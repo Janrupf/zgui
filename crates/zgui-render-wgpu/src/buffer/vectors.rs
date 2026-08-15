@@ -1,7 +1,6 @@
 //! The instances every vector composite of a frame is drawn from.
 
-use crate::buffer::instances::StorageBuffer;
-use crate::buffer::upload::UploadBelt;
+use crate::buffer::tables::TableTexture;
 use crate::gpu::device::Gpu;
 use crate::pipeline::vector::VectorInstance;
 
@@ -15,7 +14,7 @@ pub struct VectorInstances {
     /// This frame's instances, in the order they were planned.
     staged: Vec<VectorInstance>,
     /// Where they are uploaded to.
-    buffer: StorageBuffer,
+    buffer: TableTexture,
 }
 
 impl VectorInstances {
@@ -23,7 +22,7 @@ impl VectorInstances {
     pub fn new(gpu: &Gpu) -> Self {
         Self {
             staged: Vec::new(),
-            buffer: StorageBuffer::new(gpu, "zgui.vector_instances"),
+            buffer: TableTexture::new(gpu, "zgui.vector_instances"),
         }
     }
 
@@ -39,14 +38,9 @@ impl VectorInstances {
         (first, self.staged.len() as u32 - first)
     }
 
-    /// Uploads this frame's instances through a reusable mapped belt.
-    pub fn upload_with(
-        &mut self,
-        gpu: &Gpu,
-        belt: &mut UploadBelt,
-        encoder: &mut wgpu::CommandEncoder,
-    ) -> u64 {
-        self.buffer.upload(gpu, belt, encoder, &self.staged)
+    /// Uploads this frame's instances.
+    pub fn upload_with(&mut self, gpu: &Gpu) -> u64 {
+        self.buffer.upload(gpu, &self.staged)
     }
 
     /// The binding a bind group names.

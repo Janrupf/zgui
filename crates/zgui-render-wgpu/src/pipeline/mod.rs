@@ -12,6 +12,28 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::effect::{EffectProgram, Effects};
 use crate::gpu::device::Gpu;
+
+/// The draw order, as one slot number an instance with the chunk shift resolved beside it.
+///
+/// A draw binds this at the offset its own range starts at and draws from instance zero, so no
+/// pipeline asks for a non-zero base instance — which OpenGL has only from 4.2, and the oldest
+/// device this runs on is 3.3. The stride is [`OrderEntry`](crate::buffer::persist::OrderEntry)'s.
+pub(crate) const REMAP: [wgpu::VertexBufferLayout<'static>; 1] = [wgpu::VertexBufferLayout {
+    array_stride: size_of::<crate::buffer::persist::OrderEntry>() as u64,
+    step_mode: wgpu::VertexStepMode::Instance,
+    attributes: &[
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Uint32,
+            offset: 0,
+            shader_location: 0,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x2,
+            offset: size_of::<u32>() as u64,
+            shader_location: 1,
+        },
+    ],
+}];
 use crate::gpu::pipeline_cache::PipelineCache;
 use crate::pipeline::kind::PipelineKind;
 use crate::pipeline::layout::Layouts;
@@ -241,8 +263,12 @@ fn build(
                 entry_point: Some(kind.vertex_entry()),
                 compilation_options: Default::default(),
                 // Every primitive is four corners of a unit square expanded in the vertex stage,
-                // so there is no vertex data at all: an instance is read straight out of storage.
-                buffers: &[],
+                // so the only vertex data is one slot number an instance, which is the draw order.
+                // The instance itself is read from the arena at that slot.
+                //
+                // A pipeline that draws no instances — the blit, the clear, a composite — takes
+                // none of it and is given an empty list.
+                buffers: if kind.is_instanced() { &REMAP } else { &[] },
             },
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleStrip,

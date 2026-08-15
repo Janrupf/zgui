@@ -259,7 +259,14 @@ fn build(
                 module: &effect.module,
                 entry_point: Some(zgui_wgsl::vertex_entry(effect.mode)),
                 compilation_options: Default::default(),
-                buffers: &[],
+                // A primitive effect draws out of the shaded lane exactly as the framework's own
+                // pipelines draw out of theirs: the order stream is its vertex input. A filter
+                // effect covers a rectangle and reads a texture; it has no instances to order.
+                buffers: if effect.mode.is_primitive() {
+                    &crate::pipeline::REMAP
+                } else {
+                    &[]
+                },
             },
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleStrip,

@@ -21,11 +21,34 @@ struct Shadow {
     shape: f32,
 }
 
-@group(1) @binding(0) var<storage, read> shadows: array<Shadow>;
-// The draw-order permutation: the instance array keeps push order, and a draw's instance
-// range walks this list.
-@group(1) @binding(1) var<storage, read> remap: array<u32>;
-@group(1) @binding(2) var<storage, read> chunk_offsets: array<vec2<f32>>;
+@group(1) @binding(0) var shadows: texture_2d<u32>;
+
+/// One shadow, which spans 9 texels of the arena.
+fn load_shadow(slot: u32) -> Shadow {
+    let base = slot * 9u;
+    let t0 = textureLoad(shadows, table_texel(base + 0u), 0);
+    let t1 = textureLoad(shadows, table_texel(base + 1u), 0);
+    let t2 = textureLoad(shadows, table_texel(base + 2u), 0);
+    let t3 = textureLoad(shadows, table_texel(base + 3u), 0);
+    let t4 = textureLoad(shadows, table_texel(base + 4u), 0);
+    let t5 = textureLoad(shadows, table_texel(base + 5u), 0);
+    let t6 = textureLoad(shadows, table_texel(base + 6u), 0);
+    let t7 = textureLoad(shadows, table_texel(base + 7u), 0);
+    let t8 = textureLoad(shadows, table_texel(base + 8u), 0);
+    return Shadow(
+        t0.x,
+        bitcast<f32>(t0.y),
+        Bounds(bitcast<f32>(t0.z), bitcast<f32>(t0.w), bitcast<f32>(t1.x), bitcast<f32>(t1.y)),
+        Radii(bitcast<f32>(t1.z), bitcast<f32>(t1.w), bitcast<f32>(t2.x), bitcast<f32>(t2.y), bitcast<f32>(t2.z), bitcast<f32>(t2.w), bitcast<f32>(t3.x), bitcast<f32>(t3.y)),
+        Bounds(bitcast<f32>(t3.z), bitcast<f32>(t3.w), bitcast<f32>(t4.x), bitcast<f32>(t4.y)),
+        Radii(bitcast<f32>(t4.z), bitcast<f32>(t4.w), bitcast<f32>(t5.x), bitcast<f32>(t5.y), bitcast<f32>(t5.z), bitcast<f32>(t5.w), bitcast<f32>(t6.x), bitcast<f32>(t6.y)),
+        Rgba(bitcast<f32>(t6.z), bitcast<f32>(t6.w), bitcast<f32>(t7.x), bitcast<f32>(t7.y)),
+        t7.z,
+        t7.w,
+        t8.x,
+        bitcast<f32>(t8.y),
+    );
+}
 
 struct ShadowVarying {
     @builtin(position) position: vec4<f32>,
@@ -37,12 +60,10 @@ struct ShadowVarying {
 @vertex
 fn vs_shadow(
     @builtin(vertex_index) vertex: u32,
-    @builtin(instance_index) instance: u32,
+    @location(0) slot: u32,
+    @location(1) shift: vec2<f32>,
 ) -> ShadowVarying {
-    let packed = remap[instance];
-    let slot = packed & REMAP_SLOT_MASK;
-    let shift = chunk_offsets[packed >> REMAP_OFFSET_SHIFT];
-    let shadow = shadows[slot];
+    let shadow = load_shadow(slot);
     // `bounds` is already everything the primitive paints: the blurred shape dilated by the
     // gaussian's reach for a drop shadow, and the casting box itself for an inset one.
     let local = inflated_corner(vertex, shadow.bounds) + shift;
@@ -104,7 +125,7 @@ fn blur_along_x(
 
 @fragment
 fn fs_shadow(in: ShadowVarying) -> @location(0) vec4<f32> {
-    let shadow = shadows[in.instance];
+    let shadow = load_shadow(in.instance);
     let clip = clip_coverage(device_position(in.position.xy), shadow.clip);
     if clip <= 0.0 {
         return vec4<f32>(0.0);

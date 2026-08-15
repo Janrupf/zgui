@@ -123,6 +123,9 @@ struct Clip {
     count: u32,
     has_mask: u32,
     mask: Tile,
+    // Padding to a whole texel, so an index into the table is a whole number of texels.
+    pad0: u32,
+    pad1: u32,
 }
 
 // One paint source.
@@ -184,7 +187,7 @@ fn table_texel(index: u32) -> vec2<i32> {
 
 /// One clip, which spans nine texels.
 fn load_clip(id: u32) -> Clip {
-    let base = id * 9u;
+    let base = id * 10u;
     let t0 = textureLoad(clips, table_texel(base + 0u), 0);
     let t1 = textureLoad(clips, table_texel(base + 1u), 0);
     let t2 = textureLoad(clips, table_texel(base + 2u), 0);
@@ -194,6 +197,7 @@ fn load_clip(id: u32) -> Clip {
     let t6 = textureLoad(clips, table_texel(base + 6u), 0);
     let t7 = textureLoad(clips, table_texel(base + 7u), 0);
     let t8 = textureLoad(clips, table_texel(base + 8u), 0);
+    let t9 = textureLoad(clips, table_texel(base + 9u), 0);
     return Clip(
         Bounds(bitcast<f32>(t0.x), bitcast<f32>(t0.y), bitcast<f32>(t0.z), bitcast<f32>(t0.w)),
         Rounded(
@@ -202,23 +206,27 @@ fn load_clip(id: u32) -> Clip {
                 bitcast<f32>(t2.x), bitcast<f32>(t2.y), bitcast<f32>(t2.z), bitcast<f32>(t2.w),
                 bitcast<f32>(t3.x), bitcast<f32>(t3.y), bitcast<f32>(t3.z), bitcast<f32>(t3.w),
             ),
+            bitcast<f32>(t4.x),
         ),
         Rounded(
-            Bounds(bitcast<f32>(t4.x), bitcast<f32>(t4.y), bitcast<f32>(t4.z), bitcast<f32>(t4.w)),
+            Bounds(bitcast<f32>(t4.y), bitcast<f32>(t4.z), bitcast<f32>(t4.w), bitcast<f32>(t5.x)),
             Radii(
-                bitcast<f32>(t5.x), bitcast<f32>(t5.y), bitcast<f32>(t5.z), bitcast<f32>(t5.w),
-                bitcast<f32>(t6.x), bitcast<f32>(t6.y), bitcast<f32>(t6.z), bitcast<f32>(t6.w),
+                bitcast<f32>(t5.y), bitcast<f32>(t5.z), bitcast<f32>(t5.w), bitcast<f32>(t6.x),
+                bitcast<f32>(t6.y), bitcast<f32>(t6.z), bitcast<f32>(t6.w), bitcast<f32>(t7.x),
             ),
+            bitcast<f32>(t7.y),
         ),
-        t7.x,
-        t7.y,
+        t7.z,
+        t7.w,
         Tile(
-            t7.z,
-            t7.w,
+            t8.x,
+            t8.y,
             TileRect(
-                bitcast<i32>(t8.x), bitcast<i32>(t8.y), bitcast<i32>(t8.z), bitcast<i32>(t8.w),
+                bitcast<i32>(t8.z), bitcast<i32>(t8.w), bitcast<i32>(t9.x), bitcast<i32>(t9.y),
             ),
         ),
+        0u,
+        0u,
     );
 }
 
@@ -328,10 +336,7 @@ fn inflated_corner(vertex: u32, b: Bounds) -> vec2<f32> {
     return origin + unit_corner(vertex) * size;
 }
 
-// A resolved remap entry: the arena slot in the low bits, and above them the index of the frame
-// chunk offset the instance is drawn shifted by. The offsets are what let a chunk that merely
-// moved keep its resident bytes — the geometry shifts here, in the vertex stage, and a fragment
-// stage comparing against encode-space fields subtracts the same shift from its sample point.
-// The widths mirror SLOT_BITS in buffer/persist.rs.
-const REMAP_SLOT_MASK: u32 = 0xFFFFFFu;
-const REMAP_OFFSET_SHIFT: u32 = 24u;
+// The chunk offsets that let a chunk which merely moved keep its resident bytes arrive resolved,
+// as the second attribute of the order stream: the geometry shifts in the vertex stage, and a
+// fragment stage comparing against encode-space fields subtracts the same shift from its sample
+// point. The packing that once carried them lives in buffer/persist.rs, on the host alone.
