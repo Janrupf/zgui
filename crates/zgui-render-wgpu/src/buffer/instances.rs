@@ -16,6 +16,8 @@ pub struct StorageBuffer {
     buffer: wgpu::Buffer,
     /// What it is called, so a driver message names it.
     label: &'static str,
+    /// What it may be bound as.
+    usage: wgpu::BufferUsages,
     /// How many bytes it holds.
     capacity: u64,
     /// Changes whenever `buffer` changes identity, for bind-group cache invalidation.
@@ -26,14 +28,33 @@ impl StorageBuffer {
     /// The smallest allocation, which is also what an empty frame gets.
     const MINIMUM: u64 = 256;
 
-    /// An empty buffer named `label`.
+    /// An empty storage buffer named `label`.
     pub fn new(gpu: &Gpu, label: &'static str) -> Self {
+        Self::with_usage(gpu, label, wgpu::BufferUsages::STORAGE)
+    }
+
+    /// An empty vertex buffer named `label`.
+    ///
+    /// The draw-order list is read as an instanced vertex attribute rather than through a storage
+    /// buffer, which takes an indirection out of the vertex stage and asks nothing of a device that
+    /// has no storage buffers at all. See `buffer::tables`.
+    pub fn vertex(gpu: &Gpu, label: &'static str) -> Self {
+        Self::with_usage(gpu, label, wgpu::BufferUsages::VERTEX)
+    }
+
+    fn with_usage(gpu: &Gpu, label: &'static str, usage: wgpu::BufferUsages) -> Self {
         Self {
-            buffer: allocate(gpu, label, Self::MINIMUM),
+            buffer: allocate(gpu, label, Self::MINIMUM, usage),
             label,
+            usage,
             capacity: Self::MINIMUM,
             generation: 1,
         }
+    }
+
+    /// The buffer itself, for a caller binding it as vertex input.
+    pub fn buffer(&self) -> &wgpu::Buffer {
+        &self.buffer
     }
 
     /// Copies all `values` through the renderer's reusable staging belt.
@@ -62,7 +83,7 @@ impl StorageBuffer {
         let grew = needed > self.capacity;
         if grew {
             self.capacity = needed.next_power_of_two().max(Self::MINIMUM);
-            self.buffer = allocate(gpu, self.label, self.capacity);
+            self.buffer = allocate(gpu, self.label, self.capacity, self.usage);
             self.generation = self.generation.wrapping_add(1);
         }
         if all.is_empty() || start == end && !grew {
@@ -104,19 +125,19 @@ impl StorageBuffer {
             return 0;
         }
         let freed = self.capacity - Self::MINIMUM;
-        self.buffer = allocate(gpu, self.label, Self::MINIMUM);
+        self.buffer = allocate(gpu, self.label, Self::MINIMUM, self.usage);
         self.capacity = Self::MINIMUM;
         self.generation = self.generation.wrapping_add(1);
         freed
     }
 }
 
-/// Allocates a storage buffer of `size` bytes.
-fn allocate(gpu: &Gpu, label: &'static str, size: u64) -> wgpu::Buffer {
+/// Allocates a buffer of `size` bytes that may be bound as `usage`.
+fn allocate(gpu: &Gpu, label: &'static str, size: u64, usage: wgpu::BufferUsages) -> wgpu::Buffer {
     gpu.device().create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        usage: usage | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     })
 }

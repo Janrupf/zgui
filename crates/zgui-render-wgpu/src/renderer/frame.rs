@@ -55,18 +55,15 @@ pub struct FrameBuffers {
     /// The persistent chunk arenas the six instanced pipelines draw out of, and the residence
     /// over them.
     pub chunks: crate::buffer::persist::ChunkStore,
-    /// The resolved remap of each instanced kind — packed offset-and-slot entries in draw order.
+    /// The resolved remap of each instanced kind — slot-and-shift entries in draw order, read as
+    /// instanced vertex attributes rather than through a binding.
     pub remaps: [StorageBuffer; LANES.len()],
     /// What each remap buffer holds, so an unchanged frame skips the upload entirely.
-    last_remaps: [Vec<u32>; LANES.len()],
-    /// The frame's chunk offsets, named by the high bits of a remap entry.
-    offsets: StorageBuffer,
-    /// What the offsets buffer holds, so a frame that moved nothing skips the upload.
-    last_offsets: Vec<[f32; 2]>,
+    last_remaps: [Vec<crate::buffer::persist::OrderEntry>; LANES.len()],
     /// Bind groups whose resources are the stable frame side-table buffers.
     frame_bind: RefCell<Option<([u64; 5], wgpu::BindGroup)>>,
-    /// One bind group per lane, keyed by its instance, remap and offset allocation epochs.
-    instance_binds: RefCell<HashMap<usize, ([u64; 3], wgpu::BindGroup)>>,
+    /// One bind group per lane, keyed by its instance arena's allocation epoch.
+    instance_binds: RefCell<HashMap<usize, ([u64; 1], wgpu::BindGroup)>>,
     /// Whether idle trimming replaced the retained side-table buffers with empty allocations.
     tables_released: bool,
 }
@@ -95,17 +92,15 @@ impl FrameBuffers {
             spatial: TableTexture::new(gpu, "zgui.spatial"),
             chunks: crate::buffer::persist::ChunkStore::new(gpu),
             remaps: [
-                StorageBuffer::new(gpu, "zgui.remap.quads"),
-                StorageBuffer::new(gpu, "zgui.remap.shadows"),
-                StorageBuffer::new(gpu, "zgui.remap.decorations"),
-                StorageBuffer::new(gpu, "zgui.remap.mono_sprites"),
-                StorageBuffer::new(gpu, "zgui.remap.subpixel_sprites"),
-                StorageBuffer::new(gpu, "zgui.remap.color_sprites"),
-                StorageBuffer::new(gpu, "zgui.remap.shaded"),
+                StorageBuffer::vertex(gpu, "zgui.remap.quads"),
+                StorageBuffer::vertex(gpu, "zgui.remap.shadows"),
+                StorageBuffer::vertex(gpu, "zgui.remap.decorations"),
+                StorageBuffer::vertex(gpu, "zgui.remap.mono_sprites"),
+                StorageBuffer::vertex(gpu, "zgui.remap.subpixel_sprites"),
+                StorageBuffer::vertex(gpu, "zgui.remap.color_sprites"),
+                StorageBuffer::vertex(gpu, "zgui.remap.shaded"),
             ],
             last_remaps: Default::default(),
-            offsets: StorageBuffer::new(gpu, "zgui.remap.offsets"),
-            last_offsets: Vec::new(),
             frame_bind: RefCell::new(None),
             instance_binds: RefCell::new(HashMap::new()),
             tables_released: false,
@@ -154,9 +149,7 @@ impl FrameBuffers {
         // The chunk delta and the frame's transient content go into the persistent arenas; the
         // frame arrays themselves are never uploaded. What each draw reads is the resolved remap
         // — arena slots in draw order — built beside the transient gathering.
-        uploaded += self
-            .chunks
-            .upload_frame(gpu, &mut self.uploader, encoder, scene);
+        uploaded += self.chunks.upload_frame(gpu, scene);
         for (lane, buffer) in self.remaps.iter_mut().enumerate() {
             let resolved = self.chunks.resolved_remap(lane);
             // A frame whose visible set and residence held still resolves to the same list — a
@@ -168,20 +161,12 @@ impl FrameBuffers {
             self.last_remaps[lane].clear();
             self.last_remaps[lane].extend_from_slice(resolved);
         }
-        let offsets = self.chunks.frame_offsets();
-        if offsets != self.last_offsets.as_slice() {
-            uploaded += self
-                .offsets
-                .upload(gpu, &mut self.uploader, encoder, offsets);
-            self.last_offsets.clear();
-            self.last_offsets.extend_from_slice(offsets);
-        }
         uploaded += self.globals.upload_with(gpu, &mut self.uploader, encoder);
         uploaded += self.blocks.upload_with(gpu, &mut self.uploader, encoder);
         uploaded += self
             .effect_params
             .upload_with(gpu, &mut self.uploader, encoder);
-        uploaded += self.vectors.upload_with(gpu, &mut self.uploader, encoder);
+        uploaded += self.vectors.upload_with(gpu);
         uploaded
     }
 
@@ -392,6 +377,11 @@ impl FrameBuffers {
         Some(bind)
     }
 
+    /// The buffer a draw of `kind` reads its draw order out of, as vertex input.
+    pub fn remap_buffer(&self, kind: PipelineKind) -> Option<&wgpu::Buffer> {
+        Some(self.remaps[Self::lane(kind)?].buffer())
+    }
+
     /// The bind group naming one lane's instances.
     ///
     /// Keyed by the lane rather than by the pipeline drawing it, because an application effect
@@ -402,12 +392,7 @@ impl FrameBuffers {
         layouts: &Layouts,
         lane: usize,
     ) -> Option<wgpu::BindGroup> {
-        let remap = self.remaps.get(lane)?;
-        let signature = [
-            self.chunks.generation(lane),
-            remap.generation(),
-            self.offsets.generation(),
-        ];
+        let signature = [self.chunks.generation(lane)];
         if let Some((held, bind)) = self.instance_binds.borrow().get(&lane)
             && *held == signature
         {
@@ -416,20 +401,10 @@ impl FrameBuffers {
         let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(lane_label(lane)),
             layout: &layouts.instances,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.chunks.binding(lane),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: remap.binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.offsets.binding(),
-                },
-            ],
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: self.chunks.binding(lane),
+            }],
         });
         self.instance_binds
             .borrow_mut()

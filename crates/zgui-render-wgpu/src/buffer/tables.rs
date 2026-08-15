@@ -181,6 +181,68 @@ impl TableTexture {
     }
 }
 
+/// Writes `bytes` into `texture` as a run of texels starting at `first`.
+///
+/// A texture write names a rectangle and this data is a line, so a run that crosses a row boundary
+/// is up to three of them: the tail of the row it starts in, the whole rows between, and the head
+/// of the row it ends in. Widening to whole rows instead would be one write, and it would put
+/// whatever this caller does not hold over the elements on either side of the run.
+///
+/// `bytes` has to be a whole number of texels, which every caller's element size gives it.
+pub(crate) fn write_texels(gpu: &Gpu, texture: &wgpu::Texture, first: u32, bytes: &[u8]) {
+    debug_assert_eq!(bytes.len() % TEXEL, 0, "a run is a whole number of texels");
+    let mut texel = first;
+    let mut rest = bytes;
+
+    while !rest.is_empty() {
+        let column = texel % TEXELS_WIDE;
+        let row = texel / TEXELS_WIDE;
+        let (width, height) = run_extent(texel, (rest.len() / TEXEL) as u32);
+        let taken = width as usize * height as usize * TEXEL;
+
+        gpu.queue().write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: column,
+                    y: row,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &rest[..taken],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * TEXEL as u32),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        texel += width * height;
+        rest = &rest[taken..];
+    }
+}
+
+/// How much of a run starting at `texel` one write can take, as a width and a height in texels.
+///
+/// Whole rows where the run starts on one and has rows left in it; what remains of the current row
+/// otherwise. A run therefore takes at most three writes, whatever its length: a partial row, the
+/// whole ones, and a partial row.
+fn run_extent(texel: u32, held: u32) -> (u32, u32) {
+    let column = texel % TEXELS_WIDE;
+    if column == 0 && held >= TEXELS_WIDE {
+        (TEXELS_WIDE, held / TEXELS_WIDE)
+    } else {
+        ((TEXELS_WIDE - column).min(held), 1)
+    }
+}
+
 /// Allocates a table of `rows` rows, and the view a bind group names it by.
 fn allocate(gpu: &Gpu, label: &'static str, rows: u32) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = gpu.device().create_texture(&wgpu::TextureDescriptor {
@@ -199,4 +261,69 @@ fn allocate(gpu: &Gpu, label: &'static str, rows: u32) -> (wgpu::Texture, wgpu::
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     (texture, view)
+}
+
+#[cfg(test)]
+mod tests {
+    //! The split a run is written in, which no device is needed to check.
+
+    use super::{TEXELS_WIDE, run_extent};
+
+    /// Every write a run of `texels` texels starting at `first` is made of.
+    fn writes(first: u32, texels: u32) -> Vec<(u32, u32, u32, u32)> {
+        let mut out = Vec::new();
+        let (mut texel, mut held) = (first, texels);
+        while held > 0 {
+            let (width, height) = run_extent(texel, held);
+            out.push((texel % TEXELS_WIDE, texel / TEXELS_WIDE, width, height));
+            texel += width * height;
+            held -= width * height;
+        }
+        out
+    }
+
+    #[test]
+    fn a_run_is_written_once_and_never_past_the_row_it_is_in() {
+        // A run of one texel, a run of exactly a row, one that starts mid-row and ends mid-row,
+        // and one long enough to have whole rows in the middle of it.
+        for (first, texels) in [
+            (0, 1),
+            (0, TEXELS_WIDE),
+            (0, 700),
+            (5, 3),
+            (250, 12),
+            (TEXELS_WIDE - 1, TEXELS_WIDE + 1),
+            (300, 1000),
+        ] {
+            let writes = writes(first, texels);
+            assert_eq!(
+                writes.iter().map(|(_, _, w, h)| w * h).sum::<u32>(),
+                texels,
+                "every texel of {first}+{texels} is written exactly once"
+            );
+            assert!(
+                writes.len() <= 3,
+                "{first}+{texels} took {} writes, and a run is at most three",
+                writes.len()
+            );
+
+            let mut at = first;
+            for (column, row, width, height) in writes {
+                assert_eq!(
+                    row * TEXELS_WIDE + column,
+                    at,
+                    "each write starts where the one before it ended"
+                );
+                assert!(
+                    column + width <= TEXELS_WIDE,
+                    "no write runs past the end of its row"
+                );
+                assert!(
+                    height == 1 || column == 0,
+                    "a write of whole rows starts on a row"
+                );
+                at += width * height;
+            }
+        }
+    }
 }

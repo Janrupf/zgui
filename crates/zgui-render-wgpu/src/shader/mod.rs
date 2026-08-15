@@ -109,7 +109,7 @@ pub fn structures(module: Module) -> Vec<Reflected> {
         reflected!(
             GpuClip,
             "Clip",
-            [aabb, first, second, count, has_mask, mask]
+            [aabb, first, second, count, has_mask, mask, pad0, pad1]
         ),
         reflected!(
             GpuPaint,

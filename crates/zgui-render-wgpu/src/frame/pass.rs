@@ -350,13 +350,22 @@ impl Recorder<'_> {
         let Some(pipeline) = self.pipelines.get(self.gpu, kind, format) else {
             return false;
         };
+        let Some(remap) = self.buffers.remap_buffer(kind) else {
+            return false;
+        };
+
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, tables, &[planned.globals]);
         pass.set_bind_group(1, &instances, &[]);
         if let Some(bind_group) = atlas {
             pass.set_bind_group(2, bind_group, &[]);
         }
-        pass.draw(0..4, range.start as u32..range.end as u32);
+        // The draw order is bound at the offset this range starts at, and the draw counts from
+        // instance zero. Asking for a non-zero base instance instead would need OpenGL 4.2, and
+        // the oldest device this runs on is 3.3.
+        let first = (range.start * size_of::<crate::buffer::persist::OrderEntry>()) as u64;
+        pass.set_vertex_buffer(0, remap.slice(first..));
+        pass.draw(0..4, 0..(range.end - range.start) as u32);
         true
     }
 
@@ -419,7 +428,11 @@ impl Recorder<'_> {
         pass.set_bind_group(0, tables, &[planned.globals]);
         pass.set_bind_group(1, &instances, &[]);
         pass.set_bind_group(2, &block, &[offset]);
-        pass.draw(0..4, range.start as u32..range.end as u32);
+        // The order stream is bound at the offset this range starts at and the draw counts from
+        // instance zero, exactly as every other instanced draw does — see `instanced` above.
+        let first = (range.start * size_of::<crate::buffer::persist::OrderEntry>()) as u64;
+        pass.set_vertex_buffer(0, self.buffers.remaps[lane].buffer().slice(first..));
+        pass.draw(0..4, 0..(range.end - range.start) as u32);
         true
     }
 

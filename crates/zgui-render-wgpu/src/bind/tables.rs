@@ -41,6 +41,10 @@ pub struct GpuClip {
     pub has_mask: u32,
     /// The mask tile, meaningless unless `has_mask` is set.
     pub mask: SpriteTile,
+    /// Padding to a whole texel, so an index into the table is a whole number of texels.
+    pub pad0: u32,
+    /// The other half of it.
+    pub pad1: u32,
 }
 
 /// One paint source.
@@ -632,6 +636,8 @@ fn gpu_clip(clip: &ResolvedClip) -> GpuClip {
         count: clip.rounded_count,
         has_mask: u32::from(clip.mask.is_some()),
         mask: clip.mask.map(SpriteTile::of).unwrap_or_default(),
+        pad0: 0,
+        pad1: 0,
     }
 }
 

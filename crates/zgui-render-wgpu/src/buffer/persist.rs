@@ -22,8 +22,11 @@ use std::sync::mpsc;
 use zgui_profile::{Counter, counter};
 use zgui_scene::{ChunkPrims, PrimitiveKind, Scene};
 
-use crate::buffer::upload::UploadBelt;
+use crate::buffer::tables::{TEXELS_WIDE, write_texels};
 use crate::gpu::device::Gpu;
+
+/// How many bytes one texel of an arena holds. `buffer::tables` states the format.
+const TEXEL: u32 = 16;
 
 /// The instanced kinds with persistent storage, in lane order.
 pub(crate) const LANES: [PrimitiveKind; 7] = [
@@ -48,6 +51,21 @@ pub(crate) const SLOT_BITS: u32 = 24;
 /// The mask that keeps a resolved remap entry's arena slot.
 pub(crate) const SLOT_MASK: u32 = (1 << SLOT_BITS) - 1;
 
+/// One entry of a lane's draw order, as the vertex stream carries it.
+///
+/// The slot into the lane's arena, and the shift the chunk it belongs to moved by this frame. The
+/// two are resolved together here so that a shader reads neither a remap nor an offsets table: the
+/// order stream is fetched per instance anyway, and twelve bytes in it cost less than the
+/// indirection they replace.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct OrderEntry {
+    /// The arena slot the instance's record is at.
+    pub slot: u32,
+    /// How far the chunk holding that record moved, in device pixels.
+    pub shift: [f32; 2],
+}
+
 /// One resident chunk: its bytes, and where each lane's elements sit in the arenas.
 #[derive(Debug)]
 struct Resident {
@@ -57,15 +75,28 @@ struct Resident {
     ranges: [Option<Range<u32>>; LANES.len()],
 }
 
-/// One persistent element arena: a buffer, a bump tail, and ranges given back by the ledger.
+/// One persistent element arena: a texture, a bump tail, and ranges given back by the ledger.
+///
+/// A texture rather than a storage buffer, for the reason `buffer::tables` states: a GL 3.3 context
+/// and WebGL 2 have no storage buffers at all. An element is written at a texel boundary, so its
+/// fields sit at fixed positions a loader can name, which is what `stride` is for.
 #[derive(Debug)]
 struct Arena {
-    /// The buffer, bound as the pipeline's instance storage.
-    buffer: wgpu::Buffer,
+    /// The texture, bound as the pipeline's instance storage.
+    texture: wgpu::Texture,
+    /// The view a bind group names, kept because the binding borrows it.
+    view: wgpu::TextureView,
     /// What it is called, so a driver message names it.
     label: &'static str,
-    /// One element's size in bytes.
+    /// One element's size in bytes, as the scene encodes it.
     element: u32,
+    /// What one element occupies in the texture: `element` rounded up to a whole texel.
+    ///
+    /// A record is 104 or 136 or 108 bytes, and a texel is sixteen. Rounding up costs at most
+    /// twelve bytes an element and puts every record on a texel, so a shader reads its fields at
+    /// offsets it knows rather than at ones that rotate with the index. Reading a record word by
+    /// word instead needs no padding and measured fifteen per cent slower.
+    stride: u32,
     /// How many elements the buffer holds.
     capacity: u32,
     /// Changes whenever `buffer` changes identity, for bind-group cache invalidation.
@@ -82,11 +113,15 @@ impl Arena {
 
     /// An empty arena for elements of `element` bytes.
     fn new(gpu: &Gpu, label: &'static str, element: u32) -> Self {
-        let capacity = (Self::MINIMUM_BYTES as u32 / element).max(1);
+        let stride = element.div_ceil(TEXEL).saturating_mul(TEXEL);
+        let capacity = (Self::MINIMUM_BYTES as u32 / stride).max(1);
+        let (texture, view) = allocate(gpu, label, capacity, stride);
         Self {
-            buffer: allocate(gpu, label, u64::from(capacity) * u64::from(element)),
+            texture,
+            view,
             label,
             element,
+            stride,
             capacity,
             generation: 1,
             tail: 0,
@@ -156,24 +191,26 @@ impl Arena {
     }
 
     /// Copies `bytes` over the elements starting at `start`.
-    fn upload(
-        &mut self,
-        gpu: &Gpu,
-        belt: &mut UploadBelt,
-        encoder: &mut wgpu::CommandEncoder,
-        start: u32,
-        bytes: &[u8],
-    ) -> u64 {
+    ///
+    /// The caller holds packed records and the texture holds padded ones, so the run is re-spaced
+    /// on the way in. A chunk is uploaded once and read for as long as it stays resident, so this
+    /// is paid on the rare side of that trade.
+    fn upload(&mut self, gpu: &Gpu, start: u32, bytes: &[u8]) -> u64 {
         if bytes.is_empty() {
             return 0;
         }
-        belt.write(
-            gpu,
-            encoder,
-            &self.buffer,
-            u64::from(start) * u64::from(self.element),
-            bytes,
-        )
+        let element = self.element as usize;
+        let stride = self.stride as usize;
+        let count = bytes.len() / element;
+
+        let mut run = vec![0_u8; count * stride];
+        for (index, record) in bytes.chunks_exact(element).enumerate() {
+            run[index * stride..index * stride + element].copy_from_slice(record);
+        }
+
+        let texels = self.stride / TEXEL;
+        write_texels(gpu, &self.texture, start * texels, &run);
+        run.len() as u64
     }
 
     /// Replaces the buffer with one holding at least `needed` elements, forgetting every range.
@@ -181,25 +218,43 @@ impl Arena {
     /// The caller re-uploads every resident chunk afterwards: this is the growth path, the
     /// idle-release path and the device-loss path, and they are deliberately one code path.
     fn reset_with_capacity(&mut self, gpu: &Gpu, needed: u32) {
-        let bytes = (u64::from(needed) * u64::from(self.element))
+        let bytes = (u64::from(needed) * u64::from(self.stride))
             .next_power_of_two()
             .max(Self::MINIMUM_BYTES);
-        self.capacity = (bytes / u64::from(self.element)) as u32;
-        self.buffer = allocate(gpu, self.label, bytes);
+        self.capacity = (bytes / u64::from(self.stride)) as u32;
+        let (texture, view) = allocate(gpu, self.label, self.capacity, self.stride);
+        self.texture = texture;
+        self.view = view;
         self.generation = self.generation.wrapping_add(1);
         self.tail = 0;
         self.free.clear();
     }
 }
 
-/// Allocates a storage buffer of `size` bytes.
-fn allocate(gpu: &Gpu, label: &'static str, size: u64) -> wgpu::Buffer {
-    gpu.device().create_buffer(&wgpu::BufferDescriptor {
+/// Allocates a texture holding `capacity` elements of `stride` bytes, and the view naming it.
+fn allocate(
+    gpu: &Gpu,
+    label: &'static str,
+    capacity: u32,
+    stride: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texels = capacity.saturating_mul(stride / TEXEL);
+    let texture = gpu.device().create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
-        size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    })
+        size: wgpu::Extent3d {
+            width: TEXELS_WIDE,
+            height: texels.div_ceil(TEXELS_WIDE).max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba32Uint,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
 }
 
 /// Ranges awaiting reclamation, bucketed by the submission that could still read them.
@@ -291,7 +346,7 @@ pub struct ChunkStore {
     /// Ranges awaiting their submission's completion.
     ledger: RetireLedger,
     /// Per-frame scratch: the resolved remap for each lane.
-    resolved: [Vec<u32>; LANES.len()],
+    resolved: [Vec<OrderEntry>; LANES.len()],
     /// Per-frame scratch: gathered transient element bytes for each lane.
     gathered: [Vec<u8>; LANES.len()],
     /// The frame's chunk offsets, indexed by the high bits of a resolved remap entry.
@@ -357,9 +412,9 @@ impl ChunkStore {
         }
     }
 
-    /// The buffer a pipeline binds as its instance storage for `lane`.
+    /// The texture a pipeline binds as its instance storage for `lane`.
     pub fn binding(&self, lane: usize) -> wgpu::BindingResource<'_> {
-        self.arenas[lane].buffer.as_entire_binding()
+        wgpu::BindingResource::TextureView(&self.arenas[lane].view)
     }
 
     /// The allocation epoch of `lane`'s buffer, for bind-group cache keys.
@@ -371,20 +426,14 @@ impl ChunkStore {
     pub fn bytes(&self) -> u64 {
         self.arenas
             .iter()
-            .map(|arena| u64::from(arena.capacity) * u64::from(arena.element))
+            .map(|arena| u64::from(arena.capacity) * u64::from(arena.stride))
             .sum()
     }
 
     /// Uploads the frame's chunk changes and transient content, and resolves each lane's remap
     /// into arena slots. Returns the bytes copied; the resolved remaps are in
     /// [`ChunkStore::resolved_remap`] afterwards.
-    pub fn upload_frame(
-        &mut self,
-        gpu: &Gpu,
-        belt: &mut UploadBelt,
-        encoder: &mut wgpu::CommandEncoder,
-        scene: &Scene,
-    ) -> u64 {
+    pub fn upload_frame(&mut self, gpu: &Gpu, scene: &Scene) -> u64 {
         self.ledger.reclaim(&mut self.arenas);
         let mut uploaded = 0;
 
@@ -399,24 +448,17 @@ impl ChunkStore {
         }
 
         for upload in scene.chunk_inserted() {
-            uploaded += self.insert(gpu, belt, encoder, upload.revision, &upload.prims);
+            uploaded += self.insert(gpu, upload.revision, &upload.prims);
         }
 
-        uploaded += self.resolve_and_gather(gpu, belt, encoder, scene);
+        uploaded += self.resolve_and_gather(gpu, scene);
         counter::set(Counter::ChunksResident, self.residence.len() as u64);
         counter::add(Counter::ChunkBytesUploaded, uploaded);
         uploaded
     }
 
     /// Uploads one chunk's lanes into the arenas, making it resident.
-    fn insert(
-        &mut self,
-        gpu: &Gpu,
-        belt: &mut UploadBelt,
-        encoder: &mut wgpu::CommandEncoder,
-        revision: u64,
-        prims: &Arc<ChunkPrims>,
-    ) -> u64 {
+    fn insert(&mut self, gpu: &Gpu, revision: u64, prims: &Arc<ChunkPrims>) -> u64 {
         if self.residence.contains_key(&revision) {
             return 0;
         }
@@ -461,13 +503,13 @@ impl ChunkStore {
                 None => {
                     // Grow the lane and settle every resident chunk into the new buffer, then
                     // take the range that now must fit.
-                    uploaded += self.grow(gpu, belt, encoder, lane, counts[lane]);
+                    uploaded += self.grow(gpu, lane, counts[lane]);
                     self.arenas[lane]
                         .alloc(counts[lane])
                         .expect("the arena was grown for exactly this request")
                 }
             };
-            uploaded += self.arenas[lane].upload(gpu, belt, encoder, range.start, lanes[lane]);
+            uploaded += self.arenas[lane].upload(gpu, range.start, lanes[lane]);
             ranges[lane] = Some(range);
         }
         self.residence.insert(
@@ -480,20 +522,13 @@ impl ChunkStore {
         uploaded
     }
 
-    /// Replaces `lane`'s buffer with one that fits everything resident plus `incoming`, and
+    /// Replaces `lane`'s texture with one that fits everything resident plus `incoming`, and
     /// re-uploads every resident chunk's lane.
     ///
-    /// Nothing in flight can be corrupted: the old buffer is dropped, and the device keeps it
-    /// alive until the submissions reading it complete. The ledger's claims on the old buffer
+    /// Nothing in flight can be corrupted: the old texture is dropped, and the device keeps it
+    /// alive until the submissions reading it complete. The ledger's claims on the old texture
     /// are meaningless afterwards, so they are forgotten with it.
-    fn grow(
-        &mut self,
-        gpu: &Gpu,
-        belt: &mut UploadBelt,
-        encoder: &mut wgpu::CommandEncoder,
-        lane: usize,
-        incoming: u32,
-    ) -> u64 {
+    fn grow(&mut self, gpu: &Gpu, lane: usize, incoming: u32) -> u64 {
         let live: u32 = self
             .residence
             .values()
@@ -532,7 +567,7 @@ impl ChunkStore {
             let range = self.arenas[lane]
                 .alloc(count)
                 .expect("the arena was sized for everything resident");
-            uploaded += self.arenas[lane].upload(gpu, belt, encoder, range.start, &bytes);
+            uploaded += self.arenas[lane].upload(gpu, range.start, &bytes);
             self.residence
                 .get_mut(&revision)
                 .expect("iterating known keys")
@@ -543,13 +578,7 @@ impl ChunkStore {
 
     /// Builds each lane's resolved remap — arena slots in draw order — gathering transient
     /// content into per-frame ranges, and uploads the gathered bytes.
-    fn resolve_and_gather(
-        &mut self,
-        gpu: &Gpu,
-        belt: &mut UploadBelt,
-        encoder: &mut wgpu::CommandEncoder,
-        scene: &Scene,
-    ) -> u64 {
+    fn resolve_and_gather(&mut self, gpu: &Gpu, scene: &Scene) -> u64 {
         let mut uploaded = 0;
         self.frame_offsets.clear();
         self.frame_offsets.push([0.0, 0.0]);
@@ -589,7 +618,7 @@ impl ChunkStore {
                 match self.arenas[lane].alloc(transients) {
                     Some(range) => range,
                     None => {
-                        uploaded += self.grow(gpu, belt, encoder, lane, transients);
+                        uploaded += self.grow(gpu, lane, transients);
                         self.arenas[lane]
                             .alloc(transients)
                             .expect("the arena was grown for exactly this request")
@@ -608,11 +637,20 @@ impl ChunkStore {
             for &index in remap {
                 let slot = provenance[index as usize];
                 match resident_slot(&self.residence, &self.offset_of, lane, &slot) {
-                    Some(at) => self.resolved[lane].push(at),
+                    // The packed entry is unpacked here rather than in the vertex stage: the shift
+                    // rides the order stream beside the slot, so a shader neither carries the
+                    // packing's widths nor takes an indirection to resolve them.
+                    Some(at) => self.resolved[lane].push(OrderEntry {
+                        slot: at & SLOT_MASK,
+                        shift: self.frame_offsets[(at >> SLOT_BITS) as usize],
+                    }),
                     None => {
                         let at = index as usize * element;
                         self.gathered[lane].extend_from_slice(&bytes[at..at + element]);
-                        self.resolved[lane].push(transient_range.start + placed);
+                        self.resolved[lane].push(OrderEntry {
+                            slot: transient_range.start + placed,
+                            shift: [0.0, 0.0],
+                        });
                         placed += 1;
                     }
                 }
@@ -620,8 +658,7 @@ impl ChunkStore {
             debug_assert_eq!(placed, transients);
             if !self.gathered[lane].is_empty() {
                 let gathered = core::mem::take(&mut self.gathered[lane]);
-                uploaded +=
-                    self.arenas[lane].upload(gpu, belt, encoder, transient_range.start, &gathered);
+                uploaded += self.arenas[lane].upload(gpu, transient_range.start, &gathered);
                 self.gathered[lane] = gathered;
             }
             // This frame's transient elements are reclaimable once its submission completes.
@@ -630,14 +667,9 @@ impl ChunkStore {
         uploaded
     }
 
-    /// The resolved remap for `lane`: packed offset-and-slot entries, in draw order.
-    pub fn resolved_remap(&self, lane: usize) -> &[u32] {
+    /// The resolved remap for `lane`: slot-and-shift entries, in draw order.
+    pub fn resolved_remap(&self, lane: usize) -> &[OrderEntry] {
         &self.resolved[lane]
-    }
-
-    /// The frame's chunk offsets, indexed by the high bits of a resolved remap entry.
-    pub fn frame_offsets(&self) -> &[[f32; 2]] {
-        &self.frame_offsets
     }
 
     /// Ties the frame's retirements to the submission just made.

@@ -56,10 +56,11 @@ impl Layouts {
             }),
             instances: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("zgui.bind.instances"),
-                // The instances, the remap list the shader reads them through — the array keeps
-                // push order, and the sorted list beside it is the draw order — and the frame's
-                // chunk offsets, named by the remap entries' high bits.
-                entries: &[storage(0), storage(1), storage(2)],
+                // The instances alone. They keep push order, and the draw order that used to sit
+                // beside them here — with the chunk offset its entries named — is now an instanced
+                // vertex attribute: the slot, and the shift resolved beside it. See
+                // `buffer::tables`.
+                entries: &[table(0)],
             }),
             sampled: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("zgui.bind.sampled"),
@@ -107,7 +108,7 @@ impl Layouts {
             vector: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("zgui.bind.vector"),
                 entries: &[
-                    storage(0),
+                    table(0),
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
                         visibility: wgpu::ShaderStages::FRAGMENT,
@@ -152,7 +153,6 @@ fn dynamic_uniform(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-/// A read-only storage buffer, visible to both stages.
 /// A side table, read one texel at a time with no sampler.
 ///
 /// The tables were storage buffers, which a GL 3.3 context and WebGL 2 have none of. See
@@ -165,19 +165,6 @@ fn table(binding: u32) -> wgpu::BindGroupLayoutEntry {
             sample_type: wgpu::TextureSampleType::Uint,
             view_dimension: wgpu::TextureViewDimension::D2,
             multisampled: false,
-        },
-        count: None,
-    }
-}
-
-fn storage(binding: u32) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only: true },
-            has_dynamic_offset: false,
-            min_binding_size: None,
         },
         count: None,
     }
