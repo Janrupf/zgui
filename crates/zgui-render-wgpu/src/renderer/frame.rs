@@ -12,6 +12,7 @@ use crate::bind::tables::{DirtySlots, PreparedTables};
 use crate::buffer::instances::StorageBuffer;
 use crate::buffer::persist::LANES;
 use crate::buffer::slots::SlotBuffer;
+use crate::buffer::tables::TableTexture;
 use crate::buffer::upload::UploadBelt;
 use crate::buffer::vectors::VectorInstances;
 use crate::gpu::device::Gpu;
@@ -44,13 +45,13 @@ pub struct FrameBuffers {
     /// One quad per vector composite this frame draws.
     pub vectors: VectorInstances,
     /// The clip chains.
-    pub clips: StorageBuffer,
+    pub clips: TableTexture,
     /// The paint sources.
-    pub paints: StorageBuffer,
+    pub paints: TableTexture,
     /// Every ramp's stops.
-    pub stops: StorageBuffer,
+    pub stops: TableTexture,
     /// The coordinate systems.
-    pub spatial: StorageBuffer,
+    pub spatial: TableTexture,
     /// The persistent chunk arenas the six instanced pipelines draw out of, and the residence
     /// over them.
     pub chunks: crate::buffer::persist::ChunkStore,
@@ -88,10 +89,10 @@ impl FrameBuffers {
             ),
             effect_offsets: Vec::new(),
             vectors: VectorInstances::new(gpu),
-            clips: StorageBuffer::new(gpu, "zgui.clips"),
-            paints: StorageBuffer::new(gpu, "zgui.paints"),
-            stops: StorageBuffer::new(gpu, "zgui.stops"),
-            spatial: StorageBuffer::new(gpu, "zgui.spatial"),
+            clips: TableTexture::new(gpu, "zgui.clips"),
+            paints: TableTexture::new(gpu, "zgui.paints"),
+            stops: TableTexture::new(gpu, "zgui.stops"),
+            spatial: TableTexture::new(gpu, "zgui.spatial"),
             chunks: crate::buffer::persist::ChunkStore::new(gpu),
             remaps: [
                 StorageBuffer::new(gpu, "zgui.remap.quads"),
@@ -136,53 +137,17 @@ impl FrameBuffers {
         let tables = self.prepared.tables();
         let mut uploaded = if self.tables_released {
             self.tables_released = false;
-            let mut uploaded = self
-                .clips
-                .upload(gpu, &mut self.uploader, encoder, &tables.clips);
-            uploaded += self
-                .paints
-                .upload(gpu, &mut self.uploader, encoder, &tables.paints);
-            uploaded += self
-                .stops
-                .upload(gpu, &mut self.uploader, encoder, &tables.stops);
-            uploaded += self
-                .spatial
-                .upload(gpu, &mut self.uploader, encoder, &tables.spatial);
+            let mut uploaded = self.clips.upload(gpu, &tables.clips);
+            uploaded += self.paints.upload(gpu, &tables.paints);
+            uploaded += self.stops.upload(gpu, &tables.stops);
+            uploaded += self.spatial.upload(gpu, &tables.spatial);
             uploaded
         } else {
             let dirty = self.prepared.dirty();
-            let mut uploaded = upload_dirty(
-                gpu,
-                &mut self.uploader,
-                encoder,
-                &mut self.clips,
-                &tables.clips,
-                &dirty.clips,
-            );
-            uploaded += upload_dirty(
-                gpu,
-                &mut self.uploader,
-                encoder,
-                &mut self.paints,
-                &tables.paints,
-                &dirty.paints,
-            );
-            uploaded += upload_dirty(
-                gpu,
-                &mut self.uploader,
-                encoder,
-                &mut self.stops,
-                &tables.stops,
-                &dirty.stops,
-            );
-            uploaded += upload_dirty(
-                gpu,
-                &mut self.uploader,
-                encoder,
-                &mut self.spatial,
-                &tables.spatial,
-                &dirty.spatial,
-            );
+            let mut uploaded = upload_dirty(gpu, &mut self.clips, &tables.clips, &dirty.clips);
+            uploaded += upload_dirty(gpu, &mut self.paints, &tables.paints, &dirty.paints);
+            uploaded += upload_dirty(gpu, &mut self.stops, &tables.stops, &dirty.stops);
+            uploaded += upload_dirty(gpu, &mut self.spatial, &tables.spatial, &dirty.spatial);
             uploaded
         };
 
@@ -490,9 +455,7 @@ fn lane_label(lane: usize) -> &'static str {
 /// Uploads dirty slots as coalesced ranges. A half-dirty table is cheaper as one full copy.
 fn upload_dirty<T: Pod>(
     gpu: &Gpu,
-    belt: &mut UploadBelt,
-    encoder: &mut wgpu::CommandEncoder,
-    buffer: &mut StorageBuffer,
+    table: &mut TableTexture,
     values: &[T],
     dirty: &DirtySlots,
 ) -> u64 {
@@ -504,7 +467,7 @@ fn upload_dirty<T: Pod>(
         .count()
         + usize::from(!dirty.slots.is_empty());
     if dirty.all || dirty.slots.len().saturating_mul(2) >= values.len() || ranges > MAX_RANGES {
-        return buffer.upload(gpu, belt, encoder, values);
+        return table.upload(gpu, values);
     }
     let mut uploaded = 0;
     let mut slots = dirty.slots.iter().copied().peekable();
@@ -513,7 +476,7 @@ fn upload_dirty<T: Pod>(
         while slots.next_if_eq(&end).is_some() {
             end += 1;
         }
-        uploaded += buffer.upload_range(gpu, belt, encoder, values, first as usize, end as usize);
+        uploaded += table.upload_range(gpu, values, first as usize, end as usize);
     }
     uploaded
 }

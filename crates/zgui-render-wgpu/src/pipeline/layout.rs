@@ -48,13 +48,7 @@ impl Layouts {
         Self {
             frame: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("zgui.bind.frame"),
-                entries: &[
-                    dynamic_uniform(0),
-                    storage(1),
-                    storage(2),
-                    storage(3),
-                    storage(4),
-                ],
+                entries: &[dynamic_uniform(0), table(1), table(2), table(3), table(4)],
             }),
             effect: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("zgui.bind.effect"),
@@ -159,6 +153,23 @@ fn dynamic_uniform(binding: u32) -> wgpu::BindGroupLayoutEntry {
 }
 
 /// A read-only storage buffer, visible to both stages.
+/// A side table, read one texel at a time with no sampler.
+///
+/// The tables were storage buffers, which a GL 3.3 context and WebGL 2 have none of. See
+/// `buffer::tables` for what that costs and what pays for it.
+fn table(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Uint,
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
 fn storage(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,

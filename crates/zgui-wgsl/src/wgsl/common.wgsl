@@ -158,10 +158,111 @@ struct Spatial {
 }
 
 @group(0) @binding(0) var<uniform> globals: Globals;
-@group(0) @binding(1) var<storage, read> clips: array<Clip>;
-@group(0) @binding(2) var<storage, read> paints: array<Paint>;
-@group(0) @binding(3) var<storage, read> stops: array<Stop>;
-@group(0) @binding(4) var<storage, read> spatial: array<Spatial>;
+
+// The side tables, as textures rather than storage buffers. Storage buffers arrive in OpenGL 4.3
+// and OpenGL ES 3.1, so a GL 3.3 context has none and neither has WebGL 2; a texture read one texel
+// at a time gives the same random access on every device. `buffer::tables` states what that costs.
+//
+// Every field of every table is four bytes and they are laid out in declaration order, so one
+// `rgba32uint` texel is four consecutive fields and the loaders below are the structures spelled
+// out. Each states how many texels its structure spans, and that number is the stride.
+@group(0) @binding(1) var clips: texture_2d<u32>;
+@group(0) @binding(2) var paints: texture_2d<u32>;
+@group(0) @binding(3) var stops: texture_2d<u32>;
+@group(0) @binding(4) var spatial: texture_2d<u32>;
+
+/// How many texels wide every table is. `buffer::tables::TEXELS_WIDE` is the same number.
+const TABLE_TEXELS_WIDE: u32 = 256u;
+
+/// Where texel `index` of a table is.
+fn table_texel(index: u32) -> vec2<i32> {
+    return vec2<i32>(
+        i32(index % TABLE_TEXELS_WIDE),
+        i32(index / TABLE_TEXELS_WIDE),
+    );
+}
+
+/// One clip, which spans nine texels.
+fn load_clip(id: u32) -> Clip {
+    let base = id * 9u;
+    let t0 = textureLoad(clips, table_texel(base + 0u), 0);
+    let t1 = textureLoad(clips, table_texel(base + 1u), 0);
+    let t2 = textureLoad(clips, table_texel(base + 2u), 0);
+    let t3 = textureLoad(clips, table_texel(base + 3u), 0);
+    let t4 = textureLoad(clips, table_texel(base + 4u), 0);
+    let t5 = textureLoad(clips, table_texel(base + 5u), 0);
+    let t6 = textureLoad(clips, table_texel(base + 6u), 0);
+    let t7 = textureLoad(clips, table_texel(base + 7u), 0);
+    let t8 = textureLoad(clips, table_texel(base + 8u), 0);
+    return Clip(
+        Bounds(bitcast<f32>(t0.x), bitcast<f32>(t0.y), bitcast<f32>(t0.z), bitcast<f32>(t0.w)),
+        Rounded(
+            Bounds(bitcast<f32>(t1.x), bitcast<f32>(t1.y), bitcast<f32>(t1.z), bitcast<f32>(t1.w)),
+            Radii(
+                bitcast<f32>(t2.x), bitcast<f32>(t2.y), bitcast<f32>(t2.z), bitcast<f32>(t2.w),
+                bitcast<f32>(t3.x), bitcast<f32>(t3.y), bitcast<f32>(t3.z), bitcast<f32>(t3.w),
+            ),
+        ),
+        Rounded(
+            Bounds(bitcast<f32>(t4.x), bitcast<f32>(t4.y), bitcast<f32>(t4.z), bitcast<f32>(t4.w)),
+            Radii(
+                bitcast<f32>(t5.x), bitcast<f32>(t5.y), bitcast<f32>(t5.z), bitcast<f32>(t5.w),
+                bitcast<f32>(t6.x), bitcast<f32>(t6.y), bitcast<f32>(t6.z), bitcast<f32>(t6.w),
+            ),
+        ),
+        t7.x,
+        t7.y,
+        Tile(
+            t7.z,
+            t7.w,
+            TileRect(
+                bitcast<i32>(t8.x), bitcast<i32>(t8.y), bitcast<i32>(t8.z), bitcast<i32>(t8.w),
+            ),
+        ),
+    );
+}
+
+/// One paint, which spans four texels.
+fn load_paint(id: u32) -> Paint {
+    let base = id * 4u;
+    let t0 = textureLoad(paints, table_texel(base + 0u), 0);
+    let t1 = textureLoad(paints, table_texel(base + 1u), 0);
+    let t2 = textureLoad(paints, table_texel(base + 2u), 0);
+    let t3 = textureLoad(paints, table_texel(base + 3u), 0);
+    return Paint(
+        t0.x, t0.y, t0.z, t0.w,
+        Vector4(bitcast<f32>(t1.x), bitcast<f32>(t1.y), bitcast<f32>(t1.z), bitcast<f32>(t1.w)),
+        Rgba(bitcast<f32>(t2.x), bitcast<f32>(t2.y), bitcast<f32>(t2.z), bitcast<f32>(t2.w)),
+        t3.x, t3.y, t3.z, t3.w,
+    );
+}
+
+/// One ramp stop, which spans two texels.
+fn load_stop(id: u32) -> Stop {
+    let base = id * 2u;
+    let t0 = textureLoad(stops, table_texel(base + 0u), 0);
+    let t1 = textureLoad(stops, table_texel(base + 1u), 0);
+    return Stop(
+        Vector4(bitcast<f32>(t0.x), bitcast<f32>(t0.y), bitcast<f32>(t0.z), bitcast<f32>(t0.w)),
+        bitcast<f32>(t1.x),
+        Vector3(bitcast<f32>(t1.y), bitcast<f32>(t1.z), bitcast<f32>(t1.w)),
+    );
+}
+
+/// One transform, which spans four texels: a `mat4x4<f32>` is four columns of four.
+fn load_spatial(id: u32) -> mat4x4<f32> {
+    let base = id * 4u;
+    let t0 = textureLoad(spatial, table_texel(base + 0u), 0);
+    let t1 = textureLoad(spatial, table_texel(base + 1u), 0);
+    let t2 = textureLoad(spatial, table_texel(base + 2u), 0);
+    let t3 = textureLoad(spatial, table_texel(base + 3u), 0);
+    return mat4x4<f32>(
+        bitcast<vec4<f32>>(t0),
+        bitcast<vec4<f32>>(t1),
+        bitcast<vec4<f32>>(t2),
+        bitcast<vec4<f32>>(t3),
+    );
+}
 
 const PAINT_NONE: u32 = 0u;
 const PAINT_SOLID: u32 = 1u;
@@ -201,7 +302,7 @@ fn unit_corner(vertex: u32) -> vec2<f32> {
 
 // A device-space point, transformed and projected into the current target's clip space.
 fn to_clip_position(point: vec2<f32>, spatial_id: u32) -> vec4<f32> {
-    let world = spatial[spatial_id].matrix * vec4<f32>(point, 0.0, 1.0);
+    let world = load_spatial(spatial_id) * vec4<f32>(point, 0.0, 1.0);
     let texel = world.xy * globals.viewport.zw;
     let ndc = vec2<f32>(
         texel.x / globals.viewport.x * 2.0 - world.w,

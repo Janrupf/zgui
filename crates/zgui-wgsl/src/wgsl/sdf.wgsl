@@ -111,7 +111,7 @@ fn rect_coverage(point: vec2<f32>, bounds: Bounds, radii: Radii, shape: f32) -> 
 // Coverage of a device pixel by a whole clip chain. Every pipeline that draws into the composed
 // target applies exactly this function, so one clip means one thing whatever draws through it.
 fn clip_coverage(point: vec2<f32>, clip_id: u32) -> f32 {
-    let clip = clips[clip_id];
+    let clip = load_clip(clip_id);
     // The intersection rectangle is a hard edge: it is an axis-aligned box in device space, and
     // antialiasing it would bleed content one pixel outside a scrollport.
     let aabb = clip.aabb;
