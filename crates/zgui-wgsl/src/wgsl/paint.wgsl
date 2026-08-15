@@ -91,11 +91,11 @@ fn sample_ramp(paint: Paint, t: f32) -> vec4<f32> {
     if count == 0u {
         return vec4<f32>(0.0);
     }
-    var low = stops[paint.stop_start];
+    var low = load_stop(paint.stop_start);
     if count == 1u || t <= low.offset {
         return decode_stop(paint.space, vector4_of(low.color));
     }
-    let last = stops[paint.stop_start + count - 1u];
+    let last = load_stop(paint.stop_start + count - 1u);
     if t >= last.offset {
         return decode_stop(paint.space, vector4_of(last.color));
     }
@@ -104,7 +104,7 @@ fn sample_ramp(paint: Paint, t: f32) -> vec4<f32> {
         if index >= count {
             break;
         }
-        let high = stops[paint.stop_start + index];
+        let high = load_stop(paint.stop_start + index);
         if t <= high.offset {
             let span = max(high.offset - low.offset, 1e-6);
             let mixed = mix(
@@ -156,7 +156,7 @@ fn paint_color(reference: PaintRef, point: vec2<f32>, origin: vec2<f32>) -> vec4
     if reference.kind == PAINT_NONE {
         return vec4<f32>(0.0);
     }
-    let paint = paints[reference.index];
+    let paint = load_paint(reference.index);
     if reference.kind == PAINT_SOLID {
         return rgba_of(paint.color);
     }
