@@ -167,8 +167,19 @@ fn Motion() -> impl IntoView {
     }
 }
 
-/// The stylesheet. Flat colours and no gradients: what is being measured is the cost of moving
-/// things, and a gradient would put the answer in the rasteriser instead.
+/// The stylesheet. No gradients: what is being measured is the cost of moving things, and a
+/// gradient would put the answer in the rasteriser instead.
+///
+/// The blocks are translucent, well rounded and cast a shadow, and each of those three costs
+/// something different. A translucent fill has to be blended over what is under it, so the
+/// backdrop is read as well as written and the frame cannot skip what the block covers — an opaque
+/// fill lets both the erasure and everything beneath it be dropped. A large radius makes the
+/// antialiased arc a larger share of the block than a small one does. A shadow is a second, softer
+/// primitive that reaches outside the block's own box, so the damage a moving block owes is wider
+/// than the block.
+///
+/// That is the point of them. A block that is a flat opaque rectangle takes every shortcut the
+/// pipeline has, and measuring it says little about an interface that looks like an interface.
 const SHEET: &str = r"
     :root {
         width: 100%;
@@ -210,8 +221,9 @@ const SHEET: &str = r"
         position: absolute;
         width: 64px;
         height: 26px;
-        border-radius: 6px;
-        background-color: #3b6cf6;
+        border-radius: RADIUSpx;
+        background-color: rgba(59, 108, 246, ALPHA);
+        box-shadow: SHADOW;
     }
 
     .motion__bar {
@@ -230,6 +242,30 @@ const SHEET: &str = r"
         background-color: #4ad19a;
     }
 ";
+
+/// The stylesheet with the three knobs on the block filled in from the environment.
+///
+/// The defaults are the taxing block that [`SHEET`] describes. Each knob turns off one of the three
+/// costs separately, which is what tells them apart: a run cannot say whether the blending or the
+/// shadow is what it is waiting on if it can only measure the two together.
+///
+/// * `ZGUI_TTY_MOTION_ALPHA` — the fill's opacity. `1` makes it opaque, and an opaque fill lets the
+///   frame drop the erasure and everything the block covers.
+/// * `ZGUI_TTY_MOTION_RADIUS` — the corner radius in pixels. `0` makes the block a plain rectangle.
+/// * `ZGUI_TTY_MOTION_SHADOW` — the `box-shadow` value. `none` removes it, which is what shrinks
+///   the ink a moving block owes back to the block itself.
+fn sheet() -> String {
+    fn knob(name: &str, fallback: &str) -> String {
+        std::env::var(name).unwrap_or_else(|_| fallback.to_owned())
+    }
+    SHEET
+        .replace("RADIUS", &knob("ZGUI_TTY_MOTION_RADIUS", "14"))
+        .replace("ALPHA", &knob("ZGUI_TTY_MOTION_ALPHA", "0.55"))
+        .replace(
+            "SHADOW",
+            &knob("ZGUI_TTY_MOTION_SHADOW", "0 8px 22px rgba(0, 0, 0, 0.55)"),
+        )
+}
 
 /// Sends the log to a file, because on this console standard error is the screen.
 fn log() {
@@ -252,7 +288,7 @@ fn main() -> Result<(), zgui::Error> {
     let described = app()
         .with_application_id("dev.zgui.TtyMotion")
         .with_title("several things moving at once")
-        .with_stylesheet(SHEET);
+        .with_stylesheet(sheet());
 
     if std::env::var_os("ZGUI_TTY_WINDOWED").is_some() {
         return described.run(|| view! { Motion() });
