@@ -53,7 +53,12 @@ impl ContentHash {
         Self(Self::BASIS)
     }
 
-    /// Folds in every byte of `bytes`.
+    /// Folds in every byte of `bytes`, one round apiece.
+    ///
+    /// For a run of bytes whose length is itself content — a name, a string — where a round per
+    /// byte is what keeps two different lengths apart. A fixed-width field belongs in
+    /// [`ContentHash::u64`] instead, which folds the whole word in one round; the two are separate
+    /// foldings and are not expected to agree on the same bytes.
     pub const fn bytes(mut self, bytes: &[u8]) -> Self {
         let mut index = 0;
         while index < bytes.len() {
@@ -64,9 +69,23 @@ impl ContentHash {
         self
     }
 
-    /// Folds in a `u64`.
-    pub const fn u64(self, value: u64) -> Self {
-        self.bytes(&value.to_le_bytes())
+    /// Folds in a `u64`, as one round rather than as eight.
+    ///
+    /// A fixed-width field is folded whole. Doing it a byte at a time cost eight rounds, and each
+    /// round is a multiply that waits on the one before it — so a matrix, which is sixteen of these
+    /// fields, was a chain of a hundred and twenty-eight dependent multiplies to hash sixty-four
+    /// bytes. Half of those rounds were folding in the zero padding of a widened `f32`.
+    ///
+    /// The shift after the multiply is load-bearing rather than decorative. A multiply carries
+    /// upwards and never down, and the top bit is a fixed point of it — `2^63` times any odd number
+    /// is `2^63` again — so without it, flipping the top bit of *any* field gave one hash whichever
+    /// field it was flipped in. The shift folds the high half back over the low one, which the next
+    /// round's multiply then carries up again.
+    pub const fn u64(mut self, value: u64) -> Self {
+        self.0 ^= value;
+        self.0 = self.0.wrapping_mul(Self::PRIME);
+        self.0 ^= self.0 >> 31;
+        self
     }
 
     /// Folds in a `u32`.
@@ -92,9 +111,15 @@ impl ContentHash {
         self
     }
 
-    /// The hash so far.
+    /// The hash so far, spread so that every input bit reaches every output bit.
+    ///
+    /// A round leaves the lowest bit of the state as the exclusive-or of the lowest bit of
+    /// everything folded in, because multiplication carries upwards and never down. A consumer
+    /// bucketing on the low bits would see far fewer than sixty-four bits of hash. This is one
+    /// multiply for the whole value, rather than one per field, so it costs nothing measurable.
     pub const fn finish(self) -> u64 {
-        self.0
+        let folded = self.0 ^ (self.0 >> 32);
+        folded.wrapping_mul(0xff51_afd7_ed55_8ccd)
     }
 }
 
@@ -122,6 +147,39 @@ mod tests {
         let once = ContentHash::new().f32(1.5).u32(7).finish();
         let again = ContentHash::new().f32(1.5).u32(7).finish();
         assert_eq!(once, again);
+    }
+
+    /// Folding a word whole is what makes the hash cheap, so the property that pays for it —
+    /// every bit of every field reaching the result — is asserted rather than assumed. A field
+    /// that flips one bit must change the hash, including the bit a multiply cannot carry into.
+    #[test]
+    fn one_flipped_bit_anywhere_changes_the_hash() {
+        let base = ContentHash::new().u64(0).u64(0).finish();
+        for bit in 0..64 {
+            let first = ContentHash::new().u64(1 << bit).u64(0).finish();
+            let second = ContentHash::new().u64(0).u64(1 << bit).finish();
+            assert_ne!(first, base, "bit {bit} of the first field");
+            assert_ne!(second, base, "bit {bit} of the second field");
+            assert_ne!(
+                first, second,
+                "the two fields are not interchangeable at bit {bit}"
+            );
+        }
+    }
+
+    /// The sixteen numbers of a matrix must not collide across the values an animation walks
+    /// through. A shift stepping a pixel at a time is exactly that walk.
+    #[test]
+    fn a_matrix_hashes_apart_across_a_shift_that_animates() {
+        use super::Content;
+        let mut seen = std::collections::HashSet::new();
+        for step in 0..4096 {
+            let by = step as f32 * 0.25;
+            assert!(
+                seen.insert(zgui_geom::Matrix4::translation(by, -by, 0.0).content_hash()),
+                "two shifts an animation passes through hashed alike at step {step}",
+            );
+        }
     }
 
     #[test]
