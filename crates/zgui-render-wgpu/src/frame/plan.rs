@@ -3,7 +3,7 @@
 use zgui_bits::DamageSet;
 use zgui_geom::{Device, DevicePx, Rect};
 use zgui_render::ExternalTexture;
-use zgui_scene::{BackdropFilter, Batch, GroupBoundary, Scene};
+use zgui_scene::{BackdropFilter, Batch, GroupBoundary, OpaqueCover, Scene};
 
 use crate::filter::chain::Chain;
 use crate::filter::{self, Filtered};
@@ -36,9 +36,13 @@ struct OpenGroup {
 /// them a value that can be read and asserted; discovering them while recording would mean
 /// discarding the borrow that states the constraint.
 ///
-/// One rectangle is one full replay of the batch stream under a different scissor, rather than a
+/// One rectangle is one replay of the batch stream under a different scissor, rather than a
 /// re-culled stream. Which primitives survive a damage set is decided where the display list is
 /// built, from the fragments' own ink; here the rectangles are only where the writes land.
+///
+/// The replay is cut at one point only: an opaque fill covering the whole rectangle hides
+/// everything before it, so the stream is picked up there. See
+/// [`Scene::opaque_covers`](zgui_scene::Scene::opaque_covers).
 pub fn plan_segments(
     mut builder: PlanBuilder<'_>,
     scene: &Scene,
@@ -56,8 +60,12 @@ pub fn plan_segments(
         .map(|backdrop| rounded_out(backdrop.source))
         .collect();
 
+    // What this frame replaces outright, which is what decides whether a rectangle needs erasing.
+    let mut opaque = Vec::new();
+    scene.opaque_covers(&mut opaque);
+
     for rect in damage::rects_covering_backdrops(damage, used, &backdrops) {
-        plan_rect(&mut builder, scene, rect, used, externals, vectors);
+        plan_rect(&mut builder, scene, rect, used, &opaque, externals, vectors);
     }
     builder.finish()
 }
@@ -68,6 +76,7 @@ fn plan_rect(
     scene: &Scene,
     rect: Rect<i32, Device>,
     used: Rect<i32, Device>,
+    opaque: &[OpaqueCover],
     externals: &dyn Fn(zgui_scene::ExternalTextureId) -> Option<ExternalTexture>,
     vectors: Option<&zgui_render::VectorPlan>,
 ) {
@@ -76,12 +85,27 @@ fn plan_rect(
     let mut scissor = rect;
 
     builder.begin_pass(current, scissor);
-    // The rectangle is about to be redrawn, so what is in it goes first. It is a draw because a
-    // render pass clears its whole attachment or none of it, and clearing all of it would throw
-    // away every pixel this frame is relying on not having to redraw.
-    builder.draw(PlannedDraw::Clear);
+    // Where something the frame draws replaces every pixel of the rectangle by itself — a page
+    // background under a moving box is the ordinary case — that fill is where the replay starts.
+    // Everything before it is hidden by it: the erasure, and every primitive under it.
+    //
+    // The latest such fill, because a later one hides more.
+    let hidden = opaque
+        .iter()
+        .filter(|cover| cover.rect.contains_rect(rect))
+        .max_by_key(|cover| cover.at);
+    // Nothing covers it, so what is in it goes first. It is a draw because a render pass clears
+    // its whole attachment or none of it, and clearing all of it would throw away every pixel this
+    // frame is relying on not having to redraw.
+    if hidden.is_none() {
+        builder.draw(PlannedDraw::Clear);
+    }
 
     for batch in scene.batches() {
+        let Some(batch) = hidden.map_or(Some(batch.clone()), |cover| scene.behind(batch, cover))
+        else {
+            continue;
+        };
         match batch {
             Batch::Group(index) => {
                 let Some(boundary) = scene.primitives.groups.get(index) else {
