@@ -96,5 +96,12 @@ name = "tty"
 path = "../../examples/tty.rs"
 required-features = ["drm"]
 
+# Several things moving at once, which is what says how many frames a second a console reaches. The
+# clock next door changes once a second and measures the hardware rather than the loop.
+[[example]]
+name = "tty_motion"
+path = "../../examples/tty_motion.rs"
+required-features = ["drm"]
+
 [lints]
 workspace = true
