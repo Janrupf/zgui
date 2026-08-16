@@ -156,10 +156,21 @@ fn paint_color(reference: PaintRef, point: vec2<f32>, origin: vec2<f32>) -> vec4
     if reference.kind == PAINT_NONE {
         return vec4<f32>(0.0);
     }
-    let paint = load_paint(reference.index);
     if reference.kind == PAINT_SOLID {
-        return rgba_of(paint.color);
+        // Texel two of the record and nothing else. Nearly every fill in a document is one colour,
+        // and reading the whole record for it costs three more fetches on every fragment of every
+        // primitive — which on a device that keeps its tables in textures is where a frame goes.
+        // `the_paint_record_is_laid_out_the_way_the_shader_reads_it` fails the build if the colour
+        // ever moves off that texel.
+        let held = textureLoad(paints, table_texel(reference.index * 4u + 2u), 0);
+        return rgba_of(Rgba(
+            bitcast<f32>(held.x),
+            bitcast<f32>(held.y),
+            bitcast<f32>(held.z),
+            bitcast<f32>(held.w),
+        ));
     }
+    let paint = load_paint(reference.index);
     let anchored = point - origin;
     if reference.kind == PAINT_GRADIENT {
         return sample_ramp(paint, gradient_extent(paint, gradient_position(paint, anchored)));
