@@ -32,6 +32,7 @@
 //! second commit would read the properties again and would leave the first one's blob behind.
 
 use std::cell::RefCell;
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -140,7 +141,13 @@ impl DrmDisplay {
         !self.cursor.borrow().on_a_plane()
     }
 
-    /// Copies `pixels` into the back buffer, draws the pointer over it, and flips to it.
+    /// Copies the rows of `pixels` that are owed into the back buffer, draws the pointer over it,
+    /// and flips to it.
+    ///
+    /// `changed` names the rows this frame drew. What is copied is those *and* whatever the rows
+    /// earlier frames drew owe this buffer, because the display rotates between several and a
+    /// frame lands in one of them. A display drawing its own pointer is copied whole: the pointer
+    /// moves without any row changing.
     ///
     /// Answers `false` while a flip is still on its way, which is [`Scanout::present`]'s own
     /// answer: the back buffer is the one still on the screen until the completion arrives, so the
@@ -153,12 +160,13 @@ impl DrmDisplay {
     ///
     /// Returns [`PlatformError::Backend`] when `pixels` is not the extent of the display, when the
     /// buffer cannot be mapped, and when the driver refuses the flip.
-    pub fn present(&self, pixels: &Pixels) -> Result<bool, PlatformError> {
+    pub fn present(&self, pixels: &Pixels, changed: &[Range<u32>]) -> Result<bool, PlatformError> {
         let mut commit = self.commit.borrow_mut();
         self.scanout.borrow_mut().present(
             &self.device,
             &mut **commit,
             pixels,
+            changed,
             &self.cursor.borrow(),
         )
     }

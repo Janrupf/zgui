@@ -20,8 +20,12 @@
 //!
 //! **The copied shape.** Two buffers the driver allocated and the processor writes. A frame is
 //! read back out of the renderer and copied in, the pointer is drawn over it, and the flip
-//! follows. It costs a readback and eight megabytes of copying a frame, and it is the answer for
-//! every machine where the other shape cannot be built.
+//! follows. It is the answer for every machine where the other shape cannot be built.
+//!
+//! Only the rows that changed make that journey. A frame states which they are, and every buffer
+//! it did not land in is told, so a buffer is copied the rows it owes rather than all of them.
+//! Reading a whole frame back is what this shape costs; reading a hundred rows of one is what it
+//! costs when a hundred rows changed.
 //!
 //! **The imported shape.** Three Vulkan images the renderer composes straight into, exported as
 //! dma-buf descriptors and registered as framebuffers in the layout the driver chose. Nothing is
@@ -69,6 +73,7 @@
 pub(crate) mod rotation;
 
 use std::fmt;
+use std::ops::Range;
 use std::os::fd::{AsFd, OwnedFd};
 use std::time::{Duration, Instant};
 
@@ -169,7 +174,20 @@ pub struct Scanout {
     /// A completion is what frees the buffer behind it, so a completion that never arrives stops
     /// this display for good. [`Scanout::overdue`] is when waiting for it stops.
     owed_since: Option<Instant>,
+    /// Per copied buffer: the rows written into some other buffer since this one was last written.
+    ///
+    /// A frame is copied into one buffer and the display rotates between several, so the rows a
+    /// frame changed are owed to every buffer it did not land in. Without this a copy limited to
+    /// what changed would show, on alternate frames, whatever the buffer held two frames ago.
+    stale: Vec<Vec<Range<u32>>>,
 }
+
+/// The most bands a buffer's staleness is tracked as before it becomes the whole frame.
+///
+/// A frame changing scattered rows for many frames in a row would otherwise grow a list nothing
+/// bounds. Copying the whole frame is the answer that is always right; this is only about which
+/// one is cheaper.
+const MOST_BANDS: usize = 16;
 
 /// The buffers a display is driven from, in one of the two shapes.
 ///
@@ -481,6 +499,7 @@ impl Scanout {
         device: &Device,
         commit: &mut dyn Commit,
         pixels: &Pixels,
+        changed: &[Range<u32>],
         cursor: &Cursor,
     ) -> Result<bool, PlatformError> {
         let Buffers::Copied { buffers, .. } = &mut self.buffers else {
@@ -490,6 +509,12 @@ impl Scanout {
                     .to_owned(),
             ));
         };
+        // Every buffer owes the rows this frame changed, recorded **before** the two ways out
+        // below. A declined frame retires its damage all the same — the composed target holds it
+        // and nothing will name those rows again — so a buffer told about them only on the paths
+        // that copy would keep whatever it held there for ever.
+        owe(&mut self.stale, changed, self.mode.height());
+
         let Some(slot) = self.rotation.drawing() else {
             return Ok(false);
         };
@@ -504,17 +529,30 @@ impl Scanout {
             )));
         }
 
+        // This buffer is about to hold everything it was owed. A pointer drawn into the picture
+        // rather than onto a plane moves without changing a row, so such a display copies all of
+        // it: the rows the pointer has just left are as stale as the ones it has reached, and
+        // nothing above here knows where it was.
+        let owed = if cursor.on_a_plane() {
+            core::mem::take(&mut self.stale[slot])
+        } else {
+            self.stale[slot] = Vec::new();
+            zgui_render_wgpu::frame::damage::every_row(height)
+        };
+
         // The driver rounds a row up, so the two strides differ and each side steps by its own.
         let destination_stride = buffers[slot].stride() as usize;
         let source_stride = width as usize * BYTES_PER_PIXEL;
         let bytes = buffers[slot].bytes(device).map_err(backend)?;
-        blit(
-            pixels.bytes(),
-            source_stride,
-            bytes,
-            destination_stride,
-            height as usize,
-        );
+        for band in &owed {
+            blit(
+                pixels.bytes(),
+                source_stride,
+                bytes,
+                destination_stride,
+                band.clone(),
+            );
+        }
         cursor.draw(bytes, destination_stride, width, height);
 
         // No fence: the processor wrote the picture into this buffer, so it is already there.
@@ -738,10 +776,11 @@ impl Scanout {
     fn new(output: &Output, buffers: Buffers) -> Self {
         // Nothing is on the screen, so every buffer is free: the first frame goes into the first of
         // them and the modeset puts that one up.
-        let rotation = Rotation::new(match &buffers {
+        let count = match &buffers {
             Buffers::Copied { buffers, .. } => buffers.len(),
             Buffers::Imported { buffers, .. } => buffers.len(),
-        });
+        };
+        let rotation = Rotation::new(count);
         Self {
             pipe: output.pipe,
             mode: output.mode,
@@ -749,6 +788,9 @@ impl Scanout {
             rotation,
             lit: false,
             owed_since: None,
+            // Every buffer holds nothing, so every one of them owes the whole frame. The bound is
+            // the display's own height, which the first copy cuts to whatever it is given.
+            stale: vec![zgui_render_wgpu::frame::damage::every_row(output.mode.height()); count],
         }
     }
 
@@ -1036,7 +1078,7 @@ fn fourcc(bgra: bool) -> Format {
     }
 }
 
-/// Copies `rows` rows from `source` into `destination`, each stepping by its own stride.
+/// Copies the rows `rows` names from `source` into `destination`, each stepping by its own stride.
 ///
 /// The source is tightly packed, so its stride is the row's own width in bytes. The destination is
 /// the driver's buffer, whose stride is rounded up past that, and the bytes past the end of a row
@@ -1053,17 +1095,20 @@ fn blit(
     source_stride: usize,
     destination: &mut [u8],
     destination_stride: usize,
-    rows: usize,
+    rows: Range<u32>,
 ) {
     if source_stride == 0 || destination_stride == 0 {
         return;
     }
     // A destination narrower than the source is the same truncation one row along.
     let width = source_stride.min(destination_stride);
+    let start = rows.start as usize;
+    let count = rows.end.saturating_sub(rows.start) as usize;
     for (into, from) in destination
         .chunks_exact_mut(destination_stride)
-        .zip(source.chunks_exact(source_stride))
-        .take(rows)
+        .skip(start)
+        .zip(source.chunks_exact(source_stride).skip(start))
+        .take(count)
     {
         into[..width].copy_from_slice(&from[..width]);
     }
@@ -1081,6 +1126,43 @@ fn completed(events: &[Event], crtc: u32) -> Option<Duration> {
         } if *finished == crtc => Some(*at),
         _ => None,
     })
+}
+
+/// Records against every buffer the rows a frame changed.
+///
+/// What a buffer is then owed is taken out of its own entry, which leaves it owing nothing: the
+/// copy that follows writes exactly those rows into it. Free of the rotation and of the device,
+/// because neither is what makes it right.
+fn owe(stale: &mut [Vec<Range<u32>>], changed: &[Range<u32>], height: u32) {
+    for held in stale {
+        *held = merge(held, changed, height);
+    }
+}
+
+/// The bands of `held` and `adding` together, merged, in order and cut to `height`.
+///
+/// Answers the whole of it rather than a long list where the two make more bands than are worth
+/// tracking: many scattered copies cost more in calls than one copy of everything saves in bytes.
+fn merge(held: &[Range<u32>], adding: &[Range<u32>], height: u32) -> Vec<Range<u32>> {
+    let mut bands: Vec<Range<u32>> = held
+        .iter()
+        .chain(adding)
+        .map(|band| band.start.min(height)..band.end.min(height))
+        .filter(|band| band.start < band.end)
+        .collect();
+    bands.sort_unstable_by_key(|band| band.start);
+    let mut kept: Vec<Range<u32>> = Vec::with_capacity(bands.len());
+    for band in bands {
+        match kept.last_mut() {
+            // Touching counts as overlapping: two bands that meet exactly are one copy.
+            Some(last) if band.start <= last.end => last.end = last.end.max(band.end),
+            _ => kept.push(band),
+        }
+    }
+    if kept.len() > MOST_BANDS {
+        return zgui_render_wgpu::frame::damage::every_row(height);
+    }
+    kept
 }
 
 /// Allocates one buffer of this extent, registered for scanout.
@@ -1117,8 +1199,9 @@ mod tests {
     //! driver that rounds a row up. The slots are where an imported buffer reaches the kernel
     //! wrong, and they are four arrays.
 
-    use super::{Layout, PLANES, blit, completed, fourcc, layout};
+    use super::{Layout, MOST_BANDS, PLANES, blit, completed, fourcc, layout, merge, owe};
     use crate::import::Plane;
+    use std::ops::Range;
     use std::time::Duration;
     use zgui_drm::Event;
     use zgui_drm::format::Format;
@@ -1143,7 +1226,7 @@ mod tests {
         let source = [1, 2, 3, 4, 5, 6, 7, 8];
         let mut destination = padded(6, 2);
 
-        blit(&source, 4, &mut destination, 6, 2);
+        blit(&source, 4, &mut destination, 6, 0..2);
 
         assert_eq!(
             destination,
@@ -1157,7 +1240,7 @@ mod tests {
         let source = [1, 2, 3, 4, 5, 6];
         let mut destination = padded(3, 2);
 
-        blit(&source, 3, &mut destination, 3, 2);
+        blit(&source, 3, &mut destination, 3, 0..2);
 
         assert_eq!(destination, source, "nothing is left over on either side");
     }
@@ -1167,7 +1250,7 @@ mod tests {
         let source = [1, 2, 3, 4];
         let mut destination = padded(4, 1);
 
-        blit(&source, 4, &mut destination, 4, 0);
+        blit(&source, 4, &mut destination, 4, 0..0);
 
         assert_eq!(destination, [0xAA; 4], "a frame of no rows writes no bytes");
     }
@@ -1179,7 +1262,7 @@ mod tests {
         let source = [1, 2, 3, 4, 5, 6];
         let mut destination = padded(4, 2);
 
-        blit(&source, 2, &mut destination, 4, 3);
+        blit(&source, 2, &mut destination, 4, 0..3);
 
         assert_eq!(
             destination,
@@ -1193,7 +1276,7 @@ mod tests {
         let source = [1, 2, 3];
         let mut destination = padded(4, 3);
 
-        blit(&source, 2, &mut destination, 4, 3);
+        blit(&source, 2, &mut destination, 4, 0..3);
 
         assert_eq!(
             destination,
@@ -1205,12 +1288,83 @@ mod tests {
     }
 
     #[test]
+    fn a_band_starting_part_way_down_copies_those_rows_and_leaves_the_others() {
+        let source = [1, 2, 3, 4, 5, 6, 7, 8];
+        let mut destination = padded(2, 4);
+
+        blit(&source, 2, &mut destination, 2, 1..3);
+
+        assert_eq!(
+            destination,
+            [0xAA, 0xAA, 3, 4, 5, 6, 0xAA, 0xAA],
+            "both sides skip to the band, so a row lands where it came from"
+        );
+    }
+
+    /// The whole of what the copied shape depends on: a row changed while one buffer is being
+    /// written is owed to every other, and a buffer that has just been written owes nothing.
+    #[expect(
+        clippy::single_range_in_vec_init,
+        reason = "one band of rows a frame changed, which is what a frame usually changes"
+    )]
+    #[test]
+    fn a_row_one_frame_changed_is_owed_to_the_buffer_the_next_frame_uses() {
+        let mut stale = vec![Vec::new(), Vec::new()];
+
+        let first: Vec<Range<u32>> = vec![0..10];
+        owe(&mut stale, &first, 100);
+        assert_eq!(core::mem::take(&mut stale[0]), vec![0..10]);
+
+        let second: Vec<Range<u32>> = vec![20..30];
+        owe(&mut stale, &second, 100);
+        assert_eq!(
+            core::mem::take(&mut stale[1]),
+            vec![0..10, 20..30],
+            "the buffer the first frame did not land in is owed that frame's rows as well"
+        );
+
+        owe(&mut stale, &[], 100);
+        assert_eq!(
+            stale[0],
+            vec![20..30],
+            "and the first buffer still owes the second frame's"
+        );
+    }
+
+    #[test]
+    fn bands_that_meet_or_overlap_become_one() {
+        assert_eq!(
+            merge(&[0..4, 10..12], &[4..6, 11..20], 100),
+            vec![0..6, 10..20]
+        );
+    }
+
+    #[expect(
+        clippy::single_range_in_vec_init,
+        reason = "one band, reaching past the bottom, which is what this is about"
+    )]
+    #[test]
+    fn a_band_reaching_past_the_display_is_cut_to_it() {
+        assert_eq!(merge(&[90..200], &[], 100), vec![90..100]);
+        assert!(merge(&[200..300], &[], 100).is_empty());
+    }
+
+    /// Many scattered bands cost more in calls than one copy of everything saves in bytes.
+    #[test]
+    fn more_bands_than_are_worth_tracking_become_the_whole_frame() {
+        let scattered: Vec<Range<u32>> = (0..MOST_BANDS as u32 + 1)
+            .map(|n| n * 4..n * 4 + 1)
+            .collect();
+        assert_eq!(merge(&scattered, &[], 100), vec![0..100]);
+    }
+
+    #[test]
     fn a_stride_of_zero_copies_nothing_rather_than_dividing_by_it() {
         let source = [1, 2, 3, 4];
         let mut destination = padded(4, 1);
 
-        blit(&source, 0, &mut destination, 4, 1);
-        blit(&source, 4, &mut destination, 0, 1);
+        blit(&source, 0, &mut destination, 4, 0..1);
+        blit(&source, 4, &mut destination, 0, 0..1);
 
         assert_eq!(destination, [0xAA; 4]);
     }
