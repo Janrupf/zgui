@@ -215,8 +215,34 @@ impl<T> ChunkArena<T> {
     }
 
     /// Whether a key still resolves.
+    ///
+    /// Answered from the slot tables without reaching the value, which is the difference that
+    /// matters when the caller is not going to read it: a stored value can be any size and sits in
+    /// a block the tables do not share a cache line with, so following the pointer to it is a miss
+    /// bought for nothing.
     pub fn contains_key(&self, key: Key<T>) -> bool {
-        self.get(key).is_some()
+        key.domain() == self.domain && self.slots.resolve(key.index(), key.generation()).is_some()
+    }
+
+    /// Borrows the value in `slot`, or [`None`] if that slot holds none.
+    ///
+    /// The lookup a caller that already has a slot number is entitled to. A key names a slot *and*
+    /// which occupant of it, and resolving one costs a counter comparison against a second table
+    /// on top of the occupancy test; a caller holding a bare slot number is asking only the
+    /// occupancy question and pays only for it.
+    ///
+    /// This is the whole of the difference, and it is a narrower promise rather than a faster
+    /// version of the same one. A slot number does not say which occupant, so a caller that keeps
+    /// one across the frame boundary that recycles the slot reads the *next* occupant here, where
+    /// a key would have stopped resolving. Keep slot numbers within a frame, or keep keys.
+    pub fn at(&self, slot: u32) -> Option<&T> {
+        if !self.slots.occupied(slot) {
+            return None;
+        }
+        // SAFETY: the slot is occupied, so it holds a value that has not been dropped, and the
+        // slot cannot be emptied while the returned reference lives: every operation that empties
+        // one takes `&mut self`, which the borrow of `self` behind this reference rules out.
+        Some(unsafe { self.blocks[slot as usize / BLOCK_LEN].get(slot as usize % BLOCK_LEN) })
     }
 
     /// Marks a slot dead.
@@ -425,6 +451,53 @@ mod tests {
         let text = format!("{arena:?}");
         assert!(text.contains("len: 1"), "{text}");
         assert!(text.contains("retired: 0"), "{text}");
+    }
+
+    #[test]
+    fn a_slot_reads_the_same_as_its_key_for_as_long_as_the_key_resolves() {
+        let mut arena: ChunkArena<String> = ChunkArena::new(DomainId::FIRST);
+        let key = arena.insert("held".to_owned());
+        let slot = key.index();
+        assert_eq!(arena.at(slot), arena.get(key));
+
+        // Removal defers, so both still read it; the recycle that drops it empties both.
+        assert!(arena.remove(key));
+        assert_eq!(arena.at(slot).map(String::as_str), Some("held"));
+        arena.recycle();
+        assert_eq!(arena.at(slot), None);
+        assert_eq!(arena.get(key), None);
+
+        // A slot number outlives the occupant it was taken from, which a key does not. This is
+        // the narrower promise the by-slot lookup makes, stated as a test so that it stays true.
+        let next = arena.insert("moved in".to_owned());
+        assert_eq!(next.index(), slot, "the slot came back");
+        assert_eq!(arena.at(slot).map(String::as_str), Some("moved in"));
+        assert_eq!(arena.get(key), None, "the old key still knows better");
+    }
+
+    #[test]
+    fn a_slot_that_was_never_handed_out_holds_nothing() {
+        let mut arena: ChunkArena<u32> = ChunkArena::new(DomainId::FIRST);
+        assert_eq!(arena.at(0), None, "before the first block exists");
+        arena.insert(7);
+        assert_eq!(arena.at(1), None, "past the last slot claimed");
+    }
+
+    #[test]
+    fn a_key_is_tested_without_reading_what_it_names() {
+        let mut arena: ChunkArena<u32> = ChunkArena::new(DomainId::FIRST);
+        let key = arena.insert(7);
+        let foreign: ChunkArena<u32> = ChunkArena::new(DomainId::from_u16(1));
+
+        assert!(arena.contains_key(key));
+        assert!(
+            !foreign.contains_key(key),
+            "a key of another arena names nothing here"
+        );
+        arena.remove(key);
+        assert!(arena.contains_key(key), "still readable this frame");
+        arena.recycle();
+        assert!(!arena.contains_key(key));
     }
 
     #[test]

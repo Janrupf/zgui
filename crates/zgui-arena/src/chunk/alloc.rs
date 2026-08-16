@@ -65,6 +65,20 @@ impl Slots {
         self.states[index as usize]
     }
 
+    /// Whether a slot holds a value that has not been dropped yet.
+    ///
+    /// One table and one comparison, which is what makes it worth stating apart from
+    /// [`Slots::resolve`]. It is the same test [`Slots::resolve`] ends with, and the counter test
+    /// it starts with is the part a caller holding a bare slot number has no question for.
+    ///
+    /// A retired slot answers false, which needs no test of its own: a counter runs out inside the
+    /// same call that empties the slot, so a slot with no counter left is vacant already.
+    pub(crate) fn occupied(&self, index: u32) -> bool {
+        self.states
+            .get(index as usize)
+            .is_some_and(|state| *state != SlotState::Vacant)
+    }
+
     /// Claims a slot for a new value, preferring one that has already been recycled.
     ///
     /// # Panics
