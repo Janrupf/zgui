@@ -16,6 +16,7 @@ use crate::frame::present;
 use crate::pipeline::kind::PipelineKind;
 use crate::renderer::WgpuRenderer;
 use crate::target::acquire::{Acquisition, SurfaceAction};
+use crate::target::swapchain::Presentation;
 
 impl Renderer for WgpuRenderer {
     fn capabilities(&self) -> RenderCapabilities {
@@ -138,6 +139,13 @@ impl Renderer for WgpuRenderer {
             zgui_profile::latency::mark("draw.undamaged");
             return FrameOutcome::Skipped(SkipReason::Undamaged);
         }
+
+        // Resolved here, before anything is recorded, because the copy that ends the frame is
+        // limited to these rows and the copy is recorded below. Taken from what will be drawn
+        // rather than from what was asked for: the widening above happens between the two.
+        let rects = damage::rects(damage, self.composed.used());
+        let redrawn: u64 = rects.iter().map(|rect| damage::area(*rect)).sum();
+        damage::rows_of(&rects, &mut self.composed_rows);
 
         let formats = self.presentation.formats();
         // Before anything is planned: a display list may name an effect declared since the last
@@ -278,7 +286,22 @@ impl Renderer for WgpuRenderer {
         }
         let mut draw_calls = recorded.draw_calls;
         if let Some(view) = &presented.view {
-            self.blit(&mut encoder, view, formats.blit_undoes_srgb());
+            // What the copy has to cover. A supplied set is rotated through and its textures
+            // persist, so a frame copies the rows it drew plus the rows drawn while this texture
+            // was not the one being written — which is worth knowing when every one of those rows
+            // crosses a bus. Everything else is copied whole: an acquired surface texture is a new
+            // resource marked wholly uninitialised on every acquisition, so a partial copy onto one
+            // comes out black everywhere it did not write.
+            let rows = match &mut self.presentation {
+                Presentation::Supplied(supplied) => {
+                    let slot = supplied.selected();
+                    supplied.owed(slot, &self.composed_rows)
+                }
+                Presentation::Surface(_) | Presentation::Offscreen(_) => {
+                    damage::every_row(self.composed.used().size.height.max(0) as u32)
+                }
+            };
+            self.blit(&mut encoder, view, formats.blit_undoes_srgb(), &rows);
             draw_calls += 1;
         }
         self.gpu.queue().submit([encoder.finish()]);
@@ -303,12 +326,7 @@ impl Renderer for WgpuRenderer {
         }
         zgui_profile::latency::mark("pres.out");
 
-        let rects = damage::rects(damage, self.composed.used());
-        let redrawn: u64 = rects.iter().map(|rect| damage::area(*rect)).sum();
         counter::add(Counter::DamagePx, redrawn);
-        // Recorded from what was drawn rather than from what was asked for, because the widening
-        // above happens between the two. A backend that copies the target out reads these.
-        damage::rows_of(&rects, &mut self.composed_rows);
         let stats = FrameStats {
             draw_calls,
             vector_passes: scene.pass_plan().passes.len() as u32,
@@ -530,8 +548,17 @@ impl WgpuRenderer {
         }
     }
 
-    /// Copies the composed target onto whatever is being presented to.
-    fn blit(&mut self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, undo: bool) {
+    /// Copies the rows `rows` names of the composed target onto whatever is being presented to.
+    ///
+    /// The attachment is **loaded** rather than cleared. A clear covers the whole of it whatever
+    /// the scissor says, so clearing here would blank every row this copy is not about to write.
+    fn blit(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        undo: bool,
+        rows: &[core::ops::Range<u32>],
+    ) {
         let kind = if undo {
             PipelineKind::BlitUndoSrgb
         } else {
@@ -549,9 +576,7 @@ impl WgpuRenderer {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    // Every pixel is written, so nothing has to be preserved and no clear is
-                    // inserted ahead of the copy.
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -562,6 +587,14 @@ impl WgpuRenderer {
         });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.composed_binding, &[]);
-        pass.draw(0..4, 0..1);
+        let width = self.composed.used().size.width.max(0) as u32;
+        for band in rows {
+            let height = band.end.saturating_sub(band.start);
+            if width == 0 || height == 0 {
+                continue;
+            }
+            pass.set_scissor_rect(0, band.start, width, height);
+            pass.draw(0..4, 0..1);
+        }
     }
 }

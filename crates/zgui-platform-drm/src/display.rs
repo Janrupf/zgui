@@ -39,7 +39,7 @@ use std::sync::Arc;
 use zgui_drm::Device;
 use zgui_drm::commit::Commit;
 use zgui_platform::{PlatformError, SurfaceId};
-use zgui_render_wgpu::{Pixels, wgpu};
+use zgui_render_wgpu::{Gpu, Pixels, wgpu};
 
 use crate::cursor::Cursor;
 use crate::scanout::Scanout;
@@ -185,12 +185,7 @@ impl DrmDisplay {
     /// Cloning a texture handle costs one reference count, and the buffer lives until every clone
     /// has gone.
     pub fn textures(&self) -> Vec<wgpu::Texture> {
-        self.scanout
-            .borrow()
-            .buffers()
-            .iter()
-            .map(|buffer| buffer.texture().clone())
-            .collect()
+        self.scanout.borrow().textures()
     }
 
     /// Takes the buffer the next frame is drawn into back from the display engine, and names it.
@@ -230,18 +225,22 @@ impl DrmDisplay {
     /// [`DrmDisplay::acquire`] answered nothing.
     ///
     /// The pointer is not drawn: a display on this shape has one on a plane, which is the condition
-    /// [`Scanout::imported`] chose it under.
+    /// both drawn shapes were chosen under.
+    ///
+    /// `gpu` is the device the frame was composed on. The OpenGL shape has no pair of barriers to
+    /// pass an image between queue families, so what stands in for them is a fence taken here — and
+    /// a fence belongs to the device that drew, which nothing below this holds.
     ///
     /// # Errors
     ///
     /// Returns [`PlatformError::Backend`] when this display is on the copied shape, when the buffer
     /// was never taken back, when the graphics device refuses or does not finish the barrier, and
     /// when the driver refuses the mode or the flip.
-    pub fn present_drawn(&self) -> Result<bool, PlatformError> {
+    pub fn present_drawn(&self, gpu: &Gpu) -> Result<bool, PlatformError> {
         let mut commit = self.commit.borrow_mut();
         self.scanout
             .borrow_mut()
-            .present_drawn(&self.device, &mut **commit)
+            .present_drawn(&self.device, &mut **commit, gpu)
     }
 }
 
