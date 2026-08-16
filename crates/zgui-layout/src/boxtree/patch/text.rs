@@ -87,10 +87,19 @@ fn visit(
         // a change to what the boxes are made of throughout a subtree, and it arrives with an
         // obligation to rebuild anyway; refusing here is what keeps the two answers from
         // disagreeing.
+        // An element with no children generates no runs, so there is nothing below it for a
+        // re-shape to be about and nothing a rebuild would produce differently. Saying so is worth
+        // a line because the refusal below is not a local one: it rebuilds the *whole* box tree,
+        // which reports every fragment as new, which repaints the whole surface. An element is
+        // told it owes a re-shape the first time it is ever styled — it has never been shaped, so
+        // there is nothing to reuse — and in a document whose elements are first styled at
+        // different moments, that is one whole-surface repaint apiece. A moving box that carries
+        // no text was costing 1.3 megapixels to move sixty-four by thirty-two.
         if core.kind() != NodeKind::Text {
-            return false;
-        }
-        if !rewrite(store, document, index, rewritten) {
+            if core.first_child().is_some() {
+                return false;
+            }
+        } else if !rewrite(store, document, index, rewritten) {
             return false;
         }
     }
