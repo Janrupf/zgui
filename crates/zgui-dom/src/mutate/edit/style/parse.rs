@@ -18,18 +18,30 @@ use style::context::QuirksMode;
 use style::properties::{Importance, PropertyDeclarationBlock, PropertyId, parse_style_attribute};
 use style::stylesheets::{CssRuleType, UrlExtraData};
 
-/// The base a declaration's URL-valued components resolve against.
-///
-/// Built by inference rather than by naming the URL library: the type is fixed by the field it
-/// goes into, so nothing here has to name a crate the ledger does not permit.
+thread_local! {
+    /// The base a declaration's URL-valued components resolve against.
+    ///
+    /// Built by inference rather than by naming the URL library: the type is fixed by the field it
+    /// goes into, so nothing here has to name a crate the ledger does not permit.
+    ///
+    /// Parsed once a thread rather than once a call, because it is a constant and the call is not
+    /// rare. An animation that moves a box by rewriting its `style` attribute parses one of these
+    /// per element per frame — forty-eight of them at sixty hertz is three thousand URL parses and
+    /// three thousand allocations a second, for the same seven characters every time.
+    static BASE_URL: UrlExtraData = UrlExtraData(ServoArc::new(parsed("zgui:///")));
+}
+
+/// A copy of the base URL, which is a reference count rather than a parse.
 fn base_url() -> UrlExtraData {
-    fn parsed<T: FromStr>(text: &str) -> T
-    where
-        T::Err: core::fmt::Debug,
-    {
-        text.parse().expect("a well-formed base URL")
-    }
-    UrlExtraData(ServoArc::new(parsed("zgui:///")))
+    BASE_URL.with(Clone::clone)
+}
+
+/// `text`, parsed into whatever the caller needs it as.
+fn parsed<T: FromStr>(text: &str) -> T
+where
+    T::Err: core::fmt::Debug,
+{
+    text.parse().expect("a well-formed base URL")
 }
 
 /// Parses a whole `style` attribute's worth of declarations.
