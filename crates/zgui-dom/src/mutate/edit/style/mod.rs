@@ -48,6 +48,17 @@ impl Edit<'_> {
         if parsed.is_none() && slot.is_none() {
             return;
         }
+        // A re-cascade is a restyle, a relayout and a repaint of the element that took it, and
+        // this is the commonest way for a view to ask for all three while changing nothing: a
+        // binding that recomputes more often than its value changes hands back a freshly built
+        // string that spells out exactly what the element already declares. An animation moving a
+        // box by whole pixels does it on every frame the box has not yet crossed one.
+        //
+        // [`Wrote::Unchanged`](parse::Wrote::Unchanged) is the same answer for one declaration;
+        // this is it for the whole attribute.
+        if declares_the_same(&lock, slot.as_ref(), parsed.as_ref()) {
+            return;
+        }
         *slot = parsed.map(|block| wrapped(&lock, block));
         self.recascade(node);
     }
@@ -167,6 +178,29 @@ impl Edit<'_> {
 /// One block, wrapped in the document's lock and reference-counted.
 fn wrapped(lock: &SharedRwLock, block: PropertyDeclarationBlock) -> StyleBlock {
     servo_arc::Arc::new(lock.wrap(block))
+}
+
+/// Whether what an element already declares of its own and what it is being given are the same
+/// declarations, in the same order, at the same importance.
+///
+/// Compared as parsed declarations rather than as the text they came from, so `10.0px` and `10px`
+/// — the same declaration written two ways — are the same declaration, exactly as they are for one
+/// property in [`parse::set`].
+fn declares_the_same(
+    lock: &SharedRwLock,
+    held: Option<&StyleBlock>,
+    parsed: Option<&PropertyDeclarationBlock>,
+) -> bool {
+    match (held, parsed) {
+        (None, None) => true,
+        (Some(held), Some(parsed)) => {
+            let guard = lock.read();
+            let held = held.read_with(&guard);
+            held.declarations() == parsed.declarations()
+                && held.declarations_importance() == parsed.declarations_importance()
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
