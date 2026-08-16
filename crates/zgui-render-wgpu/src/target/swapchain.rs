@@ -5,10 +5,20 @@ use zgui_geom::{Device, Rect, Size};
 
 /// How many disjoint rectangles a supplied texture's outstanding copy is tracked as.
 ///
-/// Larger than the renderer's own `MAX_DAMAGE` on purpose. A rectangle there is a whole render
-/// pass; a rectangle here is a scissor and a draw inside one pass that is open anyway, which costs
-/// almost nothing — so the two want different numbers and this one is stated where it is paid.
-const STALE: usize = 32;
+/// Stated as a multiple of [`MAX_DAMAGE`] rather than as a number, because below it the set cannot
+/// hold even one frame's damage: the rectangles merge, the merged ones cover the gaps between
+/// them, and the copy writes pixels no frame ever changed. On a display whose buffers are on the
+/// far side of a bus that is the largest thing a frame spends — measured at half as much again as
+/// the frame's own damage, for a set one rectangle short of holding it.
+///
+/// Twice, because a texture is written every second or third frame and is owed what was drawn
+/// while it was not. Frame to frame those rectangles mostly land on each other and absorb, so the
+/// second copy is headroom rather than a count of anything.
+///
+/// The other end of the trade is a scissor and a draw per rectangle, inside a pass that is open
+/// anyway. A draw costs about seventeen microseconds on the slowest driver this was measured
+/// against, and a rectangle merged away wastes far more than that in pixels.
+const STALE: usize = zgui_bits::MAX_DAMAGE * 2;
 
 use crate::gpu::device::Gpu;
 use crate::gpu::formats::{self, Formats};
