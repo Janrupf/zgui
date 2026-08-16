@@ -6,7 +6,7 @@
 // interior is exact.
 //
 // This is the arrangement for a device with no compute shaders, so there is nothing here but a
-// vertex stage, a fragment stage and two read-only storage buffers.
+// vertex stage, a fragment stage and read-only textures.
 
 struct Item {
     // The quad, in the pass region's own pixels: origin then extent.
@@ -16,29 +16,23 @@ struct Item {
     viewport: vec4<f32>,
     // Straight, gamma-encoded colour.
     color: vec4<f32>,
-    // x: first segment. y: how many. z: non-zero for the even-odd rule. w: first clip run.
+    // x: first band. y: how many. z: non-zero for the even-odd rule. w: first clip run.
     control: vec4<f32>,
-    // x: how many clip runs. yzw unused.
-    clips: vec4<f32>,
+    // x: how many clip runs. y: where the first band begins. z: how tall one band is. w unused.
+    bands: vec4<f32>,
 }
 
 // Textures rather than storage buffers, so that a device with no storage buffers at all — a GL 3.3
 // context, WebGL 2 — can run this. It is the rasteriser such a device falls back *to*, so it above
 // all must not ask for what that device has none of.
 @group(0) @binding(0) var items: texture_2d<u32>;
-// Every outline in the frame, end to end: x0, y0, x1, y1. One texel each.
-@group(0) @binding(1) var segments: texture_2d<u32>;
+// Every outline the fragment stage walks: each band's own segments, then each clip run's. One
+// texel per segment — x0, y0, x1, y1.
+@group(0) @binding(1) var outlines: texture_2d<u32>;
 // Where each clip's outline starts, how long it is, and whether it is tested even-odd.
 @group(0) @binding(2) var runs: texture_2d<u32>;
-// Per band: where its segment indices start, and how many there are.
+// Per band: where its own segments start, and how many there are.
 @group(0) @binding(3) var bands: texture_2d<u32>;
-// The segment indices the bands name, four to a texel.
-@group(0) @binding(4) var band_index: texture_2d<u32>;
-
-/// The segment index at `slot` of the band table.
-fn band_segment(slot: u32) -> u32 {
-    return textureLoad(band_index, table_texel(slot / 4u), 0)[slot % 4u];
-}
 
 /// How many texels wide every one of them is. `TableTexture` uses the same number.
 const TABLE_TEXELS_WIDE: u32 = 256u;
@@ -53,7 +47,7 @@ fn table_texel(index: u32) -> vec2<i32> {
 
 /// One segment, which is one texel.
 fn load_segment(index: u32) -> vec4<f32> {
-    return bitcast<vec4<f32>>(textureLoad(segments, table_texel(index), 0));
+    return bitcast<vec4<f32>>(textureLoad(outlines, table_texel(index), 0));
 }
 
 /// One clip run, which is one texel.
@@ -78,13 +72,107 @@ fn load_item(slot: u32) -> Item {
     );
 }
 
-// The sampling grid's side. Sixteen samples per pixel, which is the quality this trades for needing
-// nothing but a fragment shader.
-const GRID: i32 = 4;
+// Where the sample grid's four rows and four columns sit inside a pixel. Sixteen samples per pixel,
+// which is the quality this trades for needing nothing but a fragment shader.
+const OFFSETS: vec4<f32> = vec4<f32>(0.125, 0.375, 0.625, 0.875);
+
+/// What the sixteen samples of one pixel have counted, a row of four to a vector.
+///
+/// Four vectors rather than an array, because an array a loop counter indexes becomes addressable
+/// storage on a driver that cannot prove the index away, and that storage is off the chip.
+struct Rows {
+    first: vec4<i32>,
+    second: vec4<i32>,
+    third: vec4<i32>,
+    fourth: vec4<i32>,
+}
+
+/// Nothing counted yet.
+fn no_rows() -> Rows {
+    return Rows(vec4<i32>(0), vec4<i32>(0), vec4<i32>(0), vec4<i32>(0));
+}
+
+/// What one segment's crossing of the row at `y` adds to that row's four samples.
+///
+/// `slope` is the segment's own dx/dy, which is one division for the four rows rather than one for
+/// each. The ray is cast to the right, so a crossing counts for every sample it is to the right of
+/// — and those are a prefix of the row, which makes the whole row one comparison against one number.
+fn crossing(a: vec2<f32>, ends: f32, slope: f32, y: f32, columns: vec4<f32>, delta: i32) -> vec4<i32> {
+    if (a.y > y) == (ends > y) {
+        return vec4<i32>(0);
+    }
+    let at = a.x + (y - a.y) * slope;
+    // Built from the comparison rather than selected on it, because `select` over an integer
+    // vector reaches GLSL 330 as a `mix` that version defines for floating point only.
+    return vec4<i32>(columns < vec4<f32>(at)) * delta;
+}
+
+/// What the segments `first .. first + count` do to each of a pixel's sixteen samples.
+///
+/// One pass over the outline serves the whole pixel: a segment is fetched once and then asked where
+/// it crosses each of the four sample rows. Fetching it once for each row instead is four times the
+/// memory traffic for the same answer.
+///
+/// Even-odd counts crossings and non-zero sums their directions, so one accumulator serves both
+/// rules — a step of one for the first, the crossing's own direction for the second.
+fn wind(first: u32, count: u32, rows: vec4<f32>, columns: vec4<f32>, even_odd: bool) -> Rows {
+    var out = no_rows();
+    for (var index = 0u; index < count; index = index + 1u) {
+        let segment = load_segment(first + index);
+        let a = segment.xy;
+        let b = segment.zw;
+        let delta = select(select(-1, 1, b.y > a.y), 1, even_odd);
+        // The one division the segment needs, taken out of the four rows that share it. A segment
+        // is never horizontal — one of those crosses no row and is dropped where it is flattened —
+        // so this never divides by nothing.
+        let slope = (b.x - a.x) / (b.y - a.y);
+        out.first = out.first + crossing(a, b.y, slope, rows.x, columns, delta);
+        out.second = out.second + crossing(a, b.y, slope, rows.y, columns, delta);
+        out.third = out.third + crossing(a, b.y, slope, rows.z, columns, delta);
+        out.fourth = out.fourth + crossing(a, b.y, slope, rows.w, columns, delta);
+    }
+    return out;
+}
+
+/// The fill rule applied to one row of four counts: one where the sample is inside, zero where not.
+fn holds(counted: vec4<i32>, even_odd: bool) -> vec4<i32> {
+    if even_odd {
+        return counted & vec4<i32>(1);
+    }
+    return vec4<i32>(counted != vec4<i32>(0));
+}
+
+/// Which of a pixel's sixteen samples the counted crossings put inside the outline.
+fn filled(counted: Rows, even_odd: bool) -> Rows {
+    return Rows(
+        holds(counted.first, even_odd),
+        holds(counted.second, even_odd),
+        holds(counted.third, even_odd),
+        holds(counted.fourth, even_odd),
+    );
+}
+
+/// The samples both masks hold.
+fn both(left: Rows, right: Rows) -> Rows {
+    return Rows(
+        left.first & right.first,
+        left.second & right.second,
+        left.third & right.third,
+        left.fourth & right.fourth,
+    );
+}
+
+/// How many of the sixteen samples a mask holds.
+fn tally(mask: Rows) -> i32 {
+    let sum = mask.first + mask.second + mask.third + mask.fourth;
+    return sum.x + sum.y + sum.z + sum.w;
+}
 
 struct Varying {
     @builtin(position) position: vec4<f32>,
-    @location(0) @interpolate(flat) instance: u32,
+    @location(0) @interpolate(flat) color: vec4<f32>,
+    @location(1) @interpolate(flat) control: vec4<f32>,
+    @location(2) @interpolate(flat) bands: vec4<f32>,
 }
 
 @vertex
@@ -101,186 +189,56 @@ fn vs_coverage(
     );
     var out: Varying;
     out.position = vec4<f32>(ndc, 0.0, 1.0);
-    out.instance = instance;
+    // Carried across rather than fetched again per fragment. A record is five texels and a fragment
+    // reads three of them, so forwarding costs interpolator slots the device has to spare and saves
+    // three fetches on every pixel of every item.
+    out.color = item.color;
+    out.control = item.control;
+    out.bands = item.bands;
     return out;
 }
 
 @fragment
 fn fs_coverage(in: Varying) -> @location(0) vec4<f32> {
-    let item = load_item(in.instance);
-    let first = u32(item.control.x);
-    let count = u32(item.control.y);
-    let even_odd = item.control.z != 0.0;
-    let clip_first = u32(item.control.w);
-    let clip_count = u32(item.clips.x);
+    let band_first = u32(in.control.x);
+    let band_count = u32(in.control.y);
+    let even_odd = in.control.z != 0.0;
+    let clip_first = u32(in.control.w);
+    let clip_count = u32(in.bands.x);
+    let top = in.bands.y;
+    let tall = in.bands.z;
+    if band_count == 0u {
+        return vec4<f32>(0.0);
+    }
 
     let corner = floor(in.position.xy);
-    let banded = u32(item.clips.z) != 0u && item.clips.w > 0.0;
-    var inside = 0;
-    for (var j = 0; j < GRID; j = j + 1) {
-        let y = corner.y + (f32(j) + 0.5) / f32(GRID);
-        // Once for the row, not once for each of its samples.
-        let band = band_at(item, y);
-        let mask = row_mask(band, banded, even_odd, corner.x, y);
-        for (var i = 0; i < GRID; i = i + 1) {
-            if (mask & (1u << u32(i))) == 0u {
-                continue;
-            }
-            let sample = vec2<f32>(corner.x + (f32(i) + 0.5) / f32(GRID), y);
-            // A residual clip is one the composite could not bind, so it is applied here — per
-            // sample rather than as a separate coverage multiplied in afterwards, which is what
-            // keeps the corner where an edge meets a clip from being lighter than either.
-            var clipped = false;
-            for (var c = 0u; c < clip_count; c = c + 1u) {
-                let run = load_run(clip_first + c);
-                if !contains(sample, u32(run.x), u32(run.y), run.z != 0.0) {
-                    clipped = true;
-                    break;
-                }
-            }
-            if !clipped {
-                inside = inside + 1;
-            }
-        }
+    let columns = corner.x + OFFSETS;
+    let rows = corner.y + OFFSETS;
+
+    // A band is a whole number of pixels tall and begins on a pixel boundary, so the one band this
+    // pixel sits in holds every segment that can cross any of its sixteen samples. That is what
+    // lets the band be found once and walked once, rather than once for each row of four.
+    let which = clamp(i32((corner.y - top) / tall), 0, i32(band_count) - 1);
+    let band = textureLoad(bands, table_texel(band_first + u32(which)), 0);
+    var inside = filled(wind(band.x, band.y, rows, columns, even_odd), even_odd);
+
+    // A residual clip is one the composite could not bind, so it is applied here — per sample
+    // rather than as a separate coverage multiplied in afterwards, which is what keeps the corner
+    // where an edge meets a clip from being lighter than either.
+    for (var c = 0u; c < clip_count; c = c + 1u) {
+        let run = load_run(clip_first + c);
+        let clip_even_odd = run.z != 0.0;
+        let counted = wind(u32(run.x), u32(run.y), rows, columns, clip_even_odd);
+        inside = both(inside, filled(counted, clip_even_odd));
     }
-    let coverage = f32(inside) / f32(GRID * GRID);
+
+    let coverage = f32(tally(inside)) / 16.0;
     if coverage <= 0.0 {
         return vec4<f32>(0.0);
     }
     // Premultiplied on the way into the accumulation texture, because that is the only form in
     // which source-over is a fixed-function blend. The resolve turns it back into the straight
     // colour the composite expects to read.
-    let alpha = item.color.a * coverage;
-    return vec4<f32>(item.color.rgb * alpha, alpha);
-}
-
-// Whether `point` is inside the outline held in segments `first .. first + count`.
-/// Where the segments of the band holding `y` start, and how many there are.
-///
-/// Resolved once for a row of samples rather than once for each: every sample in a row shares its
-/// `y`, so it shares its band, and the lookup is a texture read that would otherwise be made four
-/// times over for one answer.
-fn band_at(item: Item, y: f32) -> vec2<u32> {
-    let band_count = u32(item.clips.z);
-    let tall = item.clips.w;
-    if band_count == 0u || tall <= 0.0 {
-        // No bands: the whole shape, which is the same answer by the long road.
-        return vec2<u32>(u32(item.control.x), u32(item.control.y));
-    }
-    let which = clamp(i32(floor((y - item.bounds.y) / tall)), 0, i32(band_count) - 1);
-    let band = textureLoad(bands, table_texel(u32(item.clips.y) + u32(which)), 0);
-    return vec2<u32>(band.x, band.y);
-}
-
-/// Which samples of one row are inside the shape, as one bit each.
-///
-/// A row's samples share their `y`, so a segment crosses that row once and at one place. Walking
-/// the band once and asking every sample where it sits against that crossing costs one fetch and
-/// one division for the row; asking each sample to walk the band itself costs four of each for the
-/// same answer.
-fn row_mask(
-    band: vec2<u32>,
-    banded: bool,
-    even_odd: bool,
-    left: f32,
-    y: f32,
-) -> u32 {
-    var winding = array<i32, 4>(0, 0, 0, 0);
-    var crossings = array<i32, 4>(0, 0, 0, 0);
-
-    for (var index = 0u; index < band.y; index = index + 1u) {
-        var slot = band.x + index;
-        if banded {
-            slot = band_segment(slot);
-        }
-        let segment = load_segment(slot);
-        let a = segment.xy;
-        let b = segment.zw;
-        if (a.y > y) == (b.y > y) {
-            continue;
-        }
-        let at = a.x + (y - a.y) / (b.y - a.y) * (b.x - a.x);
-        let step = select(-1, 1, b.y > a.y);
-        for (var i = 0; i < GRID; i = i + 1) {
-            // The same comparison `contains` makes, against each sample of the row in turn.
-            if at > left + (f32(i) + 0.5) / f32(GRID) {
-                crossings[i] = crossings[i] + 1;
-                winding[i] = winding[i] + step;
-            }
-        }
-    }
-
-    var mask = 0u;
-    for (var i = 0; i < GRID; i = i + 1) {
-        var hit = winding[i] != 0;
-        if even_odd {
-            hit = (crossings[i] & 1) == 1;
-        }
-        if hit {
-            mask = mask | (1u << u32(i));
-        }
-    }
-    return mask;
-}
-
-/// Whether `point` is inside the shape, testing the segments `band` names.
-///
-/// `banded` says whether those are indices into the band table or a plain run of segments, which is
-/// what lets a shape with no bands take the same path.
-fn contains_in_band(point: vec2<f32>, band: vec2<u32>, even_odd: bool, banded: bool) -> bool {
-    var winding = 0;
-    var crossings = 0;
-    for (var index = 0u; index < band.y; index = index + 1u) {
-        var slot = band.x + index;
-        if banded {
-            slot = band_segment(slot);
-        }
-        let segment = load_segment(slot);
-        let a = segment.xy;
-        let b = segment.zw;
-        if (a.y > point.y) == (b.y > point.y) {
-            continue;
-        }
-        let at = a.x + (point.y - a.y) / (b.y - a.y) * (b.x - a.x);
-        if at <= point.x {
-            continue;
-        }
-        crossings = crossings + 1;
-        if b.y > a.y {
-            winding = winding + 1;
-        } else {
-            winding = winding - 1;
-        }
-    }
-    if even_odd {
-        return (crossings & 1) == 1;
-    }
-    return winding != 0;
-}
-
-fn contains(point: vec2<f32>, first: u32, count: u32, even_odd: bool) -> bool {
-    var winding = 0;
-    var crossings = 0;
-    for (var index = 0u; index < count; index = index + 1u) {
-        let segment = load_segment(first + index);
-        let a = segment.xy;
-        let b = segment.zw;
-        if (a.y > point.y) == (b.y > point.y) {
-            continue;
-        }
-        let at = a.x + (point.y - a.y) / (b.y - a.y) * (b.x - a.x);
-        if at <= point.x {
-            continue;
-        }
-        crossings = crossings + 1;
-        if b.y > a.y {
-            winding = winding + 1;
-        } else {
-            winding = winding - 1;
-        }
-    }
-    if even_odd {
-        return (crossings & 1) == 1;
-    }
-    return winding != 0;
+    let alpha = in.color.a * coverage;
+    return vec4<f32>(in.color.rgb * alpha, alpha);
 }
