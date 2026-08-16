@@ -50,11 +50,58 @@ fn load_shadow(slot: u32) -> Shadow {
     );
 }
 
+// The record travels with the vertices rather than being fetched again per fragment.
+//
+// It is one value for the whole instance, so the four vertices already know all of it — and the
+// fragment shader was reading all nine of its texels again for every pixel it covered. On a device
+// whose tables are textures those nine fetches were 42% of the composition pass, three times what
+// the whole blur integral costs. Flat interpolation is the same value delivered without them.
 struct ShadowVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) local: vec2<f32>,
-    @location(1) @interpolate(flat) instance: u32,
-    @location(2) @interpolate(flat) shift: vec2<f32>,
+    @location(1) @interpolate(flat) bounds: vec4<f32>,
+    @location(2) @interpolate(flat) radii_near: vec4<f32>,
+    @location(3) @interpolate(flat) radii_far: vec4<f32>,
+    @location(4) @interpolate(flat) element_bounds: vec4<f32>,
+    @location(5) @interpolate(flat) element_radii_near: vec4<f32>,
+    @location(6) @interpolate(flat) element_radii_far: vec4<f32>,
+    @location(7) @interpolate(flat) color: vec4<f32>,
+    @location(8) @interpolate(flat) blur: f32,
+    @location(9) @interpolate(flat) clip: u32,
+    @location(10) @interpolate(flat) inset: u32,
+    @location(11) @interpolate(flat) shift: vec2<f32>,
+    @location(12) @interpolate(flat) shape: f32,
+}
+
+// The record put back together from what the vertices carried.
+//
+// `order`, `transform` and `reserved` are the vertex stage's alone — one decides nothing here, one
+// has already been applied to the position, and one is padding — so they are not carried and are
+// filled with zero.
+fn shadow_of(in: ShadowVarying) -> Shadow {
+    return Shadow(
+        0u,
+        in.blur,
+        Bounds(in.bounds.x, in.bounds.y, in.bounds.z, in.bounds.w),
+        Radii(
+            in.radii_near.x, in.radii_near.y, in.radii_near.z, in.radii_near.w,
+            in.radii_far.x, in.radii_far.y, in.radii_far.z, in.radii_far.w,
+        ),
+        Bounds(
+            in.element_bounds.x, in.element_bounds.y, in.element_bounds.z, in.element_bounds.w,
+        ),
+        Radii(
+            in.element_radii_near.x, in.element_radii_near.y,
+            in.element_radii_near.z, in.element_radii_near.w,
+            in.element_radii_far.x, in.element_radii_far.y,
+            in.element_radii_far.z, in.element_radii_far.w,
+        ),
+        Rgba(in.color.x, in.color.y, in.color.z, in.color.w),
+        in.clip,
+        0u,
+        in.inset,
+        in.shape,
+    );
 }
 
 @vertex
@@ -70,8 +117,23 @@ fn vs_shadow(
     var out: ShadowVarying;
     out.position = to_clip_position(local, shadow.transform);
     out.local = local;
-    out.instance = slot;
+    let b = shadow.bounds;
+    out.bounds = vec4<f32>(b.x, b.y, b.w, b.h);
+    let r = shadow.radii;
+    out.radii_near = vec4<f32>(r.tl_x, r.tl_y, r.tr_x, r.tr_y);
+    out.radii_far = vec4<f32>(r.br_x, r.br_y, r.bl_x, r.bl_y);
+    let e = shadow.element_bounds;
+    out.element_bounds = vec4<f32>(e.x, e.y, e.w, e.h);
+    let q = shadow.element_radii;
+    out.element_radii_near = vec4<f32>(q.tl_x, q.tl_y, q.tr_x, q.tr_y);
+    out.element_radii_far = vec4<f32>(q.br_x, q.br_y, q.bl_x, q.bl_y);
+    let c = shadow.color;
+    out.color = vec4<f32>(c.r, c.g, c.b, c.a);
+    out.blur = shadow.blur;
+    out.clip = shadow.clip;
+    out.inset = shadow.inset;
     out.shift = shift;
+    out.shape = shadow.shape;
     return out;
 }
 
@@ -125,7 +187,7 @@ fn blur_along_x(
 
 @fragment
 fn fs_shadow(in: ShadowVarying) -> @location(0) vec4<f32> {
-    let shadow = load_shadow(in.instance);
+    let shadow = shadow_of(in);
     let clip = clip_coverage(device_position(in.position.xy), shadow.clip);
     if clip <= 0.0 {
         return vec4<f32>(0.0);
