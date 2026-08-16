@@ -66,11 +66,14 @@ struct ShadowVarying {
     @location(5) @interpolate(flat) element_radii_near: vec4<f32>,
     @location(6) @interpolate(flat) element_radii_far: vec4<f32>,
     @location(7) @interpolate(flat) color: vec4<f32>,
-    @location(8) @interpolate(flat) blur: f32,
-    @location(9) @interpolate(flat) clip: u32,
-    @location(10) @interpolate(flat) inset: u32,
-    @location(11) @interpolate(flat) shift: vec2<f32>,
-    @location(12) @interpolate(flat) shape: f32,
+    // The clip's own box, and in `misc` the blur, whether the shadow is inset, and how many
+    // rounded tests the clip carries. The clip is read here for the same reason the record is:
+    // nearly every primitive is clipped by nothing but a box, and answering that per fragment was
+    // two more texture reads for a result the whole instance shares.
+    @location(8) @interpolate(flat) clip_box: vec4<f32>,
+    @location(9) @interpolate(flat) misc: vec4<f32>,
+    @location(10) @interpolate(flat) shift: vec2<f32>,
+    @location(11) @interpolate(flat) shape: f32,
 }
 
 // The record put back together from what the vertices carried.
@@ -81,7 +84,7 @@ struct ShadowVarying {
 fn shadow_of(in: ShadowVarying) -> Shadow {
     return Shadow(
         0u,
-        in.blur,
+        in.misc.x,
         Bounds(in.bounds.x, in.bounds.y, in.bounds.z, in.bounds.w),
         Radii(
             in.radii_near.x, in.radii_near.y, in.radii_near.z, in.radii_near.w,
@@ -97,11 +100,24 @@ fn shadow_of(in: ShadowVarying) -> Shadow {
             in.element_radii_far.z, in.element_radii_far.w,
         ),
         Rgba(in.color.x, in.color.y, in.color.z, in.color.w),
-        in.clip,
         0u,
-        in.inset,
+        0u,
+        u32(in.misc.y),
         in.shape,
     );
+}
+
+// Coverage by the clip, from what the vertices carried.
+//
+// A clip that is a box and nothing else — which is nearly all of them — is settled by the box test
+// alone, and the rounded tests below it are never reached. The two texture reads that used to
+// answer this per fragment are gone; only a clip that really rounds still reads a table.
+fn clip_from(in: ShadowVarying, point: vec2<f32>) -> f32 {
+    let box = in.clip_box;
+    if point.x < box.x || point.y < box.y || point.x > box.x + box.z || point.y > box.y + box.w {
+        return 0.0;
+    }
+    return clip_rounded_coverage(point, u32(in.misc.w), u32(in.misc.z));
 }
 
 @vertex
@@ -129,9 +145,9 @@ fn vs_shadow(
     out.element_radii_far = vec4<f32>(q.br_x, q.br_y, q.bl_x, q.bl_y);
     let c = shadow.color;
     out.color = vec4<f32>(c.r, c.g, c.b, c.a);
-    out.blur = shadow.blur;
-    out.clip = shadow.clip;
-    out.inset = shadow.inset;
+    out.clip_box = bitcast<vec4<f32>>(textureLoad(clips, table_texel(shadow.clip * 11u + 0u), 0));
+    let rounds = textureLoad(clips, table_texel(shadow.clip * 11u + 9u), 0).x;
+    out.misc = vec4<f32>(shadow.blur, f32(shadow.inset), f32(rounds), f32(shadow.clip));
     out.shift = shift;
     out.shape = shadow.shape;
     return out;
@@ -188,7 +204,7 @@ fn blur_along_x(
 @fragment
 fn fs_shadow(in: ShadowVarying) -> @location(0) vec4<f32> {
     let shadow = shadow_of(in);
-    let clip = clip_coverage(device_position(in.position.xy), shadow.clip);
+    let clip = clip_from(in, device_position(in.position.xy));
     if clip <= 0.0 {
         return vec4<f32>(0.0);
     }
