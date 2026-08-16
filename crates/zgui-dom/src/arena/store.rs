@@ -206,9 +206,15 @@ impl DocumentStore {
     }
 
     /// The record for `index`, or [`None`] if it names nothing live.
+    ///
+    /// Asked of the arena by slot rather than through the key table, which answers the same
+    /// question with two fewer tables read. The key table holds the name of each slot's *current*
+    /// occupant — every insertion into a slot overwrites it — so the counter that a lookup through
+    /// it compares is the counter it just loaded from the slot it is comparing against. A slot
+    /// number resolves here exactly when it resolved there, and both mean "this slot holds a
+    /// record".
     pub fn try_core(&self, index: NodeIndex) -> Option<&NodeInner> {
-        let key = *self.keys.get(index.get() as usize)?;
-        self.arena.get(key)
+        self.arena.at(index.get())
     }
 
     /// The record `key` names, or [`None`] if the node it named is gone.
@@ -226,8 +232,16 @@ impl DocumentStore {
     }
 
     /// `key`'s slot number, or [`None`] if the node it named is gone.
+    ///
+    /// Read off the key once the key is known to resolve, rather than off the record it resolves
+    /// to. The two are the same number — a record's own name is the key it was inserted with, and
+    /// the slot number in it is that key's — so reading the record buys nothing and costs a walk
+    /// out to wherever the record sits, which is a different cache line from the tables that
+    /// decided the key resolves.
     pub fn index_of(&self, key: NodeKey) -> Option<NodeIndex> {
-        self.arena.get(key).map(NodeInner::index)
+        self.arena
+            .contains_key(key)
+            .then(|| NodeIndex::new(key.index()))
     }
 
     /// `node`'s position among its element siblings, counting from zero.
