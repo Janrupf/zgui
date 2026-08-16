@@ -68,7 +68,7 @@ fn Motion() -> impl IntoView {
         .ok()
         .and_then(|held| held.parse::<usize>().ok())
         .unwrap_or(BOXES)
-        .clamp(1, 64);
+        .clamp(1, 512);
 
     // The frame counter every position is derived from. One signal rather than one per block, so a
     // tick writes once and the blocks are recomputed from it.
