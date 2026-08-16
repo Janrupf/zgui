@@ -31,6 +31,61 @@ impl Scene {
         }
     }
 
+    /// Where the primitive at draw-order `position` of `kind` puts ink, in device pixels.
+    ///
+    /// `None` for a primitive drawn under a coordinate system of its own, and for a position past
+    /// the end. A primitive's ink is stated in the space it is drawn in, so only one drawn in the
+    /// viewport's own space has ink that is already device pixels; answering for the others would
+    /// mean resolving a matrix per primitive per frame, which costs more than the question is
+    /// worth to the one caller that asks it.
+    ///
+    /// What asks is a renderer deciding which instances of a batch can reach a region it is
+    /// redrawing. `None` therefore has to mean "assume it can", never "it cannot".
+    pub fn device_ink(
+        &self,
+        kind: PrimitiveKind,
+        position: usize,
+    ) -> Option<Rect<DevicePx, Device>> {
+        let index = self.slot(kind, position)?;
+        let viewport = SpatialId::VIEWPORT.index();
+        match kind {
+            PrimitiveKind::Quad => {
+                let quad = self.primitives.quads.get(index)?;
+                (quad.transform == viewport).then(|| quad.ink())
+            }
+            PrimitiveKind::Shadow => {
+                let shadow = self.primitives.shadows.get(index)?;
+                (shadow.transform == viewport).then(|| shadow.ink())
+            }
+            PrimitiveKind::Decoration => {
+                let decoration = self.primitives.decorations.get(index)?;
+                (decoration.transform == viewport).then(|| decoration.ink())
+            }
+            PrimitiveKind::MonoSprite => {
+                let sprite = self.primitives.mono_sprites.get(index)?;
+                (sprite.transform == viewport).then(|| sprite.ink())
+            }
+            PrimitiveKind::SubpixelSprite => {
+                let sprite = self.primitives.subpixel_sprites.get(index)?;
+                (sprite.transform == viewport).then(|| sprite.ink())
+            }
+            PrimitiveKind::ColorSprite => {
+                let sprite = self.primitives.color_sprites.get(index)?;
+                (sprite.transform == viewport).then(|| sprite.ink())
+            }
+            PrimitiveKind::Shaded => {
+                let quad = self.primitives.shaded.get(index)?;
+                (quad.transform == viewport).then(|| quad.ink())
+            }
+            // Neither is drawn as one instance of a batch, so neither is ever asked.
+            PrimitiveKind::External
+            | PrimitiveKind::Backdrop
+            | PrimitiveKind::Vector
+            | PrimitiveKind::GroupStart
+            | PrimitiveKind::GroupEnd => None,
+        }
+    }
+
     /// The array index of the primitive at draw-order `position` of `kind`, or `None` past the
     /// end.
     fn slot(&self, kind: PrimitiveKind, position: usize) -> Option<usize> {

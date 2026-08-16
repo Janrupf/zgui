@@ -59,6 +59,8 @@ pub struct PlanBuilder<'gpu> {
     blocks: &'gpu mut SlotBuffer,
     /// Where the quads of every vector composite are staged.
     vectors: &'gpu mut VectorInstances,
+    /// Where each batch draw's surviving instances are staged.
+    orders: &'gpu mut crate::buffer::orders::DrawOrders,
     /// Which way round the display's subpixels run.
     subpixel_order: SubpixelOrder,
     /// What this frame's application effects are told about it.
@@ -95,6 +97,7 @@ impl<'gpu> PlanBuilder<'gpu> {
         globals: &'gpu mut SlotBuffer,
         blocks: &'gpu mut SlotBuffer,
         vectors: &'gpu mut VectorInstances,
+        orders: &'gpu mut crate::buffer::orders::DrawOrders,
         subpixel_order: SubpixelOrder,
         frame_clock: zgui_scene::FrameClock,
         effect_offsets: &'gpu [u32],
@@ -108,6 +111,7 @@ impl<'gpu> PlanBuilder<'gpu> {
             globals,
             blocks,
             vectors,
+            orders,
             subpixel_order,
             frame_clock,
             effect_offsets,
@@ -224,6 +228,16 @@ impl<'gpu> PlanBuilder<'gpu> {
     /// Stages one external-texture block and returns the offset naming it.
     pub fn stage_external(&mut self, params: &ExternalParams) -> u32 {
         self.blocks.stage(params)
+    }
+
+    /// Stages the draw-order positions of `lane` one batch draw survives with, and returns where
+    /// they start and how many there are.
+    pub fn stage_instances(
+        &mut self,
+        lane: usize,
+        positions: impl IntoIterator<Item = usize>,
+    ) -> (u32, u32) {
+        self.orders.stage(lane, positions)
     }
 
     /// Stages the quads of one vector composite and returns the instance range naming them.

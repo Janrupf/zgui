@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use zgui_geom::{Device, Rect};
 use zgui_profile::{Counter, counter};
-use zgui_scene::{Batch, ExternalTextureId};
+use zgui_scene::ExternalTextureId;
 
 use crate::atlas_backend::sink::AtlasTextures;
 use crate::frame::build::FramePlan;
@@ -281,9 +281,22 @@ impl Recorder<'_> {
                 sweep(pass, scissors, 0..1);
                 true
             }
-            PlannedDraw::Batch(batch) => {
-                self.batch(pass, planned, tables, batch.clone(), format, scissors)
-            }
+            PlannedDraw::Instances {
+                kind,
+                texture,
+                first,
+                count,
+            } => self.instances(
+                pass, planned, tables, *kind, *texture, *first, *count, format, scissors,
+            ),
+            PlannedDraw::Shaded {
+                shader,
+                params,
+                first,
+                count,
+            } => self.shaded(
+                pass, planned, tables, *shader, *params, *first, *count, format, scissors,
+            ),
             PlannedDraw::Blur {
                 source,
                 params,
@@ -368,44 +381,24 @@ impl Recorder<'_> {
         }
     }
 
-    /// Issues one instanced batch of the display list, under every rectangle of `scissors`.
-    fn batch(
+    /// Issues one run of instances of the display list, under every rectangle of `scissors`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "every one of them is a property of the one draw being issued"
+    )]
+    fn instances(
         &mut self,
         pass: &mut wgpu::RenderPass<'_>,
         planned: &PlannedPass,
         tables: Option<&wgpu::BindGroup>,
-        batch: Batch,
+        kind: PipelineKind,
+        texture: Option<u32>,
+        first: u32,
+        count: u32,
         format: wgpu::TextureFormat,
         scissors: &[Rect<i32, Device>],
     ) -> bool {
-        let (kind, range, texture) = match batch {
-            Batch::Quads(range) => (PipelineKind::Quad, range, None),
-            Batch::Shadows(range) => (PipelineKind::Shadow, range, None),
-            Batch::Decorations(range) => (PipelineKind::Decoration, range, None),
-            Batch::MonoSprites { texture, range } => {
-                (PipelineKind::MonoSprite, range, Some(texture))
-            }
-            Batch::SubpixelSprites { texture, range } => {
-                (PipelineKind::SubpixelSprite, range, Some(texture))
-            }
-            Batch::ColorSprites { texture, range } => {
-                (PipelineKind::ColorSprite, range, Some(texture))
-            }
-            // An application effect binds a pipeline this crate never enumerated and a parameter
-            // block of its own, so it is issued on its own path rather than through the table
-            // above.
-            Batch::Shaded {
-                shader,
-                params,
-                range,
-            } => return self.shaded(pass, planned, tables, shader, params, range, format),
-            // Group markers, backdrops, vector composites and external quads are planned, not
-            // batched: each one changes what is being drawn into or where the pixels come from.
-            Batch::Group(_) | Batch::Backdrop(_) | Batch::Vector(_) | Batch::External(_) => {
-                return false;
-            }
-        };
-        if range.is_empty() {
+        if count == 0 {
             return false;
         }
         let Some(tables) = tables else {
@@ -433,22 +426,18 @@ impl Recorder<'_> {
         let Some(pipeline) = self.pipelines.get(self.gpu, kind, format) else {
             return false;
         };
-        let Some(remap) = self.buffers.remap_buffer(kind) else {
-            return false;
-        };
-
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, tables, &[planned.globals]);
         pass.set_bind_group(1, &instances, &[]);
         if let Some(bind_group) = atlas {
             pass.set_bind_group(2, bind_group, &[]);
         }
-        // The draw order is bound at the offset this range starts at, and the draw counts from
+        // The order list is bound at the offset this run starts at, and the draw counts from
         // instance zero. Asking for a non-zero base instance instead would need OpenGL 4.2, and
         // the oldest device this runs on is 3.3.
-        let first = (range.start * size_of::<crate::buffer::persist::OrderEntry>()) as u64;
-        pass.set_vertex_buffer(0, remap.slice(first..));
-        sweep(pass, scissors, 0..(range.end - range.start) as u32);
+        let offset = u64::from(first) * size_of::<crate::buffer::persist::OrderEntry>() as u64;
+        pass.set_vertex_buffer(0, self.buffers.orders.buffer().slice(offset..));
+        sweep(pass, scissors, 0..count);
         true
     }
 
@@ -458,6 +447,7 @@ impl Recorder<'_> {
     /// and one block more. An effect the renderer was never told about draws nothing: the
     /// alternative is drawing the rectangle with whatever pipeline happened to be bound.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn shaded(
         &mut self,
         pass: &mut wgpu::RenderPass<'_>,
@@ -465,10 +455,12 @@ impl Recorder<'_> {
         tables: Option<&wgpu::BindGroup>,
         shader: zgui_scene::ShaderId,
         params: zgui_scene::ShaderParamsSlot,
-        range: core::ops::Range<usize>,
+        first: u32,
+        count: u32,
         format: wgpu::TextureFormat,
+        scissors: &[Rect<i32, Device>],
     ) -> bool {
-        if range.is_empty() {
+        if count == 0 {
             return false;
         }
         // Every one of these drops a rectangle the display list asked for, so each says once why:
@@ -511,11 +503,12 @@ impl Recorder<'_> {
         pass.set_bind_group(0, tables, &[planned.globals]);
         pass.set_bind_group(1, &instances, &[]);
         pass.set_bind_group(2, &block, &[offset]);
-        // The order stream is bound at the offset this range starts at and the draw counts from
-        // instance zero, exactly as every other instanced draw does — see `instanced` above.
-        let first = (range.start * size_of::<crate::buffer::persist::OrderEntry>()) as u64;
-        pass.set_vertex_buffer(0, self.buffers.remaps[lane].buffer().slice(first..));
-        pass.draw(0..4, 0..(range.end - range.start) as u32);
+        // The order list is bound at the offset this run starts at and the draw counts from
+        // instance zero, exactly as `instances` above does — the run is culled to each scissor the
+        // same way, and drawn once per rectangle.
+        let offset = u64::from(first) * size_of::<crate::buffer::persist::OrderEntry>() as u64;
+        pass.set_vertex_buffer(0, self.buffers.orders.buffer().slice(offset..));
+        sweep(pass, scissors, 0..count);
         true
     }
 

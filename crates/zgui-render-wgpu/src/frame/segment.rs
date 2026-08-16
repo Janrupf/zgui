@@ -3,9 +3,10 @@
 use core::ops::Range;
 
 use zgui_geom::{Device, Rect};
-use zgui_scene::{Batch, ExternalTextureId};
+use zgui_scene::ExternalTextureId;
 
 use crate::frame::target::TargetRef;
+use crate::pipeline::kind::PipelineKind;
 
 /// One draw of a planned pass.
 #[derive(Clone, Debug, PartialEq)]
@@ -17,7 +18,20 @@ pub enum PlannedDraw {
     /// mechanism rather than a description.
     Clear,
     /// One batch of the display list, drawn instanced out of the frame's buffers.
-    Batch(Batch),
+    ///
+    /// The instances are a run of the frame's own order list rather than a range of the scene's,
+    /// because the ones that cannot reach this draw's scissor were left out when it was planned.
+    /// See [`DrawOrders`](crate::buffer::orders::DrawOrders).
+    Instances {
+        /// Which pipeline draws them.
+        kind: PipelineKind,
+        /// The atlas texture they read, packed as the display list packs it, for a sprite batch.
+        texture: Option<u32>,
+        /// The first of this draw's entries in the frame's order list.
+        first: u32,
+        /// How many instances it draws.
+        count: u32,
+    },
     /// One filtering pass of the blur chain, reading `source`.
     Blur {
         /// What it reads.
@@ -26,6 +40,21 @@ pub enum PlannedDraw {
         params: u32,
         /// Whether this is the 2:1 downsample rather than one of the two axis passes.
         downsample: bool,
+    },
+    /// One run of rectangles drawn by an application's own primitive effect.
+    ///
+    /// Culled and drawn exactly as [`PlannedDraw::Instances`] is — a run of the frame's order list
+    /// — but through a pipeline this crate never enumerated and with a parameter block of its own,
+    /// so it is its own variant rather than a `kind` of that one.
+    Shaded {
+        /// The effect that draws them.
+        shader: zgui_scene::ShaderId,
+        /// The parameter block they are drawn with.
+        params: zgui_scene::ShaderParamsSlot,
+        /// The first of this draw's entries in the frame's order list.
+        first: u32,
+        /// How many instances it draws.
+        count: u32,
     },
     /// One filtering pass of an application's own shader, reading `source`.
     Effect {

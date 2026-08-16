@@ -170,6 +170,7 @@ impl Renderer for WgpuRenderer {
                 &mut self.buffers.globals,
                 &mut self.buffers.blocks,
                 &mut self.buffers.vectors,
+                &mut self.buffers.orders,
                 self.subpixel_order,
                 scene.frame_clock(),
                 &self.buffers.effect_offsets,

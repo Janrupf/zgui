@@ -186,7 +186,12 @@ fn plan_rect(
                     None => builder.defer(),
                 }
             }
-            other => builder.draw(PlannedDraw::Batch(other)),
+            Batch::Shaded {
+                shader,
+                params,
+                ref range,
+            } => plan_shaded(builder, scene, shader, params, range.clone(), scissor),
+            other => plan_instances(builder, scene, other, scissor),
         }
     }
 
@@ -199,6 +204,151 @@ fn plan_rect(
         builder.begin_pass(group.parent, enclosing);
     }
     builder.end_pass();
+}
+
+/// Plans one instanced batch, with the instances that cannot reach `scissor` left out.
+///
+/// A scissor rejects a primitive after its vertex stage has read the whole record out of the
+/// arena, so an instance that lands nowhere is not free — measured at 0.61 microseconds on the
+/// slowest device this runs on. A frame damaged in many places replays every batch in every
+/// rectangle, which is where nearly all of them land nowhere.
+///
+/// Culled by device-space ink, and only where the scene will answer for it: a primitive under a
+/// coordinate system of its own has ink in that system, and is kept rather than transformed here.
+fn plan_instances(
+    builder: &mut PlanBuilder<'_>,
+    scene: &Scene,
+    batch: Batch,
+    scissor: Rect<i32, Device>,
+) {
+    let Some((kind, primitive, lane, texture, range)) = instanced(batch) else {
+        return;
+    };
+    let reaches = |at: &usize| {
+        scene
+            .device_ink(primitive, *at)
+            .is_none_or(|ink| inflated(rounded_out(ink)).intersects(scissor))
+    };
+    let (first, count) = builder.stage_instances(lane, range.filter(reaches));
+    if count == 0 {
+        return;
+    }
+    builder.draw(PlannedDraw::Instances {
+        kind,
+        texture,
+        first,
+        count,
+    });
+}
+
+/// `rect` grown by the pixel a primitive's own geometry is expanded by.
+///
+/// Every instanced quad is drawn one pixel larger than its bounds on every side, so that an edge
+/// that covers a pixel partly has somewhere to land — see `inflated_corner`. A primitive whose
+/// bounds stop just outside a rectangle therefore still writes its antialiased edge into it, and
+/// culling on the bounds alone takes a pixel off the edge of everything near a damage boundary.
+/// The byte-for-byte comparison between a damaged redraw and a whole one is what says so.
+fn inflated(rect: Rect<i32, Device>) -> Rect<i32, Device> {
+    Rect::from_corners(
+        zgui_geom::Point::new(rect.left() - 1, rect.top() - 1),
+        zgui_geom::Point::new(rect.right() + 1, rect.bottom() + 1),
+    )
+}
+
+/// The pipeline, the primitive kind, the atlas texture and the draw-order range `batch` names,
+/// for a batch that is drawn as instances at all.
+#[allow(
+    clippy::type_complexity,
+    reason = "the four things one batch names, returned together because they are read together"
+)]
+fn instanced(
+    batch: Batch,
+) -> Option<(
+    crate::pipeline::kind::PipelineKind,
+    zgui_scene::PrimitiveKind,
+    usize,
+    Option<u32>,
+    core::ops::Range<usize>,
+)> {
+    use crate::pipeline::kind::PipelineKind;
+    use zgui_scene::PrimitiveKind;
+    // The lane is the one `FrameBuffers` resolves remaps into, and the two orders have to agree.
+    Some(match batch {
+        Batch::Quads(range) => (PipelineKind::Quad, PrimitiveKind::Quad, 0, None, range),
+        Batch::Shadows(range) => (PipelineKind::Shadow, PrimitiveKind::Shadow, 1, None, range),
+        Batch::Decorations(range) => (
+            PipelineKind::Decoration,
+            PrimitiveKind::Decoration,
+            2,
+            None,
+            range,
+        ),
+        Batch::MonoSprites { texture, range } => (
+            PipelineKind::MonoSprite,
+            PrimitiveKind::MonoSprite,
+            3,
+            Some(texture),
+            range,
+        ),
+        Batch::SubpixelSprites { texture, range } => (
+            PipelineKind::SubpixelSprite,
+            PrimitiveKind::SubpixelSprite,
+            4,
+            Some(texture),
+            range,
+        ),
+        Batch::ColorSprites { texture, range } => (
+            PipelineKind::ColorSprite,
+            PrimitiveKind::ColorSprite,
+            5,
+            Some(texture),
+            range,
+        ),
+        // A shaded run is instanced, but through a per-application pipeline this crate never
+        // enumerated, so it is planned on its own path — see `plan_shaded`.
+        //
+        // Group markers, backdrops, vector composites and external quads are planned rather than
+        // batched: each one changes what is being drawn into or where the pixels come from, and
+        // every one of them is handled before this is reached.
+        Batch::Shaded { .. }
+        | Batch::Group(_)
+        | Batch::Backdrop(_)
+        | Batch::Vector(_)
+        | Batch::External(_) => {
+            return None;
+        }
+    })
+}
+
+/// Plans one run of an application's own primitive effect, culled to `scissor`.
+///
+/// The shaded lane is one arena like the six the framework's own pipelines draw from, so it is
+/// culled by the same device-space ink and staged into the same order list. What differs is only
+/// the pipeline and the parameter block, which the draw binds.
+fn plan_shaded(
+    builder: &mut PlanBuilder<'_>,
+    scene: &Scene,
+    shader: zgui_scene::ShaderId,
+    params: zgui_scene::ShaderParamsSlot,
+    range: core::ops::Range<usize>,
+    scissor: Rect<i32, Device>,
+) {
+    let lane = crate::renderer::frame::FrameBuffers::SHADED_LANE;
+    let reaches = |at: &usize| {
+        scene
+            .device_ink(zgui_scene::PrimitiveKind::Shaded, *at)
+            .is_none_or(|ink| inflated(rounded_out(ink)).intersects(scissor))
+    };
+    let (first, count) = builder.stage_instances(lane, range.filter(reaches));
+    if count == 0 {
+        return;
+    }
+    builder.draw(PlannedDraw::Shaded {
+        shader,
+        params,
+        first,
+        count,
+    });
 }
 
 /// Lends a group its target and works out the region its content may touch.
