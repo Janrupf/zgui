@@ -73,11 +73,18 @@ struct QuadVarying {
     @location(3) @interpolate(flat) radii_high: vec4<f32>,
     @location(4) @interpolate(flat) border: vec4<f32>,
     @location(5) @interpolate(flat) paint_origin: vec2<f32>,
-    // style, clip, and the two paint references, which are whole numbers and travel as such.
-    @location(6) @interpolate(flat) style_clip: vec2<u32>,
+    // style, clip, how many rounded tests the clip has, and the two paint references — all whole
+    // numbers, so they travel as such.
+    @location(6) @interpolate(flat) style_clip: vec4<u32>,
     @location(7) @interpolate(flat) paints: vec4<u32>,
-    @location(8) @interpolate(flat) shift: vec2<f32>,
-    @location(9) @interpolate(flat) shape: f32,
+    // The clip's own box, and the fill's colour where the fill is one colour. Both are properties
+    // of the primitive rather than of the pixel, and both were being fetched per fragment: the box
+    // to reject a fragment outside the clip, the colour to shade every fragment inside it. Carrying
+    // them leaves the common case — an unclipped rectangle of one colour — reading no table at all.
+    @location(8) @interpolate(flat) clip_box: vec4<f32>,
+    @location(9) @interpolate(flat) fill_color: vec4<f32>,
+    @location(10) @interpolate(flat) shift: vec2<f32>,
+    @location(11) @interpolate(flat) shape: f32,
 }
 
 @vertex
@@ -102,9 +109,17 @@ fn vs_quad(
         quad.border.top, quad.border.right, quad.border.bottom, quad.border.left,
     );
     out.paint_origin = vec2<f32>(quad.paint_origin.x, quad.paint_origin.y);
-    out.style_clip = vec2<u32>(quad.style, quad.clip);
     out.paints = vec4<u32>(
         quad.fill.kind, quad.fill.index, quad.stroke.kind, quad.stroke.index,
+    );
+    let box = bitcast<vec4<f32>>(textureLoad(clips, table_texel(quad.clip * 11u + 0u), 0));
+    let rounded = textureLoad(clips, table_texel(quad.clip * 11u + 9u), 0).x;
+    out.clip_box = box;
+    out.style_clip = vec4<u32>(quad.style, quad.clip, rounded, 0u);
+    out.fill_color = select(
+        vec4<f32>(0.0),
+        bitcast<vec4<f32>>(textureLoad(paints, table_texel(quad.fill.index * 4u + 2u), 0)),
+        quad.fill.kind == PAINT_SOLID,
     );
     out.shift = shift;
     out.shape = quad.shape;
@@ -131,14 +146,25 @@ fn fs_quad(in: QuadVarying) -> @location(0) vec4<f32> {
         Vector2(in.paint_origin.x, in.paint_origin.y),
     );
     // The clip is in device space, so it is evaluated at the real pixel; the shape is in the
-    // primitive's own space, so it is evaluated at the point that maps to this pixel.
-    let clip = clip_coverage(device_position(in.position.xy), quad.clip);
+    // primitive's own space, so it is evaluated at the point that maps to this pixel. The box and
+    // the count came across from the vertex stage; only a clip that has rounded tests reads the
+    // table here, and nearly none has.
+    let at = device_position(in.position.xy);
+    let box = in.clip_box;
+    if at.x < box.x || at.y < box.y || at.x > box.x + box.z || at.y > box.y + box.w {
+        return vec4<f32>(0.0);
+    }
+    let clip = clip_rounded_coverage(at, in.style_clip.y, in.style_clip.z);
     if clip <= 0.0 {
         return vec4<f32>(0.0);
     }
     let point = in.local - in.shift;
     let paint_origin = vec2<f32>(quad.paint_origin.x, quad.paint_origin.y);
-    let background = paint_color(quad.fill, point, paint_origin);
+    let background = select(
+        paint_color(quad.fill, point, paint_origin),
+        in.fill_color,
+        quad.fill.kind == PAINT_SOLID,
+    );
 
     let size = bounds_size(quad.bounds);
     let half_size = size * 0.5;

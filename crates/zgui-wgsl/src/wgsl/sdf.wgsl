@@ -147,6 +147,31 @@ fn clip_coverage(point: vec2<f32>, clip_id: u32) -> f32 {
     return coverage;
 }
 
+/// Coverage by a clip's rounded tests alone, for a caller that has already rejected the box.
+///
+/// `count` is the clip's own, carried from wherever it was read. Zero means the clip is a box and
+/// nothing else, which is nearly every clip in a document, and then this reads no table at all.
+fn clip_rounded_coverage(point: vec2<f32>, clip_id: u32, count: u32) -> f32 {
+    if count == 0u {
+        return 1.0;
+    }
+    var coverage = rect_coverage(
+        point,
+        clip_rect(clip_id, 1u),
+        clip_radii(clip_id, 2u),
+        clip_shape(clip_id, 4u),
+    );
+    if count > 1u {
+        coverage *= rect_coverage(
+            point,
+            clip_rect(clip_id, 5u),
+            clip_radii(clip_id, 6u),
+            clip_shape(clip_id, 8u),
+        );
+    }
+    return coverage;
+}
+
 /// One of a clip's rounded tests, as the rectangle at `texel` of its record.
 fn clip_rect(clip_id: u32, texel: u32) -> Bounds {
     let held = bitcast<vec4<f32>>(textureLoad(clips, table_texel(clip_id * 11u + texel), 0));
