@@ -175,6 +175,22 @@ impl Matrix4 {
             && m[3][3] == 1.0
     }
 
+    /// The shift this matrix is, or nothing when it does anything besides shift.
+    ///
+    /// The commonest transform a document holds, and the cheapest to act on: a box sliding across
+    /// the screen carries one of these and nothing else, sixty times a second. Worth asking before
+    /// multiplying, because the answer costs a handful of comparisons and the multiplication it
+    /// saves is sixteen products a point.
+    pub fn as_translation(&self) -> Option<(f32, f32)> {
+        let m = &self.columns;
+        (m[0] == [1.0, 0.0, 0.0, 0.0]
+            && m[1] == [0.0, 1.0, 0.0, 0.0]
+            && m[2] == [0.0, 0.0, 1.0, 0.0]
+            && m[3][2] == 0.0
+            && m[3][3] == 1.0)
+            .then(|| (m[3][0], m[3][1]))
+    }
+
     /// The two-dimensional transform this embeds, or nothing when it moves out of the z = 0 plane.
     ///
     /// ```
