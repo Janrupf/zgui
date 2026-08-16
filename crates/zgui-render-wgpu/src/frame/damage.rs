@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn a_rectangle_reaching_past_the_surface_is_cut_to_it() {
-        let mut damage = DamageSet::<4>::new();
+        let mut damage: DamageSet = DamageSet::new();
         damage.absorb(Rect::new(Point::new(100, 100), Size::new(200, 200)));
         assert_eq!(
             rects(&damage, used()),
@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn a_rectangle_wholly_outside_the_surface_is_dropped_rather_than_clamped_to_nothing() {
-        let mut damage = DamageSet::<4>::new();
+        let mut damage: DamageSet = DamageSet::new();
         damage.absorb(Rect::new(Point::new(400, 400), Size::new(10, 10)));
         assert!(rects(&damage, used()).is_empty());
     }
@@ -186,7 +186,7 @@ mod tests {
     #[test]
     fn a_rectangle_touching_a_backdrop_grows_to_cover_what_it_reads() {
         // One row lights up under a panel that reads the width of the window.
-        let mut damage = DamageSet::<4>::new();
+        let mut damage: DamageSet = DamageSet::new();
         damage.absorb(Rect::new(Point::new(10, 100), Size::new(60, 4)));
         let panel = Rect::new(Point::new(0, 96), Size::new(128, 20));
 
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn a_backdrop_the_damage_does_not_reach_costs_nothing() {
-        let mut damage = DamageSet::<4>::new();
+        let mut damage: DamageSet = DamageSet::new();
         let row = Rect::new(Point::new(10, 10), Size::new(60, 4));
         damage.absorb(row);
         let panel = Rect::new(Point::new(0, 96), Size::new(128, 20));
@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn the_rectangles_stay_disjoint_so_no_pixel_is_redrawn_twice() {
-        let mut damage = DamageSet::<4>::new();
+        let mut damage: DamageSet = DamageSet::new();
         damage.absorb(Rect::new(Point::new(0, 0), Size::new(20, 20)));
         damage.absorb(Rect::new(Point::new(10, 10), Size::new(20, 20)));
         damage.absorb(Rect::new(Point::new(60, 60), Size::new(10, 10)));

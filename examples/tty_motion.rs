@@ -56,6 +56,14 @@ const REPORT: Duration = Duration::from_secs(1);
 /// A scene with several things moving at once.
 #[component]
 fn Motion() -> impl IntoView {
+    // The block's extent, so that a run can hold the number of blocks fixed and change only how
+    // many pixels they cover — which is what separates a cost paid per draw from one paid per
+    // pixel.
+    let side = std::env::var("ZGUI_TTY_MOTION_SIZE")
+        .ok()
+        .and_then(|held| held.parse::<u32>().ok())
+        .unwrap_or(64)
+        .clamp(4, 512);
     let boxes = std::env::var("ZGUI_TTY_MOTION_BOXES")
         .ok()
         .and_then(|held| held.parse::<usize>().ok())
@@ -132,14 +140,17 @@ fn Motion() -> impl IntoView {
                         // The cell this block travels inside, and how far along it is.
                         let cell_wide = 1180.0 / columns as f32;
                         let cell_tall = 940.0 / rows.max(1) as f32;
-                        let left = 24.0 + column as f32 * cell_wide + along * (cell_wide - 72.0);
+                        let travel = (cell_wide - side as f32 - 8.0).max(0.0);
+                        let left = 24.0 + column as f32 * cell_wide + along * travel;
                         let top = 24.0 + row as f32 * cell_tall;
                         view! {
                             column(
                                 class = "motion__box",
                                 style = Some(format!(
-                                    "left: {}px; top: {}px",
-                                    left as i32, top as i32
+                                    "left: {}px; top: {}px; width: {side}px; height: {}px",
+                                    left as i32,
+                                    top as i32,
+                                    (side / 2).max(2),
                                 )),
                             )
                         }
