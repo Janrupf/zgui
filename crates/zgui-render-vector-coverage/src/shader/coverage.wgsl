@@ -30,6 +30,15 @@ struct Item {
 @group(0) @binding(1) var segments: texture_2d<u32>;
 // Where each clip's outline starts, how long it is, and whether it is tested even-odd.
 @group(0) @binding(2) var runs: texture_2d<u32>;
+// Per band: where its segment indices start, and how many there are.
+@group(0) @binding(3) var bands: texture_2d<u32>;
+// The segment indices the bands name, four to a texel.
+@group(0) @binding(4) var band_index: texture_2d<u32>;
+
+/// The segment index at `slot` of the band table.
+fn band_segment(slot: u32) -> u32 {
+    return textureLoad(band_index, table_texel(slot / 4u), 0)[slot % 4u];
+}
 
 /// How many texels wide every one of them is. `TableTexture` uses the same number.
 const TABLE_TEXELS_WIDE: u32 = 256u;
@@ -106,16 +115,18 @@ fn fs_coverage(in: Varying) -> @location(0) vec4<f32> {
     let clip_count = u32(item.clips.x);
 
     let corner = floor(in.position.xy);
+    let banded = u32(item.clips.z) != 0u && item.clips.w > 0.0;
     var inside = 0;
     for (var j = 0; j < GRID; j = j + 1) {
+        let y = corner.y + (f32(j) + 0.5) / f32(GRID);
+        // Once for the row, not once for each of its samples.
+        let band = band_at(item, y);
+        let mask = row_mask(band, banded, even_odd, corner.x, y);
         for (var i = 0; i < GRID; i = i + 1) {
-            let sample = corner + vec2<f32>(
-                (f32(i) + 0.5) / f32(GRID),
-                (f32(j) + 0.5) / f32(GRID),
-            );
-            if !contains(sample, first, count, even_odd) {
+            if (mask & (1u << u32(i))) == 0u {
                 continue;
             }
+            let sample = vec2<f32>(corner.x + (f32(i) + 0.5) / f32(GRID), y);
             // A residual clip is one the composite could not bind, so it is applied here — per
             // sample rather than as a separate coverage multiplied in afterwards, which is what
             // keeps the corner where an edge meets a clip from being lighter than either.
@@ -144,6 +155,109 @@ fn fs_coverage(in: Varying) -> @location(0) vec4<f32> {
 }
 
 // Whether `point` is inside the outline held in segments `first .. first + count`.
+/// Where the segments of the band holding `y` start, and how many there are.
+///
+/// Resolved once for a row of samples rather than once for each: every sample in a row shares its
+/// `y`, so it shares its band, and the lookup is a texture read that would otherwise be made four
+/// times over for one answer.
+fn band_at(item: Item, y: f32) -> vec2<u32> {
+    let band_count = u32(item.clips.z);
+    let tall = item.clips.w;
+    if band_count == 0u || tall <= 0.0 {
+        // No bands: the whole shape, which is the same answer by the long road.
+        return vec2<u32>(u32(item.control.x), u32(item.control.y));
+    }
+    let which = clamp(i32(floor((y - item.bounds.y) / tall)), 0, i32(band_count) - 1);
+    let band = textureLoad(bands, table_texel(u32(item.clips.y) + u32(which)), 0);
+    return vec2<u32>(band.x, band.y);
+}
+
+/// Which samples of one row are inside the shape, as one bit each.
+///
+/// A row's samples share their `y`, so a segment crosses that row once and at one place. Walking
+/// the band once and asking every sample where it sits against that crossing costs one fetch and
+/// one division for the row; asking each sample to walk the band itself costs four of each for the
+/// same answer.
+fn row_mask(
+    band: vec2<u32>,
+    banded: bool,
+    even_odd: bool,
+    left: f32,
+    y: f32,
+) -> u32 {
+    var winding = array<i32, 4>(0, 0, 0, 0);
+    var crossings = array<i32, 4>(0, 0, 0, 0);
+
+    for (var index = 0u; index < band.y; index = index + 1u) {
+        var slot = band.x + index;
+        if banded {
+            slot = band_segment(slot);
+        }
+        let segment = load_segment(slot);
+        let a = segment.xy;
+        let b = segment.zw;
+        if (a.y > y) == (b.y > y) {
+            continue;
+        }
+        let at = a.x + (y - a.y) / (b.y - a.y) * (b.x - a.x);
+        let step = select(-1, 1, b.y > a.y);
+        for (var i = 0; i < GRID; i = i + 1) {
+            // The same comparison `contains` makes, against each sample of the row in turn.
+            if at > left + (f32(i) + 0.5) / f32(GRID) {
+                crossings[i] = crossings[i] + 1;
+                winding[i] = winding[i] + step;
+            }
+        }
+    }
+
+    var mask = 0u;
+    for (var i = 0; i < GRID; i = i + 1) {
+        var hit = winding[i] != 0;
+        if even_odd {
+            hit = (crossings[i] & 1) == 1;
+        }
+        if hit {
+            mask = mask | (1u << u32(i));
+        }
+    }
+    return mask;
+}
+
+/// Whether `point` is inside the shape, testing the segments `band` names.
+///
+/// `banded` says whether those are indices into the band table or a plain run of segments, which is
+/// what lets a shape with no bands take the same path.
+fn contains_in_band(point: vec2<f32>, band: vec2<u32>, even_odd: bool, banded: bool) -> bool {
+    var winding = 0;
+    var crossings = 0;
+    for (var index = 0u; index < band.y; index = index + 1u) {
+        var slot = band.x + index;
+        if banded {
+            slot = band_segment(slot);
+        }
+        let segment = load_segment(slot);
+        let a = segment.xy;
+        let b = segment.zw;
+        if (a.y > point.y) == (b.y > point.y) {
+            continue;
+        }
+        let at = a.x + (point.y - a.y) / (b.y - a.y) * (b.x - a.x);
+        if at <= point.x {
+            continue;
+        }
+        crossings = crossings + 1;
+        if b.y > a.y {
+            winding = winding + 1;
+        } else {
+            winding = winding - 1;
+        }
+    }
+    if even_odd {
+        return (crossings & 1) == 1;
+    }
+    return winding != 0;
+}
+
 fn contains(point: vec2<f32>, first: u32, count: u32, even_odd: bool) -> bool {
     var winding = 0;
     var crossings = 0;

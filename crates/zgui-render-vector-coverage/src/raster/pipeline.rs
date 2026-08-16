@@ -28,7 +28,7 @@ impl Pipelines {
         let device = gpu.device();
         let coverage_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("zgui.vector.coverage"),
-            entries: &[storage(0), storage(1), storage(2)],
+            entries: &[storage(0), storage(1), storage(2), storage(3), storage(4)],
         });
         let resolve_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("zgui.vector.coverage.resolve"),
