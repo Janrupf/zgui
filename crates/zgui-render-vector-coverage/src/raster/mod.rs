@@ -51,6 +51,10 @@ pub struct CoverageRaster {
     scratch: Scratch,
     /// Every outline of the frame, end to end.
     segments: Vec<Segment>,
+    /// Per band: where its segment indices start in `band_index`, and how many there are.
+    bands: Vec<[u32; 4]>,
+    /// The segment indices every band names, four to a texel.
+    band_index: Vec<u32>,
     /// Where each residual clip's outline is.
     runs: Vec<Run>,
     /// What to fill, in the order it is filled.
@@ -78,9 +82,23 @@ struct Buffers {
     segments: Storage,
     /// The clip runs.
     runs: Storage,
+    /// Per band: where its segment indices start, and how many.
+    bands: Storage,
+    /// The segment indices the bands name.
+    band_index: Storage,
 }
 
 impl CoverageRaster {
+    /// How tall one band is, in device pixels.
+    ///
+    /// Small enough that a band names a few segments of a glyph rather than most of them, and large
+    /// enough that a shape does not produce more bands than its segments. Four is about one band
+    /// per stroke width at a display size.
+    const BAND_PIXELS: f32 = 2.0;
+
+    /// The most bands one shape may have, so a very tall shape cannot produce an unbounded table.
+    const MAX_BANDS: usize = 512;
+
     /// A rasteriser on `gpu`, sized for a surface of `width` by `height` device pixels.
     pub fn new(gpu: &Arc<Gpu>, width: u32, height: u32) -> Self {
         let mut scratch = Scratch::new();
@@ -89,6 +107,8 @@ impl CoverageRaster {
             pipelines: Pipelines::new(gpu),
             scratch,
             segments: Vec::new(),
+            bands: Vec::new(),
+            band_index: Vec::new(),
             runs: Vec::new(),
             items: Vec::new(),
             spans: Vec::new(),
@@ -98,6 +118,8 @@ impl CoverageRaster {
                 items: Storage::new(gpu, "zgui.vector.coverage.items"),
                 segments: Storage::new(gpu, "zgui.vector.coverage.segments"),
                 runs: Storage::new(gpu, "zgui.vector.coverage.runs"),
+                bands: Storage::new(gpu, "zgui.vector.coverage.bands"),
+                band_index: Storage::new(gpu, "zgui.vector.coverage.band_index"),
             },
             gpu: Arc::clone(gpu),
             last: Rasterised::default(),
@@ -199,6 +221,8 @@ impl CoverageRaster {
             if let Some(color) = flat(item.fill, frame.paints) {
                 let start = self.segments.len();
                 geometry::flatten(&item.path, placement, &mut self.segments);
+                let (band_first, band_count, band_tall) =
+                    self.band(start, self.segments.len(), bounds);
                 self.items.push(Item {
                     bounds,
                     viewport: extent,
@@ -209,7 +233,12 @@ impl CoverageRaster {
                         f32::from(u8::from(item.fill_rule == peniko::Fill::EvenOdd)),
                         clip_first as f32,
                     ],
-                    clips: [clip_count as f32, 0.0, 0.0, 0.0],
+                    clips: [
+                        clip_count as f32,
+                        band_first as f32,
+                        band_count as f32,
+                        band_tall,
+                    ],
                 });
                 painted = true;
             }
@@ -218,6 +247,8 @@ impl CoverageRaster {
             {
                 let start = self.segments.len();
                 geometry::flatten_stroke(&item.path, &stroke.style, placement, &mut self.segments);
+                let (band_first, band_count, band_tall) =
+                    self.band(start, self.segments.len(), bounds);
                 self.items.push(Item {
                     bounds,
                     viewport: extent,
@@ -231,7 +262,12 @@ impl CoverageRaster {
                         0.0,
                         clip_first as f32,
                     ],
-                    clips: [clip_count as f32, 0.0, 0.0, 0.0],
+                    clips: [
+                        clip_count as f32,
+                        band_first as f32,
+                        band_count as f32,
+                        band_tall,
+                    ],
                 });
                 painted = true;
             }
@@ -240,6 +276,48 @@ impl CoverageRaster {
             }
         }
         (first, self.items.len() as u32 - first)
+    }
+
+    /// Buckets segments `start..end` into horizontal bands over `bounds`.
+    ///
+    /// Answers where the item's bands begin, how many there are, and how tall one is. A fragment
+    /// then tests the handful of segments its own band names instead of every segment of the shape,
+    /// which is the same answer reached by less arithmetic: a segment that does not cross the
+    /// sample's row cannot cross the ray cast from it.
+    ///
+    /// Sixteen samples a pixel over a display-sized glyph is tens of millions of segment tests a
+    /// frame, and this is what takes the multiplier out of it. The work it costs is on the
+    /// processor, where a frame that spends a hundred milliseconds on the graphics device spends
+    /// two tenths of one.
+    fn band(&mut self, start: usize, end: usize, bounds: [f32; 4]) -> (u32, u32, f32) {
+        let first = self.bands.len() as u32;
+        let top = bounds[1];
+        let height = bounds[3];
+        // `is_finite` as well as the sign: a height that came out NaN would otherwise divide into
+        // a band count of nothing, and the shape would be tested against no segments at all.
+        if end <= start || !height.is_finite() || height <= 0.0 {
+            return (first, 0, 0.0);
+        }
+        let count = ((height / Self::BAND_PIXELS).ceil() as usize).clamp(1, Self::MAX_BANDS);
+        let tall = height / count as f32;
+
+        for band in 0..count {
+            let low = top + band as f32 * tall;
+            let high = low + tall;
+            let names = self.band_index.len() as u32;
+            for index in start..end {
+                let segment = self.segments[index];
+                // A segment belongs to every band its y-extent reaches. One that ends inside a band
+                // and one that crosses it whole are both crossings the ray may meet.
+                let (lowest, highest) = (segment[1].min(segment[3]), segment[1].max(segment[3]));
+                if highest >= low && lowest <= high {
+                    self.band_index.push(index as u32);
+                }
+            }
+            let named = self.band_index.len() as u32 - names;
+            self.bands.push([names, named, 0, 0]);
+        }
+        (first, count as u32, tall)
     }
 
     /// The item's own transform, counting the ones this cannot apply.
@@ -297,6 +375,14 @@ impl CoverageRaster {
                     wgpu::BindGroupEntry {
                         binding: 2,
                         resource: self.buffers.runs.binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.buffers.bands.binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.buffers.band_index.binding(),
                     },
                 ],
             });
@@ -403,6 +489,8 @@ impl VectorRaster for CoverageRaster {
     fn prepare(&mut self, frame: &mut VectorFrame<'_>) -> Result<(), VectorError> {
         self.last = Rasterised::default();
         self.segments.clear();
+        self.bands.clear();
+        self.band_index.clear();
         self.runs.clear();
         self.items.clear();
         self.spans.clear();
@@ -418,17 +506,39 @@ impl VectorRaster for CoverageRaster {
             .iter()
             .position(|pass| pass.target == VectorTarget::NONE)
             .unwrap_or(frame.plan.passes.len());
-        for index in 0..prepared {
-            let pass = frame.plan.passes[index].clone();
-            let span = self.collect(frame, &pass);
-            self.spans.push(span);
+        {
+            let _stage = tracing::debug_span!("cov.collect").entered();
+            for index in 0..prepared {
+                let pass = frame.plan.passes[index].clone();
+                let span = self.collect(frame, &pass);
+                self.spans.push(span);
+            }
+            self.group(&frame.plan.passes[..prepared]);
         }
-        self.group(&frame.plan.passes[..prepared]);
         self.last.segments = self.segments.len() as u32;
-        self.buffers.items.upload(&self.gpu, &self.items);
-        self.buffers.segments.upload(&self.gpu, &self.segments);
-        self.buffers.runs.upload(&self.gpu, &self.runs);
-        self.record()?;
+        {
+            let _stage = tracing::debug_span!(
+                "cov.upload",
+                items = self.items.len(),
+                segments = self.segments.len(),
+                runs = self.runs.len()
+            )
+            .entered();
+            // A texel holds four indices, so the last one is filled out rather than left partly
+            // written; nothing reads past the count a band states.
+            while !self.band_index.len().is_multiple_of(4) {
+                self.band_index.push(0);
+            }
+            self.buffers.items.upload(&self.gpu, &self.items);
+            self.buffers.segments.upload(&self.gpu, &self.segments);
+            self.buffers.runs.upload(&self.gpu, &self.runs);
+            self.buffers.bands.upload(&self.gpu, &self.bands);
+            self.buffers.band_index.upload(&self.gpu, &self.band_index);
+        }
+        {
+            let _stage = tracing::debug_span!("cov.record").entered();
+            self.record()?;
+        }
         if self.last.unclippable > 0 {
             tracing::warn!(
                 items = self.last.unclippable,
@@ -462,7 +572,9 @@ impl VectorRaster for CoverageRaster {
             scratch: self.scratch.bytes(),
             buffers: self.buffers.items.capacity()
                 + self.buffers.segments.capacity()
-                + self.buffers.runs.capacity(),
+                + self.buffers.runs.capacity()
+                + self.buffers.bands.capacity()
+                + self.buffers.band_index.capacity(),
             ..MemoryReport::ZERO
         }
     }
@@ -472,12 +584,16 @@ impl VectorRaster for CoverageRaster {
         freed += self.buffers.items.shrink(&self.gpu);
         freed += self.buffers.segments.shrink(&self.gpu);
         freed += self.buffers.runs.shrink(&self.gpu);
+        freed += self.buffers.bands.shrink(&self.gpu);
+        freed += self.buffers.band_index.shrink(&self.gpu);
         self.items.clear();
         self.items.shrink_to_fit();
         self.segments.clear();
         self.segments.shrink_to_fit();
         self.runs.clear();
         self.runs.shrink_to_fit();
+        self.bands.shrink_to_fit();
+        self.band_index.shrink_to_fit();
         freed
     }
 }
