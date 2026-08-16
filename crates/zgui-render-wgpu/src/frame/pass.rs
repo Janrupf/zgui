@@ -148,7 +148,7 @@ impl Recorder<'_> {
     /// Opens one pass for a run of planned passes that share it, and issues all their draws.
     ///
     /// Every planned pass in `run` writes the same attachment under the same globals, so what
-    /// distinguishes them is the scissor — set again before each one's draws.
+    /// distinguishes them is the scissor.
     fn record_pass<'a>(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -166,11 +166,19 @@ impl Recorder<'_> {
             return;
         };
         let extent = self.extent(planned.target);
-        // Every scissor of the run is empty, so the whole run draws nothing anywhere.
-        if run
-            .clone()
-            .all(|held| scaled(held.scissor, held.target, extent).is_empty())
-        {
+        // Resolved before the pass is opened, because a run every scissor of which is empty draws
+        // nothing anywhere and should not open one at all.
+        let mut passes: Vec<&PlannedPass> = Vec::new();
+        let mut scissors: Vec<Rect<i32, Device>> = Vec::new();
+        for held in run {
+            let scissor = scaled(held.scissor, held.target, extent);
+            if scissor.is_empty() {
+                continue;
+            }
+            passes.push(held);
+            scissors.push(scissor);
+        }
+        if passes.is_empty() {
             return;
         }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -206,29 +214,52 @@ impl Recorder<'_> {
         let tables = self
             .buffers
             .frame_bind_group(self.gpu, self.pipelines.layouts());
-        for planned in run {
-            let scissor = scaled(planned.scissor, planned.target, extent);
-            if scissor.is_empty() {
-                continue;
+        // Setting a pipeline and its bindings costs far more than setting a scissor — measured on
+        // the driver this was built against, about twenty microseconds against a fraction of one —
+        // so a run whose rectangles all replay the same draws issues each of those draws once and
+        // sweeps the rectangles inside it. A frame damaged in forty-eight places then sets state
+        // five times rather than two hundred and forty.
+        //
+        // Only when the rectangles are disjoint, which is what makes the two orders the same
+        // picture: no pixel is written under more than one of them, so it sees its own rectangle's
+        // draws in their planned order either way. Overlapping rectangles are drawn one at a time,
+        // because a pixel in two of them has to be cleared again between the two.
+        match shared_draws(plan, &passes, &scissors) {
+            Some(shared) => {
+                for draw in shared {
+                    let issued = self.issue(
+                        &mut pass,
+                        passes[0],
+                        tables.as_ref(),
+                        draw,
+                        format,
+                        &scissors,
+                    );
+                    if issued {
+                        recorded.draw_calls += scissors.len() as u32;
+                    } else {
+                        recorded.dropped += 1;
+                    }
+                }
             }
-            pass.set_scissor_rect(
-                scissor.origin.x.max(0) as u32,
-                scissor.origin.y.max(0) as u32,
-                scissor.size.width.max(0) as u32,
-                scissor.size.height.max(0) as u32,
-            );
-            for draw in plan.draws_of(planned) {
-                let issued = self.issue(&mut pass, planned, tables.as_ref(), draw, format);
-                if issued {
-                    recorded.draw_calls += 1;
-                } else {
-                    recorded.dropped += 1;
+            None => {
+                for (planned, scissor) in passes.iter().zip(&scissors) {
+                    let one = core::slice::from_ref(scissor);
+                    for draw in plan.draws_of(planned) {
+                        let issued =
+                            self.issue(&mut pass, planned, tables.as_ref(), draw, format, one);
+                        if issued {
+                            recorded.draw_calls += 1;
+                        } else {
+                            recorded.dropped += 1;
+                        }
+                    }
                 }
             }
         }
     }
 
-    /// Issues one planned draw, and says whether it happened.
+    /// Issues one planned draw under every rectangle of `scissors`, and says whether it happened.
     fn issue(
         &mut self,
         pass: &mut wgpu::RenderPass<'_>,
@@ -236,6 +267,7 @@ impl Recorder<'_> {
         tables: Option<&wgpu::BindGroup>,
         draw: &PlannedDraw,
         format: wgpu::TextureFormat,
+        scissors: &[Rect<i32, Device>],
     ) -> bool {
         match draw {
             PlannedDraw::Clear => {
@@ -246,10 +278,12 @@ impl Recorder<'_> {
                     return false;
                 };
                 pass.set_pipeline(pipeline);
-                pass.draw(0..4, 0..1);
+                sweep(pass, scissors, 0..1);
                 true
             }
-            PlannedDraw::Batch(batch) => self.batch(pass, planned, tables, batch.clone(), format),
+            PlannedDraw::Batch(batch) => {
+                self.batch(pass, planned, tables, batch.clone(), format, scissors)
+            }
             PlannedDraw::Blur {
                 source,
                 params,
@@ -260,7 +294,7 @@ impl Recorder<'_> {
                 } else {
                     PipelineKind::BlurAxis
                 };
-                self.textured(pass, kind, *source, *params, None, format)
+                self.textured(pass, kind, *source, *params, None, format, scissors)
             }
             PlannedDraw::Effect {
                 source,
@@ -275,6 +309,7 @@ impl Recorder<'_> {
                 *params,
                 tables.map(|bind| (bind, planned.globals)),
                 format,
+                scissors,
             ),
             PlannedDraw::Vector {
                 target,
@@ -302,7 +337,7 @@ impl Recorder<'_> {
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, tables, &[planned.globals]);
                 pass.set_bind_group(1, &bind, &[]);
-                pass.draw(0..4, *first..*first + *count);
+                sweep(pass, scissors, *first..*first + *count);
                 true
             }
             PlannedDraw::External { texture, params } => {
@@ -327,13 +362,13 @@ impl Recorder<'_> {
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, tables, &[planned.globals]);
                 pass.set_bind_group(1, &bind, &[*params]);
-                pass.draw(0..4, 0..1);
+                sweep(pass, scissors, 0..1);
                 true
             }
         }
     }
 
-    /// Issues one instanced batch of the display list.
+    /// Issues one instanced batch of the display list, under every rectangle of `scissors`.
     fn batch(
         &mut self,
         pass: &mut wgpu::RenderPass<'_>,
@@ -341,6 +376,7 @@ impl Recorder<'_> {
         tables: Option<&wgpu::BindGroup>,
         batch: Batch,
         format: wgpu::TextureFormat,
+        scissors: &[Rect<i32, Device>],
     ) -> bool {
         let (kind, range, texture) = match batch {
             Batch::Quads(range) => (PipelineKind::Quad, range, None),
@@ -412,7 +448,7 @@ impl Recorder<'_> {
         // the oldest device this runs on is 3.3.
         let first = (range.start * size_of::<crate::buffer::persist::OrderEntry>()) as u64;
         pass.set_vertex_buffer(0, remap.slice(first..));
-        pass.draw(0..4, 0..(range.end - range.start) as u32);
+        sweep(pass, scissors, 0..(range.end - range.start) as u32);
         true
     }
 
@@ -526,7 +562,7 @@ impl Recorder<'_> {
         true
     }
 
-    /// Issues one draw that reads a target through a block of its own.
+    /// Issues one draw that reads a target through a block of its own, once per scissor.
     fn textured(
         &mut self,
         pass: &mut wgpu::RenderPass<'_>,
@@ -535,6 +571,7 @@ impl Recorder<'_> {
         params: u32,
         tables: Option<(&wgpu::BindGroup, u32)>,
         format: wgpu::TextureFormat,
+        scissors: &[Rect<i32, Device>],
     ) -> bool {
         let Some(view) = self.view(source) else {
             return false;
@@ -559,7 +596,7 @@ impl Recorder<'_> {
             None => 0,
         };
         pass.set_bind_group(group, &bind, &[params]);
-        pass.draw(0..4, 0..1);
+        sweep(pass, scissors, 0..1);
         true
     }
 
@@ -594,6 +631,56 @@ impl Recorder<'_> {
             TargetRef::Pool(slot) => slot.scale().extent(self.pool.region()),
         }
     }
+}
+
+/// Draws `instances` of a unit quad once under each of `scissors`.
+///
+/// The pipeline and its bindings are set by the caller and not touched here: what separates one
+/// damage rectangle from the next is the scissor alone, and setting one is a small fraction of
+/// what setting the rest costs.
+fn sweep(
+    pass: &mut wgpu::RenderPass<'_>,
+    scissors: &[Rect<i32, Device>],
+    instances: core::ops::Range<u32>,
+) {
+    for scissor in scissors {
+        pass.set_scissor_rect(
+            scissor.origin.x.max(0) as u32,
+            scissor.origin.y.max(0) as u32,
+            scissor.size.width.max(0) as u32,
+            scissor.size.height.max(0) as u32,
+        );
+        pass.draw(0..4, instances.clone());
+    }
+}
+
+/// The draw list every pass of a run replays, when they all replay one and it is safe to sweep.
+///
+/// A damage rectangle is planned as a full replay of the batch stream under its own scissor, so
+/// the runs that matter are the ones where every rectangle's draw list is the same list. Sweeping
+/// then reorders the draws — every rectangle's first draw, then every rectangle's second — and
+/// that is the same picture only while no pixel lies under two scissors. It usually does not: a
+/// [`DamageSet`](zgui_bits::DamageSet) holds pairwise disjoint rectangles by construction. A
+/// backdrop widens the set afterwards and can put one rectangle inside another, which is the case
+/// this returns `None` for.
+fn shared_draws<'plan>(
+    plan: &'plan FramePlan,
+    passes: &[&PlannedPass],
+    scissors: &[Rect<i32, Device>],
+) -> Option<&'plan [PlannedDraw]> {
+    let first = plan.draws_of(passes[0]);
+    if passes.len() == 1 {
+        return Some(first);
+    }
+    if !passes[1..].iter().all(|held| plan.draws_of(held) == first) {
+        return None;
+    }
+    let disjoint = scissors.iter().enumerate().all(|(index, rect)| {
+        !scissors[index + 1..]
+            .iter()
+            .any(|other| other.intersects(*rect))
+    });
+    disjoint.then_some(first)
 }
 
 /// A device-pixel rectangle in a target's own texels, cut to its extent.
