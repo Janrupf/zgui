@@ -58,11 +58,26 @@ const BORDER_SOLID: u32 = 0u;
 const BORDER_DASHED: u32 = 1u;
 const BORDER_DOTTED: u32 = 2u;
 
+// The record carried across, rather than fetched again on every fragment.
+//
+// A device with no storage buffers reads these tables out of textures, so the seven texels a quad
+// occupies are seven `textureLoad`s **per fragment** — for a record that is the same at every
+// fragment of the primitive. The vertex stage has already read it, and what the fragment stage
+// needs of it is twenty-four scalars, which is six slots. Even the narrowest device this pipeline
+// runs on has fifteen.
 struct QuadVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) local: vec2<f32>,
-    @location(1) @interpolate(flat) instance: u32,
-    @location(2) @interpolate(flat) shift: vec2<f32>,
+    @location(1) @interpolate(flat) bounds: vec4<f32>,
+    @location(2) @interpolate(flat) radii_low: vec4<f32>,
+    @location(3) @interpolate(flat) radii_high: vec4<f32>,
+    @location(4) @interpolate(flat) border: vec4<f32>,
+    @location(5) @interpolate(flat) paint_origin: vec2<f32>,
+    // style, clip, and the two paint references, which are whole numbers and travel as such.
+    @location(6) @interpolate(flat) style_clip: vec2<u32>,
+    @location(7) @interpolate(flat) paints: vec4<u32>,
+    @location(8) @interpolate(flat) shift: vec2<f32>,
+    @location(9) @interpolate(flat) shape: f32,
 }
 
 @vertex
@@ -76,14 +91,45 @@ fn vs_quad(
     var out: QuadVarying;
     out.position = to_clip_position(local, quad.transform);
     out.local = local;
-    out.instance = slot;
+    out.bounds = vec4<f32>(quad.bounds.x, quad.bounds.y, quad.bounds.w, quad.bounds.h);
+    out.radii_low = vec4<f32>(
+        quad.radii.tl_x, quad.radii.tl_y, quad.radii.tr_x, quad.radii.tr_y,
+    );
+    out.radii_high = vec4<f32>(
+        quad.radii.br_x, quad.radii.br_y, quad.radii.bl_x, quad.radii.bl_y,
+    );
+    out.border = vec4<f32>(
+        quad.border.top, quad.border.right, quad.border.bottom, quad.border.left,
+    );
+    out.paint_origin = vec2<f32>(quad.paint_origin.x, quad.paint_origin.y);
+    out.style_clip = vec2<u32>(quad.style, quad.clip);
+    out.paints = vec4<u32>(
+        quad.fill.kind, quad.fill.index, quad.stroke.kind, quad.stroke.index,
+    );
     out.shift = shift;
+    out.shape = quad.shape;
     return out;
 }
 
 @fragment
 fn fs_quad(in: QuadVarying) -> @location(0) vec4<f32> {
-    let quad = load_quad(in.instance);
+    // Rebuilt from what was carried across, so that nothing below has to change shape.
+    let quad = Quad(
+        0u,
+        in.style_clip.x,
+        Bounds(in.bounds.x, in.bounds.y, in.bounds.z, in.bounds.w),
+        Radii(
+            in.radii_low.x, in.radii_low.y, in.radii_low.z, in.radii_low.w,
+            in.radii_high.x, in.radii_high.y, in.radii_high.z, in.radii_high.w,
+        ),
+        Edges(in.border.x, in.border.y, in.border.z, in.border.w),
+        PaintRef(in.paints.x, in.paints.y),
+        PaintRef(in.paints.z, in.paints.w),
+        in.style_clip.y,
+        0u,
+        in.shape,
+        Vector2(in.paint_origin.x, in.paint_origin.y),
+    );
     // The clip is in device space, so it is evaluated at the real pixel; the shape is in the
     // primitive's own space, so it is evaluated at the point that maps to this pixel.
     let clip = clip_coverage(device_position(in.position.xy), quad.clip);
