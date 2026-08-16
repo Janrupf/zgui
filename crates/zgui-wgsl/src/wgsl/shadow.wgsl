@@ -140,6 +140,14 @@ fn fs_shadow(in: ShadowVarying) -> @location(0) vec4<f32> {
     let center_to_point = local - center;
     let corner = pick_corner_radii(center_to_point, shadow.radii);
 
+    // An outer shadow paints nothing inside the box that casts it — the multiply at the end of
+    // this function says so, having already paid for the integral. Settled here instead, before
+    // four samples of two error functions and an exponential apiece.
+    let element_distance = quad_sdf(local, shadow.element_bounds, shadow.element_radii, shadow.shape);
+    if shadow.inset == 0u && element_distance <= -0.5 {
+        return vec4<f32>(0.0);
+    }
+
     var alpha: f32;
     if shadow.blur <= 0.0 {
         alpha = saturate(0.5 - quad_sdf(local, casting, shadow.radii, shadow.shape));
@@ -170,13 +178,11 @@ fn fs_shadow(in: ShadowVarying) -> @location(0) vec4<f32> {
     if shadow.inset != 0u {
         // An inset shadow is the complement of the blurred hole, clipped to the element it sits in.
         alpha = 1.0 - alpha;
-        let element_distance = quad_sdf(local, shadow.element_bounds, shadow.element_radii, shadow.shape);
         alpha *= saturate(0.5 - element_distance);
     } else {
         // An outer shadow is never painted within the box that casts it. Behind a filled box the
         // difference cannot be seen, but a box with no fill of its own — a field that is a hole in
         // the page — would otherwise wear its own shadow as a wash over its whole interior.
-        let element_distance = quad_sdf(local, shadow.element_bounds, shadow.element_radii, shadow.shape);
         alpha *= saturate(0.5 + element_distance);
     }
 
