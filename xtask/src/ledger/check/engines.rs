@@ -130,11 +130,22 @@ const LEDGER: &[(&str, &[&str])] = &[
     // object is the only record left. Each library opened this way therefore has exactly one place
     // that names its soname and one place that states what a run needs, and a second crate reaching
     // into a library another crate already opened is a second such place for one dependency.
-    // Three libraries are opened this way. `zgui-xkb` opens libxkbcommon, because a console session
+    // Four libraries are opened this way. `zgui-xkb` opens libxkbcommon, because a console session
     // has to start where neither the library nor its data files exist. `zgui-seat` opens libseat,
     // because it has to start where no session daemon answers. `zgui-libinput` opens libinput,
     // because it has to start where that library is absent and read the devices itself.
-    ("libloading", &["zgui-xkb", "zgui-seat", "zgui-libinput"]),
+    // `zgui-platform-drm` opens libgbm, for the same reason and one more: a display it cannot
+    // allocate a shared buffer for keeps the copied scanout path, which is a slower picture rather
+    // than none, so a machine without the library has to start and say so.
+    (
+        "libloading",
+        &[
+            "zgui-xkb",
+            "zgui-seat",
+            "zgui-libinput",
+            "zgui-platform-drm",
+        ],
+    ),
     (
         "accesskit",
         &[
