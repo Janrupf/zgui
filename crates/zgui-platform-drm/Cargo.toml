@@ -52,6 +52,9 @@ zgui-drm = { path = "../zgui-drm", version = "0.1.0" }
 zgui-evdev = { path = "../zgui-evdev", version = "0.1.0" }
 zgui-geom = { path = "../zgui-geom", version = "0.1.0" }
 zgui-platform = { path = "../zgui-platform", version = "0.1.0" }
+# The latency trace. A console has no standard error a person can read — it is the screen the frame
+# loop overwrites — so the loop writes its stage marks to the file `ZGUI_LATENCY` names.
+zgui-profile = { path = "../zgui-profile", version = "0.1.0" }
 # Input policy, asked through libinput: how far a pointer travels for one movement, whether a tap
 # is a click, whether a palm on the pad is anything. It reads the devices the seat hands over and
 # opens none itself. It is one step along the same layer, and this crate is the only one that names

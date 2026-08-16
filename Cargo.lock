@@ -6036,6 +6036,7 @@ dependencies = [
  "zgui-libinput",
  "zgui-platform",
  "zgui-platform-headless",
+ "zgui-profile",
  "zgui-render",
  "zgui-render-wgpu",
  "zgui-scene",

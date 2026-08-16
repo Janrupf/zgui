@@ -672,11 +672,17 @@ impl Scanout {
             // What stands in for the Vulkan barrier. Under the top tier this answers a descriptor
             // and the kernel does the waiting; under the other two it has already waited by the
             // time it returns, and the flip carries no fence.
+            //
+            // Marked either side, because the two halves fail differently: a long wait here is the
+            // graphics device still drawing, and a long commit is the display engine.
+            zgui_profile::latency::mark("s.fence");
             let fence = gl::finish(gpu, signal);
+            zgui_profile::latency::mark("s.drawn");
             let Some(ready) = self.rotation.finished(slot, fence) else {
                 return Ok(true);
             };
             self.show(device, commit, ready)?;
+            zgui_profile::latency::mark("s.flipped");
             return Ok(true);
         }
         let Buffers::Imported { handover, .. } = &mut self.buffers else {
