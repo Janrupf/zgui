@@ -149,6 +149,10 @@ impl DrmRenderer {
             return drawn;
         }
 
+        // The two halves of the copied path, marked because they are the whole of what this path
+        // costs and neither is inside the render phase: `Renderer::draw` ends where the frame is
+        // submitted, and everything below happens after it.
+        zgui_profile::latency::mark("c.readback");
         let Some(pixels) = self.inner.read_presented() else {
             warn!(
                 "this renderer composes into a window surface rather than into a texture, so \
@@ -156,7 +160,10 @@ impl DrmRenderer {
             );
             return FrameOutcome::Skipped(SkipReason::Validation);
         };
-        match self.display.present(&pixels) {
+        zgui_profile::latency::mark("c.copy");
+        let put = self.display.present(&pixels);
+        zgui_profile::latency::mark("c.flipped");
+        match put {
             Ok(true) => drawn,
             // The buffer this frame would be written into is the one still on the screen. The
             // frame's work is submitted and the target holds it, so the damage retires and another

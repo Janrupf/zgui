@@ -138,11 +138,13 @@ pub fn read(
             depth_or_array_layers: 1,
         },
     );
+    zgui_profile::latency::mark("rb.encoded");
     gpu.queue().submit([encoder.finish()]);
 
     let slice = buffer.slice(..);
     slice.map_async(wgpu::MapMode::Read, |_| {});
     gpu.wait();
+    zgui_profile::latency::mark("rb.mapped");
 
     let view = slice.get_mapped_range();
     let mut bytes = Vec::with_capacity((width * height * 4) as usize);
@@ -152,6 +154,7 @@ pub fn read(
     }
     drop(view);
     buffer.unmap();
+    zgui_profile::latency::mark("rb.copied");
 
     Pixels {
         bytes,
