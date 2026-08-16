@@ -99,7 +99,12 @@ impl<I: PropertyId<Node = N>, N: PropertyNode<I>> PropertyTree<I, N> {
         self.named.values().copied()
     }
 
-    /// How many live names there are, without walking them.
+    /// How many live names there are, which is how many [`PropertyTree::ids`] would yield.
+    ///
+    /// Worth having beside `ids` because the question is asked once a frame, to publish a counter,
+    /// and answering it by counting what `ids` yields is a walk of every name in the document per
+    /// frame for a diagnostic. It is not [`PropertyTree::len`], which counts nodes: a thousand
+    /// untransformed rows name one coordinate system, and the two numbers are different questions.
     pub fn names(&self) -> usize {
         self.named.len()
     }
