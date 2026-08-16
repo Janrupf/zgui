@@ -82,7 +82,7 @@ fn a_scene_that_did_change_still_reaches_the_device_when_its_damage_says_so() {
     };
     let before = present(&mut renderer, &one_quad([200, 40, 40]));
 
-    let mut damage = DamageSet::new();
+    let mut damage: DamageSet = DamageSet::new();
     damage.absorb(Rect::new(Point::new(0, 0), Size::new(SIDE, SIDE)));
     let outcome = renderer.draw(&one_quad([40, 200, 40]), &damage);
     assert!(

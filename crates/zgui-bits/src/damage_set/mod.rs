@@ -19,14 +19,16 @@ pub use crate::damage_set::override_env::full_damage_forced;
 /// anything. Lowering it merges sooner, so a frame that touched two corners of the surface redraws
 /// the whole of it.
 ///
-/// Four is where restricting the redraw still deletes real work and the pass count is still
-/// negligible beside it.
+/// Forty-eight. It was four for as long as every rectangle cost a render pass of its own; the
+/// renderer now opens one pass for a run of rectangles that share it, so what a rectangle costs is
+/// a scissor and a few draws rather than a pass, and the number that balanced the old trade is far
+/// below the one that balances this one.
 ///
 /// The rule for changing it is in `CONTRIBUTING.md`, and it is a measurement rather than an
 /// argument: a change to this number is a change to how many passes every frame in the workspace
 /// costs, so it is made with the scenario evidence that a different number is better and not
 /// without.
-pub const MAX_DAMAGE: usize = 4;
+pub const MAX_DAMAGE: usize = 48;
 
 /// A bounded set of **pairwise disjoint** rectangles covering everything that must be redrawn.
 ///
