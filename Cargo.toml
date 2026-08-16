@@ -241,6 +241,13 @@ bindgen = "0.72"
 # no feature set to state — the crate has none.
 libloading = "0.8"
 
+# EGL and OpenGL, named only where a buffer has to cross between the graphics device and the display
+# controller on a machine with no Vulkan. wgpu's GL backend already holds an EGL display and a
+# loaded GL context; these are the types needed to say anything to them, and both versions are the
+# ones wgpu-hal links. `zgui-platform-drm` is the only crate that names either.
+khronos-egl = { version = "6.0", features = ["dynamic"] }
+glow = "0.17"
+
 # --- test and benchmark tooling ----------------------------------------------------------------
 proptest = "1.11"
 criterion = "0.8"

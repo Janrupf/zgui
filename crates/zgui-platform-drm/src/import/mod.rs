@@ -67,6 +67,8 @@
 // four files is this module's own business.
 mod barrier;
 mod fence;
+pub mod gbm;
+pub mod gl;
 mod image;
 mod modifier;
 
