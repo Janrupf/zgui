@@ -265,24 +265,6 @@ impl Scanout {
         pointer_on_a_plane: bool,
         bgra: bool,
     ) -> Result<Self, PlatformError> {
-        // Which shape a machine wants is not always the one the order below reaches first, and the
-        // difference can be a factor of thirty. Drawing into the display's own buffers is right
-        // when the renderer and the display share memory, and wrong when they do not: a blended
-        // pixel is then a read and a write across whatever is between the two cards, paid per
-        // fragment and per layer of overdraw, where the copy pays one write per pixel per frame.
-        //
-        // Deciding that by measurement belongs at startup and does not happen yet. Until it does,
-        // this names the shape so that a machine can be held to one and the two compared on it.
-        if let Ok(forced) = std::env::var("ZGUI_SCANOUT") {
-            if forced.eq_ignore_ascii_case("copied") {
-                info!(
-                    crtc = output.pipe.crtc,
-                    "every frame for this display is copied into a buffer the driver allocated, \
-                     because ZGUI_SCANOUT asked for it"
-                );
-                return Self::copied(device, output, bgra);
-            }
-        }
         // Vulkan first, then the same arrangement through GL, then the copy every machine can do.
         // The two drawn shapes are tried in that order rather than chosen by backend, so a device
         // that has both takes the one whose handover the kernel can wait on.
