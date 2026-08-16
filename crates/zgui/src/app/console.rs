@@ -59,6 +59,7 @@
 //! and something below the renderer refused to present it. No variant names a kernel that refused a
 //! page flip.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use tracing::warn;
@@ -70,7 +71,7 @@ use zgui_render::{
     ExternalTexture, FrameOutcome, MemoryReport, RenderCapabilities, RenderTarget, Renderer,
     ScrollShift, SkipReason, TargetPoolReport, TextureHandle, VectorStatus,
 };
-use zgui_render_wgpu::{Gpu, SharedGraphics, WgpuRenderer};
+use zgui_render_wgpu::{Gpu, Pixels, SharedGraphics, WgpuRenderer};
 use zgui_runtime::{AppError, RendererFactory};
 use zgui_scene::Scene;
 
@@ -97,6 +98,12 @@ struct DrmRenderer {
     display: DrmDisplay,
     /// How it gets there.
     delivery: Delivery,
+    /// The last frame read back, on the copied path.
+    ///
+    /// Kept between frames, and the whole of what the renderer composed. A frame reads back only
+    /// the rows it drew and this holds the rest, which is what makes reading a hundred rows
+    /// instead of a thousand both possible and correct.
+    pixels: Pixels,
 }
 
 impl DrmRenderer {
@@ -112,6 +119,7 @@ impl DrmRenderer {
             inner,
             display,
             delivery,
+            pixels: Pixels::nothing(),
         }
     }
 
@@ -149,14 +157,26 @@ impl DrmRenderer {
             return drawn;
         }
 
-        let Some(pixels) = self.inner.read_presented() else {
+        // The rows the renderer says it composed, which is not always the damage it was handed: a
+        // frame that had to redraw everything widened it, and reading back only what was asked for
+        // would leave the rest of this holding the frame from before.
+        let changed: Vec<Range<u32>> = self.inner.composed_rows().to_vec();
+
+        // The two halves of the copied path, marked because they are the whole of what this path
+        // costs and neither is inside the render phase: `Renderer::draw` ends where the frame is
+        // submitted, and everything below happens after it.
+        zgui_profile::latency::mark("c.readback");
+        if !self.inner.read_presented_bands(&mut self.pixels, &changed) {
             warn!(
                 "this renderer composes into a window surface rather than into a texture, so \
                  there is nothing to read back and nothing reaches the display"
             );
             return FrameOutcome::Skipped(SkipReason::Validation);
-        };
-        match self.display.present(&pixels) {
+        }
+        zgui_profile::latency::mark("c.copy");
+        let put = self.display.present(&self.pixels, &changed);
+        zgui_profile::latency::mark("c.flipped");
+        match put {
             Ok(true) => drawn,
             // The buffer this frame would be written into is the one still on the screen. The
             // frame's work is submitted and the target holds it, so the damage retires and another

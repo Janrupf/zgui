@@ -31,6 +31,9 @@ zgui-platform-winit = { path = "../zgui-platform-winit", version = "0.1.0" }
 zgui-reactive = { path = "../zgui-reactive", version = "0.1.0" }
 zgui-render = { path = "../zgui-render", version = "0.1.0" }
 zgui-render-wgpu = { path = "../zgui-render-wgpu", version = "0.1.0" }
+# The latency trace, for the console frame loop's stage marks. Optional, and turned on by the `drm`
+# feature that adds that loop, because a console has no standard error a person can read.
+zgui-profile = { path = "../zgui-profile", version = "0.1.0", optional = true }
 # What rasterises the vector parts of a display list. A renderer with none attached plans a
 # drawing's passes and then composites an unwritten scratch, which is an icon that is not there —
 # so this is wiring rather than a choice an application should be asked to make.
@@ -89,7 +92,7 @@ tokio = ["dep:zgui-tokio"]
 #
 # It adds `App::run_drm`, and that is the only entry point: the loop and the renderer factory it
 # needs are correct together and useless apart.
-drm = ["dep:zgui-platform-drm", "dep:tracing"]
+drm = ["dep:zgui-platform-drm", "dep:tracing", "dep:zgui-profile"]
 
 # Compiles the wall-clock budget target. Off by default so that an ordinary unoptimised test run
 # cannot execute a budget and report an unoptimised number as a regression; the gate switches it on

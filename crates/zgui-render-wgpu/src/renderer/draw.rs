@@ -304,11 +304,12 @@ impl Renderer for WgpuRenderer {
         }
         zgui_profile::latency::mark("pres.out");
 
-        let redrawn: u64 = damage::rects(damage, self.composed.used())
-            .iter()
-            .map(|rect| damage::area(*rect))
-            .sum();
+        let rects = damage::rects(damage, self.composed.used());
+        let redrawn: u64 = rects.iter().map(|rect| damage::area(*rect)).sum();
         counter::add(Counter::DamagePx, redrawn);
+        // Recorded from what was drawn rather than from what was asked for, because the widening
+        // above happens between the two. A backend that copies the target out reads these.
+        damage::rows_of(&rects, &mut self.composed_rows);
         let stats = FrameStats {
             draw_calls,
             vector_passes: scene.pass_plan().passes.len() as u32,
