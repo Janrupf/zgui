@@ -88,7 +88,7 @@ use zgui_platform::{PlatformError, Watchdog, refresh_interval};
 use zgui_render_wgpu::{Gpu, Pixels, wgpu};
 
 use crate::cursor::Cursor;
-use crate::import::{Handover, Imported, Plane, Unsupported};
+use crate::import::{Handover, Imported, Plane, Unsupported, gbm, gl};
 use crate::output::{Output, backend};
 use crate::scanout::rotation::{Ready, Rotation};
 
@@ -209,6 +209,23 @@ enum Buffers {
         /// The framebuffer each buffer is registered as, at the same index.
         framebuffers: [Framebuffer; COPIED],
     },
+    /// Buffers the renderer draws into on a machine with no Vulkan.
+    ///
+    /// The same arrangement as [`Buffers::Imported`] reached from the other end: `libgbm` allocates
+    /// on the display's own node and EGL imports each descriptor as a texture, rather than Vulkan
+    /// creating an image and exporting it. There is no pair of barriers to record — GL has no
+    /// queue families to pass an image between — so what stands in for the handover is one fence at
+    /// the end of the frame.
+    DrawnGl {
+        /// The buffers, in the order they were made.
+        buffers: Vec<gl::Drawn>,
+        /// The GEM handle each buffer's descriptor imported as, at the same index.
+        handles: Vec<ImportedBuffer>,
+        /// The framebuffer each buffer is registered as, at the same index.
+        framebuffers: Vec<Framebuffer>,
+        /// How a finished frame is signalled, decided once when the buffers were made.
+        signal: gl::Signal,
+    },
     /// Images the renderer draws into, which the display engine reads where they lie.
     Imported {
         /// The pair of barriers that passes an image between the renderer and the display engine.
@@ -248,23 +265,39 @@ impl Scanout {
         pointer_on_a_plane: bool,
         bgra: bool,
     ) -> Result<Self, PlatformError> {
-        match Self::imported(device, output, gpu, pointer_on_a_plane) {
+        // Vulkan first, then the same arrangement through GL, then the copy every machine can do.
+        // The two drawn shapes are tried in that order rather than chosen by backend, so a device
+        // that has both takes the one whose handover the kernel can wait on.
+        let refused = match Self::imported(device, output, gpu, pointer_on_a_plane) {
             Ok(scanout) => {
                 info!(
                     crtc = output.pipe.crtc,
                     "the renderer draws straight into the buffers this display scans out"
                 );
-                Ok(scanout)
+                return Ok(scanout);
             }
-            Err(reason) => {
+            Err(reason) => reason,
+        };
+        match Self::drawn_gl(device, output, gpu, pointer_on_a_plane) {
+            Ok(scanout) => {
                 info!(
                     crtc = output.pipe.crtc,
-                    "every frame for this display is copied into a buffer the driver allocated, \
-                     because {reason}"
+                    "the renderer draws straight into the buffers this display scans out, through \
+                     OpenGL"
                 );
-                Self::copied(device, output, bgra)
+                return Ok(scanout);
             }
+            Err(reason) => info!(
+                crtc = output.pipe.crtc,
+                "this display cannot be drawn into through OpenGL either, because {reason}"
+            ),
         }
+        info!(
+            crtc = output.pipe.crtc,
+            "every frame for this display is copied into a buffer the driver allocated, because \
+             {refused}"
+        );
+        Self::copied(device, output, bgra)
     }
 
     /// Allocates two buffers for `output`, both registered, with the mode still unset.
@@ -418,8 +451,26 @@ impl Scanout {
     /// afterwards.
     pub fn buffers(&self) -> &[Imported] {
         match &self.buffers {
-            Buffers::Copied { .. } => &[],
+            Buffers::Copied { .. } | Buffers::DrawnGl { .. } => &[],
             Buffers::Imported { buffers, .. } => buffers,
+        }
+    }
+
+    /// Returns the textures the renderer composes into, in the order they were made.
+    ///
+    /// What `SharedGraphics::renderer_supplied` is given. Empty on the copied shape, where a frame
+    /// is composed into the renderer's own target and copied in afterwards — and **empty is the
+    /// answer that decides the whole arrangement**, so a caller reads this rather than guessing
+    /// from the machine.
+    pub fn textures(&self) -> Vec<wgpu::Texture> {
+        match &self.buffers {
+            Buffers::Copied { .. } => Vec::new(),
+            Buffers::DrawnGl { buffers, .. } => {
+                buffers.iter().map(|held| held.texture().clone()).collect()
+            }
+            Buffers::Imported { buffers, .. } => {
+                buffers.iter().map(|held| held.texture().clone()).collect()
+            }
         }
     }
 
@@ -431,7 +482,9 @@ impl Scanout {
     pub fn framebuffers(&self) -> Vec<Framebuffer> {
         match &self.buffers {
             Buffers::Copied { framebuffers, .. } => framebuffers.to_vec(),
-            Buffers::Imported { framebuffers, .. } => framebuffers.clone(),
+            Buffers::DrawnGl { framebuffers, .. } | Buffers::Imported { framebuffers, .. } => {
+                framebuffers.clone()
+            }
         }
     }
 
@@ -459,15 +512,20 @@ impl Scanout {
     /// Returns [`PlatformError::Backend`] when the graphics device refuses or does not finish the
     /// barrier that takes the buffer back.
     pub fn acquire(&mut self) -> Result<Option<usize>, PlatformError> {
-        let Buffers::Imported { handover, .. } = &mut self.buffers else {
+        if matches!(self.buffers, Buffers::Copied { .. }) {
             return Ok(None);
-        };
+        }
         let Some(slot) = self.rotation.drawing() else {
             return Ok(None);
         };
-        handover
-            .acquire(slot)
-            .map_err(|refusal| PlatformError::Backend(refusal.to_string()))?;
+        // Only the Vulkan shape has a barrier to run. GL has no queue families to pass an image
+        // between, so there is nothing to take back — the buffer was never given away, and what
+        // keeps the display engine off it is the rotation and the fence at the end of the frame.
+        if let Buffers::Imported { handover, .. } = &mut self.buffers {
+            handover
+                .acquire(slot)
+                .map_err(|refusal| PlatformError::Backend(refusal.to_string()))?;
+        }
         Ok(Some(slot))
     }
 
@@ -604,7 +662,23 @@ impl Scanout {
         &mut self,
         device: &Device,
         commit: &mut dyn Commit,
+        gpu: &Gpu,
     ) -> Result<bool, PlatformError> {
+        if let Buffers::DrawnGl { signal, .. } = &self.buffers {
+            let signal = *signal;
+            let Some(slot) = self.rotation.drawn() else {
+                return Ok(false);
+            };
+            // What stands in for the Vulkan barrier. Under the top tier this answers a descriptor
+            // and the kernel does the waiting; under the other two it has already waited by the
+            // time it returns, and the flip carries no fence.
+            let fence = gl::finish(gpu, signal);
+            let Some(ready) = self.rotation.finished(slot, fence) else {
+                return Ok(true);
+            };
+            self.show(device, commit, ready)?;
+            return Ok(true);
+        }
         let Buffers::Imported { handover, .. } = &mut self.buffers else {
             return Err(PlatformError::Backend(
                 "this display is driven from buffers the processor writes, so a frame reaches it \
@@ -748,6 +822,20 @@ impl Scanout {
                     }
                 }
             }
+            Buffers::DrawnGl {
+                buffers, handles, ..
+            } => {
+                // The handles first: an allocation the kernel still holds a name for is one the
+                // driver will not free, and the textures below are what release the allocations.
+                for handle in handles {
+                    if let Err(error) = device.release_imported(handle) {
+                        warn!("an imported scanout buffer could not be released: {error}");
+                    }
+                }
+                // wgpu deletes each texture as it reaches it, and each allocation goes with the
+                // buffer that holds it.
+                drop(buffers);
+            }
             Buffers::Imported {
                 handover,
                 buffers,
@@ -772,12 +860,118 @@ impl Scanout {
         }
     }
 
+    /// Allocates buffers for `output` that a GL renderer composes into and the display reads.
+    ///
+    /// The counterpart to [`Scanout::imported`] for a machine with no Vulkan, and the same
+    /// arrangement reached from the other end: `libgbm` allocates on this display's own node and
+    /// EGL imports each descriptor as a texture, rather than Vulkan creating an image and
+    /// exporting it.
+    ///
+    /// **The display's node and not the renderer's.** A buffer allocated on the card that renders
+    /// is moved out of that card's own memory the moment the display card imports the descriptor,
+    /// and the submission that would draw into it is then refused. Where the two are one card the
+    /// question does not arise and this allocates from the only device there is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Copied`], which names why this display falls back to copying each frame.
+    pub fn drawn_gl(
+        device: &Device,
+        output: &Output,
+        gpu: &Gpu,
+        pointer_on_a_plane: bool,
+    ) -> Result<Self, Copied> {
+        if !pointer_on_a_plane {
+            return Err(Copied::NoCursorPlane);
+        }
+        let library = gbm::Library::load().map_err(|reason| {
+            Copied::NoImages(Unsupported::Driver {
+                step: "loading libgbm, which is what allocates a buffer both ends can use",
+                reason,
+            })
+        })?;
+        let allocator = gbm::Device::new(&library, device.as_fd()).map_err(|reason| {
+            Copied::NoImages(Unsupported::Driver {
+                step: "opening an allocator over the display's own node",
+                reason,
+            })
+        })?;
+
+        let width = output.mode.width();
+        let height = output.mode.height();
+        let buffers =
+            gl::create(gpu, &allocator, width, height, IMPORTED).map_err(Copied::NoImages)?;
+
+        // Whether the display takes an in-fence at all decides the top tier: a descriptor the
+        // driver would export has nowhere to go on a display that cannot be handed one.
+        let fenced = waits_for_a_fence(device, output.pipe.plane).unwrap_or_else(|error| {
+            warn!(
+                plane = output.pipe.plane,
+                "this plane's properties could not be read, so this display waits for its own                  frames rather than handing the kernel a fence: {error}"
+            );
+            false
+        });
+        let signal = gl::signal(gpu, fenced);
+
+        let mut buffers = buffers;
+        let mut handles = Vec::with_capacity(buffers.len());
+        let mut framebuffers = Vec::with_capacity(buffers.len());
+        for buffer in &mut buffers {
+            let (stride, offset, modifier) = (buffer.stride(), buffer.offset(), buffer.modifier());
+            let descriptor = buffer.descriptor().map_err(|reason| {
+                Copied::NoImages(Unsupported::Driver {
+                    step: "exporting a scanout buffer as a descriptor",
+                    reason,
+                })
+            })?;
+            let imported = device.import_buffer(descriptor).map_err(|error| {
+                Copied::NoImages(Unsupported::Driver {
+                    step: "importing a scanout buffer's descriptor",
+                    reason: error.to_string(),
+                })
+            })?;
+            // The layout is named only where the driver named one. A chain is wholly implicit or
+            // wholly explicit, and `DRM_FORMAT_MOD_INVALID` is not a layout.
+            let named = (device.supports_format_modifiers() && modifier != gbm::IMPLICIT)
+                .then_some(Modifier(modifier));
+            let framebuffer = device
+                .add_framebuffer_from_handles(
+                    width,
+                    height,
+                    fourcc(BGRA),
+                    [imported.handle(), 0, 0, 0],
+                    [stride, 0, 0, 0],
+                    [offset, 0, 0, 0],
+                    named,
+                )
+                .map_err(|error| {
+                    Copied::NoImages(Unsupported::Driver {
+                        step: "registering a framebuffer over a scanout buffer",
+                        reason: error.to_string(),
+                    })
+                })?;
+            handles.push(imported);
+            framebuffers.push(framebuffer);
+        }
+
+        Ok(Self::new(
+            output,
+            Buffers::DrawnGl {
+                buffers,
+                handles,
+                framebuffers,
+                signal,
+            },
+        ))
+    }
+
     /// Creates a scanout for `output` holding `buffers`, with nothing on the screen yet.
     fn new(output: &Output, buffers: Buffers) -> Self {
         // Nothing is on the screen, so every buffer is free: the first frame goes into the first of
         // them and the modeset puts that one up.
         let count = match &buffers {
             Buffers::Copied { buffers, .. } => buffers.len(),
+            Buffers::DrawnGl { buffers, .. } => buffers.len(),
             Buffers::Imported { buffers, .. } => buffers.len(),
         };
         let rotation = Rotation::new(count);
@@ -800,7 +994,9 @@ impl Scanout {
     fn framebuffer(&self, slot: usize) -> Framebuffer {
         match &self.buffers {
             Buffers::Copied { framebuffers, .. } => framebuffers[slot],
-            Buffers::Imported { framebuffers, .. } => framebuffers[slot],
+            Buffers::DrawnGl { framebuffers, .. } | Buffers::Imported { framebuffers, .. } => {
+                framebuffers[slot]
+            }
         }
     }
 

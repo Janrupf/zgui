@@ -71,7 +71,7 @@ use zgui_render::{
     ExternalTexture, FrameOutcome, MemoryReport, RenderCapabilities, RenderTarget, Renderer,
     ScrollShift, SkipReason, TargetPoolReport, TextureHandle, VectorStatus,
 };
-use zgui_render_wgpu::{Gpu, Pixels, SharedGraphics, WgpuRenderer};
+use zgui_render_wgpu::{Gpu, Pixels, SharedGraphics, WgpuRenderer, wgpu};
 use zgui_runtime::{AppError, RendererFactory};
 use zgui_scene::Scene;
 
@@ -128,8 +128,14 @@ impl DrmRenderer {
     /// The drawn path. [`drawn_into_scanout`] holds the order; this composes, once it has been told
     /// which buffer to compose into.
     fn drawn(&mut self, scene: &Scene, damage: &DamageSet) -> FrameOutcome {
+        // Taken before the renderer is borrowed for the frame, because the closure below holds it.
+        let gpu = Arc::clone(self.inner.gpu());
+        let presenting = Presenting {
+            display: &self.display,
+            gpu: &gpu,
+        };
         let inner = &mut self.inner;
-        drawn_into_scanout(&self.display, |slot| {
+        drawn_into_scanout(&presenting, |slot| {
             if !inner.present_into(slot) {
                 return refused_slot(slot);
             }
@@ -219,16 +225,28 @@ trait Bracket {
     /// A display with a flip still on its way holds the frame and shows it when the completion
     /// arrives, because the kernel takes one page flip per CRTC. Either way the frame reaches the
     /// screen, which `true` says.
+    ///
     fn present_drawn(&self) -> Result<bool, PlatformError>;
 }
 
-impl Bracket for DrmDisplay {
+/// A display and the device whose frames go on it, so that the pair can answer [`Bracket`].
+///
+/// What says a frame has finished is a fence, and a fence belongs to the device that drew — which
+/// the display does not hold and is built before. Rather than hand the device down through
+/// [`drawn_into_scanout`], where it would reach the two test doubles that have no device at all,
+/// it is carried here beside the display for the length of one frame.
+struct Presenting<'a> {
+    display: &'a DrmDisplay,
+    gpu: &'a Gpu,
+}
+
+impl Bracket for Presenting<'_> {
     fn acquire(&self) -> Result<Option<usize>, PlatformError> {
-        DrmDisplay::acquire(self)
+        self.display.acquire()
     }
 
     fn present_drawn(&self) -> Result<bool, PlatformError> {
-        DrmDisplay::present_drawn(self)
+        self.display.present_drawn(self.gpu)
     }
 }
 
@@ -395,13 +413,19 @@ pub(crate) fn factory(graphics: SharedGraphics, displays: Displays) -> RendererF
 
 /// Opens the device a display's own buffers are made on.
 ///
-/// Answers `None` on a machine with no usable adapter and on one whose driver would not grant the
-/// Vulkan device extensions an exported image needs. Both are ordinary facts about a machine rather
-/// than a failure to start: the answer to each is the copied path, which every machine has.
+/// Answers `None` only on a machine with no usable adapter at all, which is an ordinary fact about
+/// a machine rather than a failure to start: the answer is the copied path, which every machine
+/// has.
 ///
-/// The extensions are read off the device that opened rather than assumed from what was asked for.
-/// A device extension can be enabled only while a device is created, so a device without them is
-/// the device this program has for the rest of its run.
+/// **A Vulkan device that was refused the extensions is refused here**, and a device on any other
+/// backend is not. The extensions are what an *exported Vulkan image* needs, and a device extension
+/// can be enabled only while a device is created — so a Vulkan device without them will never take
+/// the drawn path however many frames it draws, and saying so here saves every display trying. An
+/// OpenGL device reaches the same arrangement through EGL and needs none of them, so withholding
+/// the device from it would answer a question about Vulkan by refusing something else.
+///
+/// Which drawn shape a display takes, or whether it takes one, is [`Scanout::for_display`]'s to
+/// decide. This only says whether there is a device worth asking with.
 pub(crate) fn scanout_device(graphics: &SharedGraphics) -> Option<Arc<Gpu>> {
     let gpu = match graphics.open_gpu() {
         Ok(gpu) => gpu,
@@ -413,17 +437,19 @@ pub(crate) fn scanout_device(graphics: &SharedGraphics) -> Option<Arc<Gpu>> {
             return None;
         }
     };
-    let enabled = gpu.vulkan_extensions();
-    if let Some(missing) = zgui_platform_drm::EXTENSIONS
-        .iter()
-        .find(|name| !enabled.contains(name))
-    {
-        warn!(
-            "{} did not enable {missing:?}, so every display copies its frames through the \
-             processor",
-            gpu.describe()
-        );
-        return None;
+    if gpu.adapter().get_info().backend == wgpu::Backend::Vulkan {
+        let enabled = gpu.vulkan_extensions();
+        if let Some(missing) = zgui_platform_drm::EXTENSIONS
+            .iter()
+            .find(|name| !enabled.contains(name))
+        {
+            warn!(
+                "{} did not enable {missing:?}, so every display copies its frames through the \
+                 processor",
+                gpu.describe()
+            );
+            return None;
+        }
     }
     Some(gpu)
 }

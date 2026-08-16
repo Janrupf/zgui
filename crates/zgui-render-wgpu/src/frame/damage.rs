@@ -86,6 +86,38 @@ pub fn every_row(height: u32) -> Vec<Range<u32>> {
     vec![0..height]
 }
 
+/// The bands of `held` and `adding` together, merged, in order and cut to `height`.
+///
+/// Answers the whole of it where the two make more bands than are worth tracking: many scattered
+/// copies cost more in calls than one copy of everything saves in bytes.
+pub fn merge(held: &[Range<u32>], adding: &[Range<u32>], height: u32) -> Vec<Range<u32>> {
+    let mut bands: Vec<Range<u32>> = held
+        .iter()
+        .chain(adding)
+        .map(|band| band.start.min(height)..band.end.min(height))
+        .filter(|band| band.start < band.end)
+        .collect();
+    bands.sort_unstable_by_key(|band| band.start);
+    let mut kept: Vec<Range<u32>> = Vec::with_capacity(bands.len());
+    for band in bands {
+        match kept.last_mut() {
+            // Touching counts as overlapping: two bands that meet exactly are one copy.
+            Some(last) if band.start <= last.end => last.end = last.end.max(band.end),
+            _ => kept.push(band),
+        }
+    }
+    if kept.len() > MOST_BANDS {
+        return every_row(height);
+    }
+    kept
+}
+
+/// The most bands a copy is cut into before it becomes the whole frame.
+///
+/// A frame changing scattered rows for many frames running would otherwise grow a list nothing
+/// bounds. Copying everything is always right; this is only about which is cheaper.
+const MOST_BANDS: usize = 16;
+
 /// The rows `rects` touch, merged into disjoint bands in order, written into `into`.
 ///
 /// Rows rather than rectangles because whatever copies a frame out of the renderer copies rows: a
