@@ -92,16 +92,27 @@ fn scene_of(group: Option<Vec<Filter>>, backdrop: Option<f32>) -> Scene {
     scene
 }
 
+/// The rectangles the two tests below plan against.
+///
+/// The corner one reaches the surface's own edge, which the covering fill's inset does not; the
+/// middle one lies well inside it. So one of them is covered and the other is not, and the two
+/// tests are the two halves of the same fixture.
+fn a_corner_and_a_middle() -> (DamageSet, Rect<i32, Device>, Rect<i32, Device>) {
+    let corner = Rect::new(Point::new(0, 0), Size::new(32, 32));
+    let middle = Rect::new(Point::new(80, 80), Size::new(32, 32));
+    let mut two: DamageSet = DamageSet::new();
+    two.absorb(corner);
+    two.absorb(middle);
+    (two, corner, middle)
+}
+
 #[test]
-fn every_damaged_rectangle_is_cleared_before_anything_is_drawn_into_it() {
+fn a_damaged_rectangle_nothing_covers_is_cleared_before_anything_is_drawn_into_it() {
     let Some(renderer) = plain_renderer() else {
         return;
     };
     let scene = scene_of(None, None);
-
-    let mut two: DamageSet = DamageSet::new();
-    two.absorb(Rect::new(Point::new(0, 0), Size::new(32, 32)));
-    two.absorb(Rect::new(Point::new(80, 80), Size::new(32, 32)));
+    let (two, corner, _) = a_corner_and_a_middle();
     let planned = plan(renderer.gpu(), &scene, &two);
 
     let clears: Vec<&Segment> = planned
@@ -113,16 +124,65 @@ fn every_damaged_rectangle_is_cleared_before_anything_is_drawn_into_it() {
                 .is_some_and(|pass| planned.draws_of(pass).first() == Some(&PlannedDraw::Clear))
         })
         .collect();
-    assert_eq!(clears.len(), 2, "one clear per damaged rectangle");
-    for segment in clears {
-        let pass = segment.pass().expect("filtered to passes");
-        assert_eq!(pass.target, TargetRef::Composed, "and only there");
-        assert!(
-            two.rects().contains(&pass.scissor),
-            "the clear is scissored to the rectangle it is clearing: {:?}",
-            pass.scissor
-        );
-    }
+    assert_eq!(
+        clears.len(),
+        1,
+        "the corner alone: the scene's first quad fills the whole surface opaquely, and what it \
+         covers needs no erasing"
+    );
+    let pass = clears[0].pass().expect("filtered to passes");
+    assert_eq!(pass.target, TargetRef::Composed, "and only there");
+    assert_eq!(
+        pass.scissor, corner,
+        "the clear is scissored to the rectangle it is clearing"
+    );
+}
+
+#[test]
+fn a_damaged_rectangle_an_opaque_fill_covers_is_planned_from_that_fill() {
+    let Some(renderer) = plain_renderer() else {
+        return;
+    };
+    // Three quads: one under the covering fill, the fill itself, and one over it. A rectangle the
+    // fill covers has to be planned from the fill, so the first one is never drawn there.
+    let mut scene = Scene::new();
+    scene.begin_frame(Size::new(SIDE, SIDE));
+    let paint = scene
+        .paints
+        .add(zgui_scene::Paint::Solid(opaque(10, 20, 30)));
+    scene.push_quad(Quad::filled(rect(72.0, 72.0, 48.0, 48.0), paint));
+    scene.push_quad(Quad::filled(
+        rect(0.0, 0.0, SIDE as f32, SIDE as f32),
+        paint,
+    ));
+    scene.push_quad(Quad::filled(rect(80.0, 80.0, 16.0, 16.0), paint));
+    scene.finish(&DamageSet::full());
+
+    let (two, _, middle) = a_corner_and_a_middle();
+    let planned = plan(renderer.gpu(), &scene, &two);
+
+    let covered = planned
+        .passes()
+        .find(|pass| pass.scissor == middle)
+        .expect("the middle rectangle is planned");
+    assert_eq!(
+        planned.draws_of(covered),
+        [PlannedDraw::Batch(zgui_scene::Batch::Quads(1..3))],
+        "no erasure, and the batch begins at the fill rather than at the quad beneath it"
+    );
+
+    let bare = planned
+        .passes()
+        .find(|pass| pass.scissor != middle)
+        .expect("the corner rectangle is planned");
+    assert_eq!(
+        planned.draws_of(bare),
+        [
+            PlannedDraw::Clear,
+            PlannedDraw::Batch(zgui_scene::Batch::Quads(0..3)),
+        ],
+        "and the rectangle nothing covers is erased and replayed whole"
+    );
 }
 
 #[test]
