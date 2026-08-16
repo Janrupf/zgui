@@ -36,6 +36,15 @@ raw-window-handle.workspace = true
 # asserted against. This crate issues no ioctl of its own outside those tests.
 rustix.workspace = true
 tracing.workspace = true
+# `libgbm`, for the buffers a display scans out of and a graphics device draws into. Loaded at run
+# time like every other library here, so a console session still starts where it is absent — such a
+# machine copies each frame instead.
+libloading.workspace = true
+# The EGL display and GL context wgpu's GL backend already holds, reached through its hal so that
+# a buffer can be imported as the texture a frame is composed into. The counterpart to `ash` above,
+# for the machines that have no Vulkan — which are exactly the machines this path is for.
+khronos-egl.workspace = true
+glow.workspace = true
 zgui-drm = { path = "../zgui-drm", version = "0.1.0" }
 # The kernel's input interface: which devices exist, what each one can report, the grab that keeps
 # a keystroke away from the shell behind the console, and the keymap the console driver holds. It
@@ -90,6 +99,13 @@ zgui-scene = { path = "../zgui-scene", version = "0.1.0" }
 # thread reads the environment is a data race. `session_direct` also holds this process's
 # descriptor limit at zero for the length of the open, which would fail whatever else was opening a
 # file at the time. A test harness runs its tests on several threads, so neither belongs under one.
+# One process, because it draws through a graphics device and reads the memory behind a buffer back:
+# two tests doing that at once on one device would each see the other's frame.
+[[test]]
+name = "drawn_gl"
+path = "tests/drawn_gl.rs"
+harness = false
+
 [[test]]
 name = "session_direct"
 path = "tests/session_direct.rs"

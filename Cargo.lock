@@ -6021,6 +6021,9 @@ version = "0.1.0"
 dependencies = [
  "accesskit",
  "ash",
+ "glow",
+ "khronos-egl",
+ "libloading",
  "raw-window-handle",
  "rustix 1.1.4",
  "tracing",
