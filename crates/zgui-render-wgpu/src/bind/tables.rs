@@ -23,6 +23,9 @@ pub struct GpuRounded {
     pub radii: [f32; 8],
     /// The superellipse exponent the corners are cut with; two is the ellipse.
     pub shape: f32,
+    /// Padding to a whole texel, so the test's rectangle and radii sit texel-aligned — which is
+    /// what lets `clip_coverage` fetch each of them by texel rather than through the whole record.
+    pub pad: [u32; 3],
 }
 
 /// A whole clip chain, flattened into what one draw call applies.
@@ -41,10 +44,6 @@ pub struct GpuClip {
     pub has_mask: u32,
     /// The mask tile, meaningless unless `has_mask` is set.
     pub mask: SpriteTile,
-    /// Padding to a whole texel, so an index into the table is a whole number of texels.
-    pub pad0: u32,
-    /// The other half of it.
-    pub pad1: u32,
 }
 
 /// One paint source.
@@ -627,17 +626,17 @@ fn gpu_clip(clip: &ResolvedClip) -> GpuClip {
             rect: clip.rounded[0].rect,
             radii: clip.rounded[0].radii,
             shape: clip.rounded[0].shape,
+            pad: [0; 3],
         },
         second: GpuRounded {
             rect: clip.rounded[1].rect,
             radii: clip.rounded[1].radii,
             shape: clip.rounded[1].shape,
+            pad: [0; 3],
         },
         count: clip.rounded_count,
         has_mask: u32::from(clip.mask.is_some()),
         mask: clip.mask.map(SpriteTile::of).unwrap_or_default(),
-        pad0: 0,
-        pad1: 0,
     }
 }
 
@@ -792,6 +791,61 @@ fn premultiplied_components(stop: &GradientStop, space: ColorSpace) -> GpuStop {
 }
 
 /// What a table with a freed slot uploads.
+#[cfg(test)]
+mod layout {
+    use super::GpuClip;
+
+    /// `clip_coverage` reads a clip's record a texel at a time rather than through `load_clip`,
+    /// because the case with no rounded tests then costs two fetches instead of nine — and on a
+    /// device that keeps its tables in textures those seven are paid per fragment.
+    ///
+    /// Reading it that way means naming byte offsets in the shader, which nothing else does. This
+    /// is what stops the record moving under them: a field reordered here fails the build rather
+    /// than clipping against whatever the new texel happens to hold.
+    /// A solid fill reads only the texel its colour is on, for the same reason and with the same
+    /// hazard as the clip record above.
+    #[test]
+    fn the_paint_record_is_laid_out_the_way_the_shader_reads_it() {
+        const TEXEL: usize = 16;
+        assert_eq!(
+            size_of::<super::GpuPaint>(),
+            4 * TEXEL,
+            "four texels a record"
+        );
+        assert_eq!(
+            core::mem::offset_of!(super::GpuPaint, color),
+            2 * TEXEL,
+            "the colour is texel two"
+        );
+    }
+
+    #[test]
+    fn the_clip_record_is_laid_out_the_way_the_shader_reads_it() {
+        const TEXEL: usize = 16;
+        assert_eq!(size_of::<GpuClip>(), 11 * TEXEL, "eleven texels a record");
+        assert_eq!(
+            core::mem::offset_of!(GpuClip, aabb),
+            0,
+            "the box is texel zero"
+        );
+        assert_eq!(
+            core::mem::offset_of!(GpuClip, first),
+            TEXEL,
+            "the outer rounded test starts at texel one"
+        );
+        assert_eq!(
+            core::mem::offset_of!(GpuClip, second),
+            5 * TEXEL,
+            "the inner one at texel five"
+        );
+        assert_eq!(
+            core::mem::offset_of!(GpuClip, count),
+            9 * TEXEL,
+            "and the count at texel nine, first component"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use zgui_geom::{Device, DevicePx, Matrix4, Point, Rect, Size};

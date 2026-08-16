@@ -113,9 +113,17 @@ struct Rounded {
     radii: Radii,
     // The superellipse exponent the corners are cut with; two is the ellipse.
     shape: f32,
+    // Padding to a whole texel, so the rectangle and the radii sit texel-aligned in the table and
+    // `clip_coverage` can fetch each by texel. See `bind::tables::GpuRounded`.
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
 }
 
 // A whole clip chain, flattened into what one draw call applies.
+//
+// Nothing loads a whole one: `clip_coverage` in sdf.wgsl reads the record a texel at a time, and
+// most fragments stop after two. The declaration is what the record's layout is checked against.
 struct Clip {
     aabb: Bounds,
     first: Rounded,
@@ -123,9 +131,6 @@ struct Clip {
     count: u32,
     has_mask: u32,
     mask: Tile,
-    // Padding to a whole texel, so an index into the table is a whole number of texels.
-    pad0: u32,
-    pad1: u32,
 }
 
 // One paint source.
@@ -182,51 +187,6 @@ fn table_texel(index: u32) -> vec2<i32> {
     return vec2<i32>(
         i32(index % TABLE_TEXELS_WIDE),
         i32(index / TABLE_TEXELS_WIDE),
-    );
-}
-
-/// One clip, which spans nine texels.
-fn load_clip(id: u32) -> Clip {
-    let base = id * 10u;
-    let t0 = textureLoad(clips, table_texel(base + 0u), 0);
-    let t1 = textureLoad(clips, table_texel(base + 1u), 0);
-    let t2 = textureLoad(clips, table_texel(base + 2u), 0);
-    let t3 = textureLoad(clips, table_texel(base + 3u), 0);
-    let t4 = textureLoad(clips, table_texel(base + 4u), 0);
-    let t5 = textureLoad(clips, table_texel(base + 5u), 0);
-    let t6 = textureLoad(clips, table_texel(base + 6u), 0);
-    let t7 = textureLoad(clips, table_texel(base + 7u), 0);
-    let t8 = textureLoad(clips, table_texel(base + 8u), 0);
-    let t9 = textureLoad(clips, table_texel(base + 9u), 0);
-    return Clip(
-        Bounds(bitcast<f32>(t0.x), bitcast<f32>(t0.y), bitcast<f32>(t0.z), bitcast<f32>(t0.w)),
-        Rounded(
-            Bounds(bitcast<f32>(t1.x), bitcast<f32>(t1.y), bitcast<f32>(t1.z), bitcast<f32>(t1.w)),
-            Radii(
-                bitcast<f32>(t2.x), bitcast<f32>(t2.y), bitcast<f32>(t2.z), bitcast<f32>(t2.w),
-                bitcast<f32>(t3.x), bitcast<f32>(t3.y), bitcast<f32>(t3.z), bitcast<f32>(t3.w),
-            ),
-            bitcast<f32>(t4.x),
-        ),
-        Rounded(
-            Bounds(bitcast<f32>(t4.y), bitcast<f32>(t4.z), bitcast<f32>(t4.w), bitcast<f32>(t5.x)),
-            Radii(
-                bitcast<f32>(t5.y), bitcast<f32>(t5.z), bitcast<f32>(t5.w), bitcast<f32>(t6.x),
-                bitcast<f32>(t6.y), bitcast<f32>(t6.z), bitcast<f32>(t6.w), bitcast<f32>(t7.x),
-            ),
-            bitcast<f32>(t7.y),
-        ),
-        t7.z,
-        t7.w,
-        Tile(
-            t8.x,
-            t8.y,
-            TileRect(
-                bitcast<i32>(t8.z), bitcast<i32>(t8.w), bitcast<i32>(t9.x), bitcast<i32>(t9.y),
-            ),
-        ),
-        0u,
-        0u,
     );
 }
 
