@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use zgui_geom::{Device, Size};
+use zgui_geom::{Device, Rect, Size};
 use zgui_render::{ExternalTexture, RenderTarget, VectorBackend};
 use zgui_scene::ExternalTextureId;
 
@@ -135,6 +135,14 @@ pub struct WgpuRenderer {
     /// its damage wrote more rows than the caller asked for, and a caller reading back only the
     /// rows it asked for would then miss what the widening drew.
     composed_rows: Vec<core::ops::Range<u32>>,
+    /// The rectangles of the composed target the last frame wrote.
+    ///
+    /// Kept beside `composed_rows` because the two are read by different things and want different
+    /// shapes. A copy the processor makes steps whole rows, so rows are what it can use; a copy the
+    /// graphics device makes is a scissor, which is any rectangle at all — and on a frame that
+    /// changed forty-eight scattered places the difference between the two is a third of the
+    /// pixels.
+    composed_rects: Vec<Rect<i32, Device>>,
     /// The buffer a readback of the composed target copies through.
     ///
     /// One buffer for the life of the renderer rather than one a frame. A console reads its whole
@@ -256,6 +264,7 @@ impl WgpuRenderer {
             pending_shift: None,
             present_composed_next: false,
             composed_rows: Vec::new(),
+            composed_rects: Vec::new(),
             staging: crate::renderer::readback::Staging::new(),
             target,
             subpixel_order: SubpixelOrder::default(),
@@ -512,6 +521,14 @@ impl WgpuRenderer {
     /// holding a frame from before the rebuild.
     pub fn composed_rows(&self) -> &[core::ops::Range<u32>] {
         &self.composed_rows
+    }
+
+    /// The rectangles of the composed target the last frame wrote.
+    ///
+    /// What a copy made by the graphics device covers. See [`WgpuRenderer::composed_rows`] for the
+    /// form a copy made by the processor needs, and why they are not the same list.
+    pub fn composed_rects(&self) -> &[Rect<i32, Device>] {
+        &self.composed_rects
     }
 
     /// Reads the rows `bands` names of what was presented into `into`, keeping the rest of it.

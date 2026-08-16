@@ -1,8 +1,14 @@
 //! Where a composed frame is copied to.
 
-use std::ops::Range;
+use zgui_bits::DamageSet;
+use zgui_geom::{Device, Rect, Size};
 
-use zgui_geom::{Device, Size};
+/// How many disjoint rectangles a supplied texture's outstanding copy is tracked as.
+///
+/// Larger than the renderer's own `MAX_DAMAGE` on purpose. A rectangle there is a whole render
+/// pass; a rectangle here is a scissor and a draw inside one pass that is open anyway, which costs
+/// almost nothing — so the two want different numbers and this one is stated where it is paid.
+const STALE: usize = 32;
 
 use crate::gpu::device::Gpu;
 use crate::gpu::formats::{self, Formats};
@@ -285,12 +291,18 @@ pub struct Supplied {
     size: Size<i32, Device>,
     /// The formats derived from them.
     formats: Formats,
-    /// Per texture: the rows written into some *other* texture since this one was last written.
+    /// Per texture: what was written into some *other* texture since this one was last written.
     ///
-    /// A supplied set is rotated through, so a frame lands in one of them and the rows it changed
-    /// are owed to every one it missed. Without this a copy limited to what changed would show, on
+    /// A supplied set is rotated through, so a frame lands in one of them and what it changed is
+    /// owed to every one it missed. Without this a copy limited to what changed would show, on
     /// alternate frames, whatever that texture held two frames ago.
-    stale: Vec<Vec<Range<u32>>>,
+    ///
+    /// A [`DamageSet`] rather than a list, because it is the same problem the damage set already
+    /// solves — keep a bounded number of disjoint rectangles and merge the cheapest pair when one
+    /// more arrives — and a second implementation of it would be a second set of edge cases. The
+    /// capacity is its own: this set costs a scissor and a draw per rectangle inside one pass,
+    /// where the renderer's costs a whole pass, so it can afford to be finer.
+    stale: Vec<DamageSet<STALE>>,
     /// Whether the renderer was configured for an extent these textures do not have.
     ///
     /// The renderer cannot reallocate a supplied set, so this is a state a frame has to stop in
@@ -312,9 +324,8 @@ impl Supplied {
         }
         let first = textures.first()?;
         let size = Size::new(first.width() as i32, first.height() as i32);
-        // Every texture holds nothing, so every one of them owes the whole frame.
-        let stale =
-            vec![crate::frame::damage::every_row(size.height.max(0) as u32); textures.len()];
+        // Every texture holds nothing, so every one of them owes all of it.
+        let stale = vec![DamageSet::<STALE>::full(); textures.len()];
         // Derived from the textures themselves. The texture already answers its format, and a
         // second statement of it beside them is a way for the two to disagree.
         //
@@ -475,20 +486,28 @@ impl Supplied {
     }
 
     /// Returns which texture the next frame is copied into.
-    /// Records the rows this frame wrote against every texture, and takes what `slot` is owed.
+    /// Records what this frame wrote against every texture, and takes what `slot` is owed.
     ///
-    /// The answer is what the copy at the end of the frame has to cover: the rows this frame drew
-    /// **and** the rows drawn while this texture was not the one being written. Taking it leaves
-    /// the texture owing nothing, because the copy that follows writes exactly those rows.
-    pub fn owed(&mut self, slot: usize, rows: &[Range<u32>]) -> Vec<Range<u32>> {
-        let height = self.size.height.max(0) as u32;
+    /// The answer is what the copy at the end of the frame has to cover: the rectangles this frame
+    /// drew **and** the ones drawn while this texture was not the one being written. Taking it
+    /// leaves the texture owing nothing, because the copy that follows writes exactly those.
+    pub fn owed(&mut self, slot: usize, rects: &[Rect<i32, Device>]) -> Vec<Rect<i32, Device>> {
+        let whole = Rect::new(zgui_geom::Point::new(0, 0), self.size);
         for held in &mut self.stale {
-            *held = crate::frame::damage::merge(held, rows, height);
+            for rect in rects {
+                held.absorb(*rect);
+            }
         }
-        match self.stale.get_mut(slot) {
-            Some(held) => core::mem::take(held),
-            None => crate::frame::damage::every_row(height),
-        }
+        let Some(held) = self.stale.get_mut(slot) else {
+            return vec![whole];
+        };
+        let owed = if held.is_full() {
+            vec![whole]
+        } else {
+            held.rects().to_vec()
+        };
+        *held = DamageSet::<STALE>::new();
+        owed
     }
 
     /// Which texture the next frame is copied into.

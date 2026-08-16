@@ -7,11 +7,16 @@
 //!
 //! # What it draws
 //!
-//! [`BOXES`] blocks, each on its own path across the window at its own speed, and a bar whose width
-//! follows the frame counter. Each block is a small element with a background colour and a rounded
-//! corner: what moves is its offset, so a frame damages the rectangles the blocks left and the ones
-//! they arrived at, and nothing else. That is the shape of an interface animating rather than of a
-//! benchmark redrawing everything, and it is the shape a damage-limited backend is built for.
+//! [`BOXES`] blocks **spread over the whole screen**, each on its own path at its own speed, and a
+//! bar whose width follows the frame counter. Each block is absolutely positioned, so what moves is
+//! one offset and a frame damages the rectangle a block left and the one it arrived at, and nothing
+//! else. That is the shape of an interface animating rather than of a benchmark redrawing
+//! everything, and it is the shape a damage-limited backend is built for.
+//!
+//! Spread over the screen rather than stacked in a column, because the two ask different questions
+//! of the backend. Stacked, every block is its own band of rows and the damage is a tall thin
+//! column; spread, the blocks share rows and the damage is scattered. A backend that copies rows
+//! and a backend that copies rectangles answer those two very differently.
 //!
 //! # What it reports
 //!
@@ -111,8 +116,12 @@ fn Motion() -> impl IntoView {
                 {move || (0..boxes)
                     .map(|which| {
                         // Each block on its own path and its own period, so nothing lines up and
-                        // the damage is scattered the way a real interface's is.
+                        // the damage is scattered the way a real interface's is. The rows are laid
+                        // out so that the set fills the screen however many there are.
                         let frame = tick.get();
+                        let columns = ((boxes as f32).sqrt().ceil() as usize).max(1);
+                        let rows = boxes.div_ceil(columns);
+                        let (column, row) = (which % columns, which / columns);
                         let period = 90 + which as u64 * 17;
                         let phase = (frame + which as u64 * 13) % period;
                         let along = if phase * 2 < period {
@@ -120,14 +129,19 @@ fn Motion() -> impl IntoView {
                         } else {
                             2.0 - phase as f32 / (period as f32 / 2.0)
                         };
-                        let left = (along * 520.0) as i32;
+                        // The cell this block travels inside, and how far along it is.
+                        let cell_wide = 1180.0 / columns as f32;
+                        let cell_tall = 940.0 / rows.max(1) as f32;
+                        let left = 24.0 + column as f32 * cell_wide + along * (cell_wide - 72.0);
+                        let top = 24.0 + row as f32 * cell_tall;
                         view! {
-                            row(class = "motion__lane") {
-                                column(
-                                    class = "motion__box",
-                                    style = Some(format!("margin-left: {left}px")),
-                                )
-                            }
+                            column(
+                                class = "motion__box",
+                                style = Some(format!(
+                                    "left: {}px; top: {}px",
+                                    left as i32, top as i32
+                                )),
+                            )
                         }
                     })
                     .collect::<Vec<_>>()}
@@ -157,23 +171,32 @@ const SHEET: &str = r"
     }
 
     .motion {
-        align-items: flex-start;
-        gap: 10px;
-        padding: 24px 32px;
-        border-radius: 16px;
-        border: 1px solid #1b2230;
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 1280px;
+        height: 1024px;
         background-color: #0b0f18;
     }
 
     .motion__rate {
+        position: absolute;
+        left: 24px;
+        top: 990px;
         font-size: 18px;
         color: #7f8ca6;
     }
 
-    .motion__stage { gap: 8px; }
-    .motion__lane { width: 600px; height: 26px; }
+    .motion__stage {
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 1280px;
+        height: 1024px;
+    }
 
     .motion__box {
+        position: absolute;
         width: 64px;
         height: 26px;
         border-radius: 6px;
@@ -181,6 +204,9 @@ const SHEET: &str = r"
     }
 
     .motion__bar {
+        position: absolute;
+        left: 24px;
+        top: 972px;
         width: 420px;
         height: 10px;
         border-radius: 5px;

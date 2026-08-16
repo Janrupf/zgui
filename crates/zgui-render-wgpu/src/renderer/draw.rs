@@ -1,6 +1,7 @@
 //! What happens to a display list: the frame, and the two steps either side of it.
 
 use zgui_bits::DamageSet;
+use zgui_geom::{Device, Rect};
 use zgui_profile::{Counter, Phase, counter};
 use zgui_render::{
     ExternalTexture, FrameOutcome, FrameStats, MemoryReport, RenderCapabilities, RenderTarget,
@@ -146,6 +147,8 @@ impl Renderer for WgpuRenderer {
         let rects = damage::rects(damage, self.composed.used());
         let redrawn: u64 = rects.iter().map(|rect| damage::area(*rect)).sum();
         damage::rows_of(&rects, &mut self.composed_rows);
+        self.composed_rects.clear();
+        self.composed_rects.extend_from_slice(&rects);
 
         let formats = self.presentation.formats();
         // Before anything is planned: a display list may name an effect declared since the last
@@ -287,21 +290,21 @@ impl Renderer for WgpuRenderer {
         let mut draw_calls = recorded.draw_calls;
         if let Some(view) = &presented.view {
             // What the copy has to cover. A supplied set is rotated through and its textures
-            // persist, so a frame copies the rows it drew plus the rows drawn while this texture
-            // was not the one being written — which is worth knowing when every one of those rows
-            // crosses a bus. Everything else is copied whole: an acquired surface texture is a new
-            // resource marked wholly uninitialised on every acquisition, so a partial copy onto one
-            // comes out black everywhere it did not write.
-            let rows = match &mut self.presentation {
+            // persist, so a frame copies the rectangles it drew plus the ones drawn while this
+            // texture was not the one being written — which is worth knowing when every one of
+            // those pixels crosses a bus. Everything else is copied whole: an acquired surface
+            // texture is a new resource marked wholly uninitialised on every acquisition, so a
+            // partial copy onto one comes out black everywhere it did not write.
+            let scissors = match &mut self.presentation {
                 Presentation::Supplied(supplied) => {
                     let slot = supplied.selected();
-                    supplied.owed(slot, &self.composed_rows)
+                    supplied.owed(slot, &self.composed_rects)
                 }
                 Presentation::Surface(_) | Presentation::Offscreen(_) => {
-                    damage::every_row(self.composed.used().size.height.max(0) as u32)
+                    vec![self.composed.used()]
                 }
             };
-            self.blit(&mut encoder, view, formats.blit_undoes_srgb(), &rows);
+            self.blit(&mut encoder, view, formats.blit_undoes_srgb(), &scissors);
             draw_calls += 1;
         }
         self.gpu.queue().submit([encoder.finish()]);
@@ -548,7 +551,7 @@ impl WgpuRenderer {
         }
     }
 
-    /// Copies the rows `rows` names of the composed target onto whatever is being presented to.
+    /// Copies the rectangles `scissors` names of the composed target onto whatever is presented to.
     ///
     /// The attachment is **loaded** rather than cleared. A clear covers the whole of it whatever
     /// the scissor says, so clearing here would blank every row this copy is not about to write.
@@ -557,7 +560,7 @@ impl WgpuRenderer {
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         undo: bool,
-        rows: &[core::ops::Range<u32>],
+        scissors: &[Rect<i32, Device>],
     ) {
         let kind = if undo {
             PipelineKind::BlitUndoSrgb
@@ -587,13 +590,20 @@ impl WgpuRenderer {
         });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.composed_binding, &[]);
-        let width = self.composed.used().size.width.max(0) as u32;
-        for band in rows {
-            let height = band.end.saturating_sub(band.start);
+        for rect in scissors {
+            let (width, height) = (
+                rect.size.width.max(0) as u32,
+                rect.size.height.max(0) as u32,
+            );
             if width == 0 || height == 0 {
                 continue;
             }
-            pass.set_scissor_rect(0, band.start, width, height);
+            pass.set_scissor_rect(
+                rect.origin.x.max(0) as u32,
+                rect.origin.y.max(0) as u32,
+                width,
+                height,
+            );
             pass.draw(0..4, 0..1);
         }
     }
