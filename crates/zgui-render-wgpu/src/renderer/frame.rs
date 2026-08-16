@@ -60,6 +60,8 @@ pub struct FrameBuffers {
     pub remaps: [StorageBuffer; LANES.len()],
     /// What each remap buffer holds, so an unchanged frame skips the upload entirely.
     last_remaps: [Vec<crate::buffer::persist::OrderEntry>; LANES.len()],
+    /// The entries each of this frame's batch draws is drawn from, culled to its own rectangle.
+    pub orders: crate::buffer::orders::DrawOrders,
     /// Bind groups whose resources are the stable frame side-table buffers.
     frame_bind: RefCell<Option<([u64; 5], wgpu::BindGroup)>>,
     /// One bind group per lane, keyed by its instance arena's allocation epoch.
@@ -101,6 +103,7 @@ impl FrameBuffers {
                 StorageBuffer::vertex(gpu, "zgui.remap.shaded"),
             ],
             last_remaps: Default::default(),
+            orders: crate::buffer::orders::DrawOrders::new(gpu),
             frame_bind: RefCell::new(None),
             instance_binds: RefCell::new(HashMap::new()),
             tables_released: false,
@@ -115,6 +118,7 @@ impl FrameBuffers {
         self.effect_params.reset();
         self.effect_offsets.clear();
         self.vectors.begin_frame();
+        self.orders.begin_frame();
     }
 
     /// Incrementally prepares the shader side tables while no device work is being recorded.
@@ -167,6 +171,20 @@ impl FrameBuffers {
             .effect_params
             .upload_with(gpu, &mut self.uploader, encoder);
         uploaded += self.vectors.upload_with(gpu);
+        // After the chunk store has resolved this frame's remaps, because that is what the
+        // positions the planner staged are resolved through.
+        let resolved = [
+            self.chunks.resolved_remap(0),
+            self.chunks.resolved_remap(1),
+            self.chunks.resolved_remap(2),
+            self.chunks.resolved_remap(3),
+            self.chunks.resolved_remap(4),
+            self.chunks.resolved_remap(5),
+            self.chunks.resolved_remap(6),
+        ];
+        uploaded += self
+            .orders
+            .upload_with(gpu, &mut self.uploader, encoder, resolved);
         uploaded
     }
 
@@ -305,6 +323,7 @@ impl FrameBuffers {
             + self.stops.capacity()
             + self.spatial.capacity()
             + self.chunks.bytes()
+            + self.orders.bytes()
             + self.remaps.iter().map(StorageBuffer::capacity).sum::<u64>()
             + self.uploader.bytes()
     }

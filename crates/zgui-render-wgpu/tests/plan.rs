@@ -39,12 +39,14 @@ fn plan_with_vectors(
     let mut blocks =
         SlotBuffer::new::<zgui_render_wgpu::pipeline::composite::CompositeParams>(gpu, "test.b");
     let mut instances = zgui_render_wgpu::buffer::vectors::VectorInstances::new(gpu);
+    let mut orders = zgui_render_wgpu::buffer::orders::DrawOrders::new(gpu);
     let builder = PlanBuilder::new(
         gpu,
         &mut pool,
         &mut globals,
         &mut blocks,
         &mut instances,
+        &mut orders,
         SubpixelOrder::default(),
         zgui_scene::FrameClock::default(),
         &[],
@@ -166,23 +168,40 @@ fn a_damaged_rectangle_an_opaque_fill_covers_is_planned_from_that_fill() {
         .find(|pass| pass.scissor == middle)
         .expect("the middle rectangle is planned");
     assert_eq!(
-        planned.draws_of(covered),
-        [PlannedDraw::Batch(zgui_scene::Batch::Quads(1..3))],
-        "no erasure, and the batch begins at the fill rather than at the quad beneath it"
+        planned.draws_of(covered).len(),
+        1,
+        "no erasure, because the fill covers the whole rectangle"
+    );
+    assert_eq!(
+        instances(&planned.draws_of(covered)[0]),
+        Some(2),
+        "the fill and the quad over it: the one beneath the fill is hidden by it"
     );
 
     let bare = planned
         .passes()
         .find(|pass| pass.scissor != middle)
         .expect("the corner rectangle is planned");
+    let draws = planned.draws_of(bare);
     assert_eq!(
-        planned.draws_of(bare),
-        [
-            PlannedDraw::Clear,
-            PlannedDraw::Batch(zgui_scene::Batch::Quads(0..3)),
-        ],
-        "and the rectangle nothing covers is erased and replayed whole"
+        draws.len(),
+        2,
+        "the rectangle nothing covers is erased first"
     );
+    assert_eq!(draws[0], PlannedDraw::Clear);
+    assert_eq!(
+        instances(&draws[1]),
+        Some(1),
+        "the fill alone: neither of the other two reaches this corner, so neither is drawn there"
+    );
+}
+
+/// How many instances one planned draw draws, if it draws any.
+fn instances(draw: &PlannedDraw) -> Option<u32> {
+    match draw {
+        PlannedDraw::Instances { count, .. } => Some(*count),
+        _ => None,
+    }
 }
 
 #[test]
