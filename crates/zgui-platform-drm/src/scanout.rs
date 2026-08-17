@@ -881,6 +881,11 @@ impl Scanout {
                 gl::finish(gpu, signal)
             };
             zgui_profile::latency::mark("s.drawn");
+            // The moment the graphics device is known to have finished something, which is the one
+            // moment asking it costs nothing. `Gpu::reclaim` says why that matters; what comes back
+            // here is the staging memory the frame just finished was written through, in time for
+            // the frame after next to be written through it again instead of allocating.
+            gpu.reclaim();
             let Some(ready) = self.rotation.finished(slot, fence) else {
                 continue;
             };
