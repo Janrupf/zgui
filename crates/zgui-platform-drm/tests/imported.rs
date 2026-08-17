@@ -317,8 +317,11 @@ fn every_buffer_of_a_display_is_imported_and_registered_in_the_layout_the_driver
     // Acquiring it takes nothing back — the display engine has never been given it — which is the
     // one case an acquire has to do nothing in.
     let mut scanout = scanout;
+    let mut commit = commit::for_device(&machine.device);
     assert_eq!(
-        scanout.acquire().expect("a new display owes no barrier"),
+        scanout
+            .acquire(&machine.device, &mut *commit, &machine.gpu)
+            .expect("a new display owes no barrier"),
         Some(0),
         "the first frame goes into the first buffer, which the modeset then puts on the screen"
     );
@@ -634,7 +637,7 @@ fn a_frame_is_given_to_the_display_engine_before_anything_is_committed() {
     let mut commit = commit::for_device(&machine.device);
 
     let slot = scanout
-        .acquire()
+        .acquire(&machine.device, &mut *commit, &machine.gpu)
         .expect("a new display owes no barrier")
         .expect("nothing is outstanding on a new display");
     draw(&machine.gpu, &scanout.buffers()[slot]);
@@ -696,7 +699,10 @@ fn a_commit_that_is_refused_keeps_no_descriptor_of_this_programs() {
     // The first frame is drawn before the count is taken, so that whatever the drivers open on the
     // way to their first commit is already open.
     let mut frame = |scanout: &mut Scanout| {
-        let Some(slot) = scanout.acquire().expect("a display owes no barrier") else {
+        let Some(slot) = scanout
+            .acquire(&machine.device, &mut *commit, &machine.gpu)
+            .expect("a display owes no barrier")
+        else {
             panic!("nothing is outstanding, so a buffer is always named");
         };
         draw(&machine.gpu, &scanout.buffers()[slot]);
@@ -781,8 +787,11 @@ fn a_display_that_composites_no_pointer_keeps_the_copied_shape() {
         "the copied shape is two buffers"
     );
     let mut scanout = scanout;
+    let mut commit = commit::for_device(&machine.device);
     assert_eq!(
-        scanout.acquire().expect("a copied display owes no barrier"),
+        scanout
+            .acquire(&machine.device, &mut *commit, &machine.gpu)
+            .expect("a copied display owes no barrier"),
         None,
         "a copied display names no buffer for a renderer to compose into"
     );
@@ -830,13 +839,15 @@ fn a_frame_that_drew_nothing_leaves_the_next_one_the_buffer_it_took_back() {
     // the frame after it is pointed at the same one. Taking it back again is what has to keep
     // working: a buffer this side of the handover is acquired by doing nothing.
     assert_eq!(
-        display.acquire().expect("a new display owes no barrier"),
+        display
+            .acquire(&machine.gpu)
+            .expect("a new display owes no barrier"),
         Some(0),
         "the first frame goes into the first buffer"
     );
     assert_eq!(
         display
-            .acquire()
+            .acquire(&machine.gpu)
             .expect("a buffer nothing gave over is taken back by doing nothing"),
         Some(0),
         "a frame that drew nothing left the buffer where the next one needs it"
@@ -863,7 +874,7 @@ fn a_frame_that_drew_nothing_leaves_the_next_one_the_buffer_it_took_back() {
     };
     assert_eq!(
         display
-            .acquire()
+            .acquire(&machine.gpu)
             .expect("a buffer the display engine holds is taken back before the next frame"),
         Some(next),
         "the frame after a give-over draws into the buffer the display is not reading"
