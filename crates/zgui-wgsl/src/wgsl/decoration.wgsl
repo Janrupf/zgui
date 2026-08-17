@@ -41,11 +41,20 @@ const DECORATION_DASHED: u32 = 2u;
 const DECORATION_DOTTED: u32 = 3u;
 const DECORATION_DOUBLE: u32 = 4u;
 
+// The record travels with the vertices rather than being read again per fragment.
+//
+// It is one value for the whole instance, and the vertex stage already loads it. On a device whose
+// tables are textures, reading it again per pixel is four texture fetches for a value every pixel
+// of the instance shares — the same waste the shadow shader was carrying, where it measured 42% of
+// the composition pass.
 struct DecorationVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) local: vec2<f32>,
-    @location(1) @interpolate(flat) instance: u32,
-    @location(2) @interpolate(flat) shift: vec2<f32>,
+    @location(1) @interpolate(flat) bounds: vec4<f32>,
+    @location(2) @interpolate(flat) color: vec4<f32>,
+    // The style, the line's thickness, and the clip it draws through.
+    @location(3) @interpolate(flat) misc: vec4<f32>,
+    @location(4) @interpolate(flat) shift: vec2<f32>,
 }
 
 @vertex
@@ -59,14 +68,32 @@ fn vs_decoration(
     var out: DecorationVarying;
     out.position = to_clip_position(local, decoration.transform);
     out.local = local;
-    out.instance = slot;
+    let b = decoration.bounds;
+    out.bounds = vec4<f32>(b.x, b.y, b.w, b.h);
+    let c = decoration.color;
+    out.color = vec4<f32>(c.r, c.g, c.b, c.a);
+    out.misc = vec4<f32>(
+        f32(decoration.style),
+        decoration.thickness,
+        f32(decoration.clip),
+        0.0,
+    );
     out.shift = shift;
     return out;
 }
 
 @fragment
 fn fs_decoration(in: DecorationVarying) -> @location(0) vec4<f32> {
-    let decoration = load_decoration(in.instance);
+    let decoration = Decoration(
+        0u,
+        u32(in.misc.x),
+        Bounds(in.bounds.x, in.bounds.y, in.bounds.z, in.bounds.w),
+        Rgba(in.color.x, in.color.y, in.color.z, in.color.w),
+        in.misc.y,
+        u32(in.misc.z),
+        0u,
+        0u,
+    );
     let clip = clip_coverage(device_position(in.position.xy), decoration.clip);
     if clip <= 0.0 {
         return vec4<f32>(0.0);
