@@ -298,12 +298,26 @@ fn drive(
         .map(|output| Rc::new(RefCell::new(Cursor::new(device, output, &mut taken))))
         .collect();
 
+    // Before the buffers, because a display that draws its own frames is given a duplicate of this
+    // channel: the thread it waits for its frames on ends the loop's park through it.
+    let waker = Arc::new(EventfdWaker::new()?);
+
     let mut scanouts: Vec<Rc<RefCell<Scanout>>> = Vec::with_capacity(outputs.len());
     for (output, cursor) in outputs.iter().zip(&cursors) {
         // Without a graphics device there is nothing to make images on, so every display copies.
         let made = match gpu {
             Some(gpu) => {
-                Scanout::for_display(device, output, gpu, cursor.borrow().on_a_plane(), BGRA)
+                Scanout::for_display(
+                    device,
+                    output,
+                    gpu,
+                    cursor.borrow().on_a_plane(),
+                    BGRA,
+                    // A duplicate of the channel the loop is already parked on, so the thread that
+                    // waits for a frame can end that park. A machine that cannot duplicate it
+                    // waits for its frames on the loop's own thread.
+                    waker.as_fd().try_clone_to_owned().ok(),
+                )
             }
             None => Scanout::copied(device, output, BGRA),
         };
@@ -322,7 +336,6 @@ fn drive(
     }
 
     let surfaces = surface::one_per_output(outputs, Arc::clone(device));
-    let waker = Arc::new(EventfdWaker::new()?);
     let clock = Arc::new(SystemClock::new());
     // The device stamps a completed flip on the kernel's monotonic clock, and everything above
     // the contract reads the loop's own. Anchored once, here: reading the kernel clock again per

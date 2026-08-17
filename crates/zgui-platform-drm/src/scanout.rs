@@ -71,9 +71,11 @@
 //! fourcc the buffers are registered under comes from it.
 
 pub(crate) mod rotation;
+pub(crate) mod waiter;
 
 use std::fmt;
 use std::ops::Range;
+use std::os::fd::OwnedFd as WakeFd;
 use std::os::fd::{AsFd, OwnedFd};
 use std::time::{Duration, Instant};
 
@@ -189,6 +191,23 @@ pub struct Scanout {
 /// one is cheaper.
 const MOST_BANDS: usize = 16;
 
+/// A frame the card is still drawing, and how this program learns that it has finished.
+///
+/// One at a time. The buffer it was drawn into is its until it has been given over, so nothing else
+/// may be composed while it is here — [`Scanout::acquire`] answers nothing until it has gone.
+#[derive(Debug)]
+struct Outstanding {
+    /// Which buffer it is in.
+    slot: usize,
+    /// When it was submitted, which is what bounds how long it may stay here.
+    since: Instant,
+    /// The flag the waiting thread sets when the card has finished.
+    ///
+    /// Nothing here where no fence could be placed or no thread started, and then the wait happens
+    /// on the loop's own thread, the way it did before there was one.
+    watched: Option<waiter::Watched>,
+}
+
 /// The buffers a display is driven from, in one of the two shapes.
 ///
 /// Private: which shape a display took is answered by [`Scanout::buffers`] and
@@ -225,15 +244,14 @@ enum Buffers {
         framebuffers: Vec<Framebuffer>,
         /// How a finished frame is signalled, decided once when the buffers were made.
         signal: gl::Signal,
-        /// The slot of a frame that was submitted and not yet waited for, and when it was.
+        /// The frame that was submitted and not yet given over.
         ///
         /// Only the two tiers that wait on this side put anything here. Under
         /// [`gl::Signal::Kernel`] the frame goes to the driver with its own descriptor and the
         /// kernel does the waiting, so nothing is ever outstanding.
-        ///
-        /// The moment is what stops a frame being stranded by a loop that keeps waking and never
-        /// draws — see [`Scanout::settle_before_blocking`].
-        submitted: Option<(usize, Instant)>,
+        submitted: Option<Outstanding>,
+        /// The thread the fences are waited on, where one could be started.
+        waiter: Option<waiter::Waiter>,
     },
     /// Images the renderer draws into, which the display engine reads where they lie.
     Imported {
@@ -273,6 +291,7 @@ impl Scanout {
         gpu: &Gpu,
         pointer_on_a_plane: bool,
         bgra: bool,
+        wake: Option<WakeFd>,
     ) -> Result<Self, PlatformError> {
         // Vulkan first, then the same arrangement through GL, then the copy every machine can do.
         // The two drawn shapes are tried in that order rather than chosen by backend, so a device
@@ -287,7 +306,7 @@ impl Scanout {
             }
             Err(reason) => reason,
         };
-        match Self::drawn_gl(device, output, gpu, pointer_on_a_plane) {
+        match Self::drawn_gl(device, output, gpu, pointer_on_a_plane, wake) {
             Ok(scanout) => {
                 info!(
                     crtc = output.pipe.crtc,
@@ -533,6 +552,18 @@ impl Scanout {
             return Ok(None);
         }
         self.settle(device, commit, gpu)?;
+        // A frame the card has not finished holds the buffer it was drawn into, and the rotation
+        // would otherwise answer that same buffer. Nothing is taken back, so nothing is owed back:
+        // the caller keeps its damage and asks again, and the thread's wake is what brings it back.
+        if matches!(
+            &self.buffers,
+            Buffers::DrawnGl {
+                submitted: Some(_),
+                ..
+            }
+        ) {
+            return Ok(None);
+        }
         let Some(slot) = self.rotation.drawing() else {
             return Ok(None);
         };
@@ -709,8 +740,23 @@ impl Scanout {
             // The other two tiers wait on this side, and the wait is the whole time the card takes.
             // It is left to [`Scanout::settle`] rather than paid here: the frame's own work is over,
             // and everything the loop does next is work the card can be drawing underneath.
-            if let Buffers::DrawnGl { submitted, .. } = &mut self.buffers {
-                *submitted = Some((slot, Instant::now()));
+            // The fence is placed while the graphics device is this thread's, and handed to the
+            // thread that waits. A machine that could give neither leaves `watched` empty, and the
+            // wait falls back to the loop's own thread at the next acquire.
+            let placed = gl::place(gpu, signal);
+            if let Buffers::DrawnGl {
+                submitted, waiter, ..
+            } = &mut self.buffers
+            {
+                let watched = placed.zip(waiter.as_ref()).and_then(|(placed, waiter)| {
+                    zgui_profile::latency::mark("s.handed");
+                    waiter.watch(placed)
+                });
+                *submitted = Some(Outstanding {
+                    slot,
+                    since: Instant::now(),
+                    watched,
+                });
             }
             return Ok(true);
         }
@@ -766,18 +812,41 @@ impl Scanout {
     ) -> Result<(), PlatformError> {
         let Buffers::DrawnGl {
             signal, submitted, ..
-        } = &mut self.buffers
+        } = &self.buffers
         else {
             return Ok(());
         };
         let signal = *signal;
-        let Some((slot, _)) = submitted.take() else {
+        let Some(outstanding) = submitted else {
             return Ok(());
         };
+        // A frame a thread is waiting for is given over when that thread says the card has
+        // finished, and left alone until then. Nothing blocks here: the loop keeps its timers, its
+        // input and its page flips, and the wake the thread sends is what brings it back.
+        if outstanding
+            .watched
+            .as_ref()
+            .is_some_and(|held| !held.drawn())
+        {
+            return Ok(());
+        }
+        let watched = outstanding.watched.is_some();
+        let Buffers::DrawnGl { submitted, .. } = &mut self.buffers else {
+            return Ok(());
+        };
+        let Some(outstanding) = submitted.take() else {
+            return Ok(());
+        };
+        let slot = outstanding.slot;
         // Marked either side, because the two halves fail differently: a long wait here is the
-        // graphics device still drawing, and a long commit is the display engine.
+        // graphics device still drawing, and a long commit is the display engine. A frame a thread
+        // waited for has nothing left to wait for and the two marks fall together.
         zgui_profile::latency::mark("s.fence");
-        let fence = gl::finish(gpu, signal);
+        let fence = if watched {
+            None
+        } else {
+            gl::finish(gpu, signal)
+        };
         zgui_profile::latency::mark("s.drawn");
         let Some(ready) = self.rotation.finished(slot, fence) else {
             return Ok(());
@@ -793,16 +862,17 @@ impl Scanout {
     /// `within` is how long that wait is, and nothing where the loop is about to block until
     /// something happens.
     ///
-    /// **A frame younger than one refresh, before a wait shorter than one refresh, is left
-    /// outstanding.** That is the whole point of deferring it: the acquire the frame after it makes
-    /// falls inside that window, and settling here instead would put the card's whole drawing back
-    /// in front of the loop.
+    /// **Where a thread is waiting for the frame this always settles**, because it never blocks:
+    /// asking the thread whether it has finished is a load of a flag, and the wake that thread
+    /// sends is what brings the loop here in the first place.
     ///
-    /// One refresh, because that is how long a frame can usefully wait: one that has not reached an
-    /// acquire by then has missed the flip it would have been shown at, so nothing is left to lose
-    /// by waiting here. Both halves are needed. The wait covers an application that stops animating
-    /// and parks, and the age covers one that keeps waking for something else and never draws
-    /// again — which would otherwise strand the last frame it did draw for the rest of the run.
+    /// Where none is — a machine whose driver placed no fence — the wait falls to this thread, and
+    /// then a frame younger than one refresh, before a wait shorter than one refresh, is left
+    /// outstanding: the acquire the frame after it makes falls inside that window. One refresh,
+    /// because that is how long a frame can usefully wait: one that has not reached an acquire by
+    /// then has missed the flip it would have been shown at. Both halves are needed. The wait
+    /// covers an application that stops animating and parks, and the age covers one that keeps
+    /// waking for something else and never draws again.
     ///
     /// # Errors
     ///
@@ -815,15 +885,21 @@ impl Scanout {
         within: Option<Duration>,
     ) -> Result<(), PlatformError> {
         let Buffers::DrawnGl {
-            submitted: Some((_, since)),
+            submitted: Some(outstanding),
             ..
         } = &self.buffers
         else {
             return Ok(());
         };
+        // A frame a thread is waiting for costs nothing to ask about and blocks nothing, so it is
+        // always asked: the thread's wake is what brought the loop here, and this is where the
+        // frame reaches the screen.
+        if outstanding.watched.is_some() {
+            return self.settle(device, commit, gpu);
+        }
         let refresh = self.refresh_interval();
         let soon = within.is_some_and(|wait| wait <= refresh);
-        let fresh = since.elapsed() <= refresh;
+        let fresh = outstanding.since.elapsed() <= refresh;
         if soon && fresh {
             return Ok(());
         }
@@ -1020,6 +1096,7 @@ impl Scanout {
         output: &Output,
         gpu: &Gpu,
         pointer_on_a_plane: bool,
+        wake: Option<WakeFd>,
     ) -> Result<Self, Copied> {
         if !pointer_on_a_plane {
             return Err(Copied::NoCursorPlane);
@@ -1102,6 +1179,7 @@ impl Scanout {
                 framebuffers,
                 signal,
                 submitted: None,
+                waiter: wake.map(waiter::Waiter::new),
             },
         ))
     }
