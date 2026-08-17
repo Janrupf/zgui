@@ -224,34 +224,43 @@ impl Recorder<'_> {
         // picture: no pixel is written under more than one of them, so it sees its own rectangle's
         // draws in their planned order either way. Overlapping rectangles are drawn one at a time,
         // because a pixel in two of them has to be cleared again between the two.
-        match shared_draws(plan, &passes, &scissors) {
-            Some(shared) => {
-                for draw in shared {
-                    let issued = self.issue(
-                        &mut pass,
-                        passes[0],
-                        tables.as_ref(),
-                        draw,
-                        format,
-                        &scissors,
-                    );
-                    if issued {
-                        recorded.draw_calls += scissors.len() as u32;
-                    } else {
-                        recorded.dropped += 1;
+        let mut run = Vec::with_capacity(scissors.len());
+        match shared_shape(plan, &passes, &scissors) {
+            Some(template) => {
+                // Where each rectangle stands in the template. A rectangle draws a subsequence of
+                // it — the kinds no instance of its own reaches are simply absent — so a cursor is
+                // what says whether this rectangle is one of the ones the draw about to be issued
+                // belongs to.
+                let mut at = vec![0_usize; passes.len()];
+                for shape in template {
+                    run.clear();
+                    for (index, (planned, scissor)) in passes.iter().zip(&scissors).enumerate() {
+                        let Some(draw) = plan.draws_of(planned).get(at[index]) else {
+                            continue;
+                        };
+                        if !same_shape(draw, shape) {
+                            continue;
+                        }
+                        run.push((*scissor, draw));
+                        at[index] += 1;
+                    }
+                    if run.is_empty() {
+                        continue;
+                    }
+                    match self.issue(&mut pass, passes[0], tables.as_ref(), shape, format, &run) {
+                        Some(issued) => recorded.draw_calls += issued,
+                        None => recorded.dropped += 1,
                     }
                 }
             }
             None => {
                 for (planned, scissor) in passes.iter().zip(&scissors) {
-                    let one = core::slice::from_ref(scissor);
                     for draw in plan.draws_of(planned) {
-                        let issued =
-                            self.issue(&mut pass, planned, tables.as_ref(), draw, format, one);
-                        if issued {
-                            recorded.draw_calls += 1;
-                        } else {
-                            recorded.dropped += 1;
+                        run.clear();
+                        run.push((*scissor, draw));
+                        match self.issue(&mut pass, planned, tables.as_ref(), draw, format, &run) {
+                            Some(issued) => recorded.draw_calls += issued,
+                            None => recorded.dropped += 1,
                         }
                     }
                 }
@@ -259,7 +268,12 @@ impl Recorder<'_> {
         }
     }
 
-    /// Issues one planned draw under every rectangle of `scissors`, and says whether it happened.
+    /// Issues one planned draw over `run`, and answers how many draws that took.
+    ///
+    /// `draw` is the shape every entry of `run` shares — the same kind, drawn by the same pipeline
+    /// — and is what the state is set from. What each entry carries of its own is which instances
+    /// reach its rectangle. Answers nothing where the draw could not be issued at all, which is a
+    /// pipeline or a binding the device has not got.
     fn issue(
         &mut self,
         pass: &mut wgpu::RenderPass<'_>,
@@ -267,36 +281,22 @@ impl Recorder<'_> {
         tables: Option<&wgpu::BindGroup>,
         draw: &PlannedDraw,
         format: wgpu::TextureFormat,
-        scissors: &[Rect<i32, Device>],
-    ) -> bool {
+        run: &[Swept<'_>],
+    ) -> Option<u32> {
         match draw {
             PlannedDraw::Clear => {
-                let Some(pipeline) =
-                    self.pipelines
-                        .get(self.gpu, PipelineKind::DamageClear, format)
-                else {
-                    return false;
-                };
+                let pipeline = self
+                    .pipelines
+                    .get(self.gpu, PipelineKind::DamageClear, format)?;
                 pass.set_pipeline(pipeline);
-                sweep(pass, scissors, 0..1);
-                true
+                Some(sweep(pass, run, once))
             }
-            PlannedDraw::Instances {
-                kind,
-                texture,
-                first,
-                count,
-            } => self.instances(
-                pass, planned, tables, *kind, *texture, *first, *count, format, scissors,
-            ),
-            PlannedDraw::Shaded {
-                shader,
-                params,
-                first,
-                count,
-            } => self.shaded(
-                pass, planned, tables, *shader, *params, *first, *count, format, scissors,
-            ),
+            PlannedDraw::Instances { kind, texture, .. } => {
+                self.instances(pass, planned, tables, *kind, *texture, format, run)
+            }
+            PlannedDraw::Shaded { shader, params, .. } => {
+                self.shaded(pass, planned, tables, *shader, *params, format, run)
+            }
             PlannedDraw::Blur {
                 source,
                 params,
@@ -307,14 +307,8 @@ impl Recorder<'_> {
                 } else {
                     PipelineKind::BlurAxis
                 };
-                self.textured(pass, kind, *source, *params, None, format, scissors)
+                self.textured(pass, kind, *source, *params, None, format, run)
             }
-            PlannedDraw::Effect {
-                source,
-                shader,
-                params,
-                block,
-            } => self.effect_filter(pass, *source, *shader, *params, *block, format),
             PlannedDraw::Composite { source, params } => self.textured(
                 pass,
                 PipelineKind::Composite,
@@ -322,66 +316,55 @@ impl Recorder<'_> {
                 *params,
                 tables.map(|bind| (bind, planned.globals)),
                 format,
-                scissors,
+                run,
             ),
-            PlannedDraw::Vector {
-                target,
-                first,
-                count,
-            } => {
-                let Some(view) = self.vectors.and_then(|source| source.view(*target)) else {
-                    return false;
-                };
-                let Some(bind) =
+            PlannedDraw::Effect {
+                source,
+                shader,
+                params,
+                block,
+            } => self.effect_filter(pass, *source, *shader, *params, *block, format, run),
+            PlannedDraw::Vector { target, .. } => {
+                let view = self.vectors.and_then(|source| source.view(*target))?;
+                let bind =
                     self.buffers
-                        .vector_bind_group(self.gpu, self.pipelines.layouts(), view)
-                else {
-                    return false;
-                };
-                let Some(tables) = tables else {
-                    return false;
-                };
-                let Some(pipeline) =
+                        .vector_bind_group(self.gpu, self.pipelines.layouts(), view)?;
+                let tables = tables?;
+                let pipeline =
                     self.pipelines
-                        .get(self.gpu, PipelineKind::VectorComposite, format)
-                else {
-                    return false;
-                };
+                        .get(self.gpu, PipelineKind::VectorComposite, format)?;
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, tables, &[planned.globals]);
                 pass.set_bind_group(1, &bind, &[]);
-                sweep(pass, scissors, *first..*first + *count);
-                true
+                Some(sweep(pass, run, composited))
             }
             PlannedDraw::External { texture, params } => {
-                let Some(attached) = self.externals.get(texture) else {
-                    return false;
-                };
-                let Some(bind) = self.buffers.filtered_bind_group(
+                let attached = self.externals.get(texture)?;
+                let bind = self.buffers.filtered_bind_group(
                     self.gpu,
                     self.pipelines.layouts(),
                     &attached.view,
                     self.sampler,
-                ) else {
-                    return false;
-                };
-                let Some(tables) = tables else {
-                    return false;
-                };
-                let Some(pipeline) = self.pipelines.get(self.gpu, PipelineKind::External, format)
-                else {
-                    return false;
-                };
+                )?;
+                let tables = tables?;
+                let pipeline = self
+                    .pipelines
+                    .get(self.gpu, PipelineKind::External, format)?;
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, tables, &[planned.globals]);
                 pass.set_bind_group(1, &bind, &[*params]);
-                sweep(pass, scissors, 0..1);
-                true
+                Some(sweep(pass, run, once))
             }
         }
     }
 
-    /// Issues one run of instances of the display list, under every rectangle of `scissors`.
+    /// Issues one run of instances of the display list over `run`.
+    ///
+    /// The pipeline and the bindings are set once. What each rectangle carries of its own is where
+    /// its instances start in the frame's order list and how many there are, and that reaches the
+    /// draw as a vertex buffer offset — asking for a non-zero base instance instead would need
+    /// OpenGL 4.2, and the oldest device this runs on is 3.3. A rectangle no instance reaches
+    /// issues nothing.
     #[allow(
         clippy::too_many_arguments,
         reason = "every one of them is a property of the one draw being issued"
@@ -393,61 +376,57 @@ impl Recorder<'_> {
         tables: Option<&wgpu::BindGroup>,
         kind: PipelineKind,
         texture: Option<u32>,
-        first: u32,
-        count: u32,
         format: wgpu::TextureFormat,
-        scissors: &[Rect<i32, Device>],
-    ) -> bool {
-        if count == 0 {
-            return false;
-        }
-        let Some(tables) = tables else {
-            return false;
-        };
-        let Some(lane) = crate::renderer::frame::FrameBuffers::lane(kind) else {
-            return false;
-        };
-        let Some(instances) =
+        run: &[Swept<'_>],
+    ) -> Option<u32> {
+        let tables = tables?;
+        let lane = crate::renderer::frame::FrameBuffers::lane(kind)?;
+        let instances =
             self.buffers
-                .instance_bind_group(self.gpu, self.pipelines.layouts(), lane)
-        else {
-            return false;
-        };
+                .instance_bind_group(self.gpu, self.pipelines.layouts(), lane)?;
         let atlas = match texture {
             None => None,
             // A sprite whose atlas texture was never created cannot be drawn at all: it happens
             // when a device was rebuilt and the content has not been rasterised again yet, and
             // drawing it against another texture would show a stranger's pixels.
-            Some(texture) => match self.atlas.bind_group(decode_texture(texture)) {
-                Some(bind_group) => Some(bind_group),
-                None => return false,
-            },
+            Some(texture) => Some(self.atlas.bind_group(decode_texture(texture))?),
         };
-        let Some(pipeline) = self.pipelines.get(self.gpu, kind, format) else {
-            return false;
-        };
+        let pipeline = self.pipelines.get(self.gpu, kind, format)?;
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, tables, &[planned.globals]);
         pass.set_bind_group(1, &instances, &[]);
         if let Some(bind_group) = atlas {
             pass.set_bind_group(2, bind_group, &[]);
         }
-        // The order list is bound at the offset this run starts at, and the draw counts from
-        // instance zero. Asking for a non-zero base instance instead would need OpenGL 4.2, and
-        // the oldest device this runs on is 3.3.
-        let offset = u64::from(first) * size_of::<crate::buffer::persist::OrderEntry>() as u64;
-        pass.set_vertex_buffer(0, self.buffers.orders.buffer().slice(offset..));
-        sweep(pass, scissors, 0..count);
-        true
+
+        let mut issued = 0;
+        for (scissor, draw) in run {
+            let PlannedDraw::Instances { first, count, .. } = draw else {
+                continue;
+            };
+            if *count == 0 {
+                continue;
+            }
+            let offset = u64::from(*first) * size_of::<crate::buffer::persist::OrderEntry>() as u64;
+            pass.set_vertex_buffer(0, self.buffers.orders.buffer().slice(offset..));
+            scissor_to(pass, scissor);
+            pass.draw(0..4, 0..*count);
+            issued += 1;
+        }
+        Some(issued)
     }
 
-    /// Issues one run of rectangles drawn by one application effect with one set of parameters.
+    /// Issues one run of an application's own primitive effect over `run`.
     ///
-    /// It binds what every instanced draw binds — the frame's tables and the lane's instances —
-    /// and one block more. An effect the renderer was never told about draws nothing: the
-    /// alternative is drawing the rectangle with whatever pipeline happened to be bound.
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
+    /// The shaded lane is drawn exactly as [`Recorder::instances`] draws the framework's own — one
+    /// order list swept across each rectangle's scissor — through a per-application pipeline and
+    /// with a parameter block of its own beside the frame's tables. An effect the renderer was
+    /// never told about draws nothing rather than the rectangle drawn by whatever pipeline happened
+    /// to be bound.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "every one of them is a property of the one draw being issued"
+    )]
     fn shaded(
         &mut self,
         pass: &mut wgpu::RenderPass<'_>,
@@ -455,25 +434,18 @@ impl Recorder<'_> {
         tables: Option<&wgpu::BindGroup>,
         shader: zgui_scene::ShaderId,
         params: zgui_scene::ShaderParamsSlot,
-        first: u32,
-        count: u32,
         format: wgpu::TextureFormat,
-        scissors: &[Rect<i32, Device>],
-    ) -> bool {
-        if count == 0 {
-            return false;
-        }
-        // Every one of these drops a rectangle the display list asked for, so each says once why:
-        // an effect that stops appearing is otherwise indistinguishable from one drawing nothing.
+        run: &[Swept<'_>],
+    ) -> Option<u32> {
         let Some(tables) = tables else {
             self.pipelines
                 .note_undrawable_effect(shader, "the frame's side tables were not bound");
-            return false;
+            return None;
         };
-        let Some(offset) = self.buffers.effect_offset(params) else {
+        let Some(block_offset) = self.buffers.effect_offset(params) else {
             self.pipelines
                 .note_undrawable_effect(shader, "this frame staged no parameters for its block");
-            return false;
+            return None;
         };
         let Some(block) = self
             .buffers
@@ -481,7 +453,7 @@ impl Recorder<'_> {
         else {
             self.pipelines
                 .note_undrawable_effect(shader, "the parameter buffer was never uploaded");
-            return false;
+            return None;
         };
         let lane = crate::renderer::frame::FrameBuffers::SHADED_LANE;
         let Some(instances) =
@@ -490,35 +462,47 @@ impl Recorder<'_> {
         else {
             self.pipelines
                 .note_undrawable_effect(shader, "the instance arena was not bound");
-            return false;
+            return None;
         };
         let Some(pipeline) = self.pipelines.effect(self.gpu, shader, format) else {
             self.pipelines.note_undrawable_effect(
                 shader,
                 "no pipeline: the effect is not registered on this device, or would not build",
             );
-            return false;
+            return None;
         };
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, tables, &[planned.globals]);
         pass.set_bind_group(1, &instances, &[]);
-        pass.set_bind_group(2, &block, &[offset]);
-        // The order list is bound at the offset this run starts at and the draw counts from
-        // instance zero, exactly as `instances` above does — the run is culled to each scissor the
-        // same way, and drawn once per rectangle.
-        let offset = u64::from(first) * size_of::<crate::buffer::persist::OrderEntry>() as u64;
-        pass.set_vertex_buffer(0, self.buffers.orders.buffer().slice(offset..));
-        sweep(pass, scissors, 0..count);
-        true
+        pass.set_bind_group(2, &block, &[block_offset]);
+
+        let mut issued = 0;
+        for (scissor, draw) in run {
+            let PlannedDraw::Shaded { first, count, .. } = draw else {
+                continue;
+            };
+            if *count == 0 {
+                continue;
+            }
+            let offset = u64::from(*first) * size_of::<crate::buffer::persist::OrderEntry>() as u64;
+            pass.set_vertex_buffer(0, self.buffers.orders.buffer().slice(offset..));
+            scissor_to(pass, scissor);
+            pass.draw(0..4, 0..*count);
+            issued += 1;
+        }
+        Some(issued)
     }
 
-    /// Issues one filtering pass of an application's own shader.
+    /// Issues one filtering pass of an application's own shader over `run`.
     ///
-    /// It binds what the blur chain binds — the block describing what it reads, the source and the
-    /// sampler — and the effect's own parameters beside them. It binds none of the frame's tables:
-    /// a filter is cut to its region by the scissor rather than clipped per fragment, so it reads
-    /// no clip chain and there is nothing for it to index into.
-    #[allow(clippy::too_many_arguments)]
+    /// A filter covers its region and reads a texture, so it binds the block describing what it
+    /// reads, the source and the sampler, and the effect's own parameters beside them — and none of
+    /// the frame's tables: it is cut to its region by the scissor rather than clipped per fragment,
+    /// so it reads no clip chain. One draw per rectangle of the run.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "every one of them is a property of the one draw being issued"
+    )]
     fn effect_filter(
         &mut self,
         pass: &mut wgpu::RenderPass<'_>,
@@ -527,35 +511,26 @@ impl Recorder<'_> {
         params: u32,
         block: u32,
         format: wgpu::TextureFormat,
-    ) -> bool {
-        let Some(view) = self.view(source) else {
-            return false;
-        };
-        let Some(read) = self.buffers.filtered_bind_group(
+        run: &[Swept<'_>],
+    ) -> Option<u32> {
+        let view = self.view(source)?;
+        let read = self.buffers.filtered_bind_group(
             self.gpu,
             self.pipelines.layouts(),
             view,
             self.sampler,
-        ) else {
-            return false;
-        };
-        let Some(own) = self
+        )?;
+        let own = self
             .buffers
-            .effect_bind_group(self.gpu, self.pipelines.layouts())
-        else {
-            return false;
-        };
-        let Some(pipeline) = self.pipelines.effect(self.gpu, shader, format) else {
-            return false;
-        };
+            .effect_bind_group(self.gpu, self.pipelines.layouts())?;
+        let pipeline = self.pipelines.effect(self.gpu, shader, format)?;
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &read, &[params]);
         pass.set_bind_group(1, &own, &[block]);
-        pass.draw(0..4, 0..1);
-        true
+        Some(sweep(pass, run, once))
     }
 
-    /// Issues one draw that reads a target through a block of its own, once per scissor.
+    /// Issues one draw that reads a target through a block of its own, once per rectangle.
     fn textured(
         &mut self,
         pass: &mut wgpu::RenderPass<'_>,
@@ -564,22 +539,16 @@ impl Recorder<'_> {
         params: u32,
         tables: Option<(&wgpu::BindGroup, u32)>,
         format: wgpu::TextureFormat,
-        scissors: &[Rect<i32, Device>],
-    ) -> bool {
-        let Some(view) = self.view(source) else {
-            return false;
-        };
-        let Some(bind) = self.buffers.filtered_bind_group(
+        run: &[Swept<'_>],
+    ) -> Option<u32> {
+        let view = self.view(source)?;
+        let bind = self.buffers.filtered_bind_group(
             self.gpu,
             self.pipelines.layouts(),
             view,
             self.sampler,
-        ) else {
-            return false;
-        };
-        let Some(pipeline) = self.pipelines.get(self.gpu, kind, format) else {
-            return false;
-        };
+        )?;
+        let pipeline = self.pipelines.get(self.gpu, kind, format)?;
         pass.set_pipeline(pipeline);
         let group = match tables {
             Some((bind_group, offset)) => {
@@ -589,8 +558,7 @@ impl Recorder<'_> {
             None => 0,
         };
         pass.set_bind_group(group, &bind, &[params]);
-        sweep(pass, scissors, 0..1);
-        true
+        Some(sweep(pass, run, once))
     }
 
     /// A view of a target.
@@ -626,46 +594,98 @@ impl Recorder<'_> {
     }
 }
 
-/// Draws `instances` of a unit quad once under each of `scissors`.
+/// One rectangle of a swept run: where to scissor, and that rectangle's own version of the draw.
+///
+/// Every entry of a run is the same kind of draw drawn by the same pipeline. What differs is which
+/// instances of the display list reach that rectangle, which is what the culling worked out when
+/// the frame was planned.
+type Swept<'plan> = (Rect<i32, Device>, &'plan PlannedDraw);
+
+/// Draws a unit quad under each rectangle of `run`, taking each one's instances from `of`.
 ///
 /// The pipeline and its bindings are set by the caller and not touched here: what separates one
 /// damage rectangle from the next is the scissor alone, and setting one is a small fraction of
-/// what setting the rest costs.
+/// what setting the rest costs. Answers how many draws that took, which is one per rectangle that
+/// had anything to draw.
 fn sweep(
     pass: &mut wgpu::RenderPass<'_>,
-    scissors: &[Rect<i32, Device>],
-    instances: core::ops::Range<u32>,
-) {
-    for scissor in scissors {
-        pass.set_scissor_rect(
-            scissor.origin.x.max(0) as u32,
-            scissor.origin.y.max(0) as u32,
-            scissor.size.width.max(0) as u32,
-            scissor.size.height.max(0) as u32,
-        );
-        pass.draw(0..4, instances.clone());
+    run: &[Swept<'_>],
+    of: fn(&PlannedDraw) -> core::ops::Range<u32>,
+) -> u32 {
+    let mut issued = 0;
+    for (scissor, draw) in run {
+        let instances = of(draw);
+        if instances.is_empty() {
+            continue;
+        }
+        scissor_to(pass, scissor);
+        pass.draw(0..4, instances);
+        issued += 1;
+    }
+    issued
+}
+
+/// The one instance every draw that is not a run of the display list draws.
+fn once(_: &PlannedDraw) -> core::ops::Range<u32> {
+    0..1
+}
+
+/// A vector composite's own instances, which a rectangle carries for itself.
+fn composited(draw: &PlannedDraw) -> core::ops::Range<u32> {
+    match draw {
+        PlannedDraw::Vector { first, count, .. } => *first..*first + *count,
+        _ => 0..0,
     }
 }
 
-/// The draw list every pass of a run replays, when they all replay one and it is safe to sweep.
+/// Cuts the pass to `scissor`, clamped to the target it is drawing into.
+fn scissor_to(pass: &mut wgpu::RenderPass<'_>, scissor: &Rect<i32, Device>) {
+    pass.set_scissor_rect(
+        scissor.origin.x.max(0) as u32,
+        scissor.origin.y.max(0) as u32,
+        scissor.size.width.max(0) as u32,
+        scissor.size.height.max(0) as u32,
+    );
+}
+
+/// The order of draw kinds a run's rectangles all replay part of, when it is safe to sweep them.
 ///
-/// A damage rectangle is planned as a full replay of the batch stream under its own scissor, so
-/// the runs that matter are the ones where every rectangle's draw list is the same list. Sweeping
-/// then reorders the draws — every rectangle's first draw, then every rectangle's second — and
+/// A damage rectangle is planned as a replay of the batch stream under its own scissor, holding
+/// only the kinds some instance of its own reaches. So the rectangles of one run draw
+/// **subsequences of one order**, and this answers the longest of them where every other is a
+/// subsequence of it. Two things are deliberately not required to match. Which instances reach a
+/// rectangle is what the culling worked out and is carried per rectangle; and a rectangle that
+/// draws fewer kinds than another simply sits out the draws it has none of.
+///
+/// Sweeping reorders the draws — every rectangle's first draw, then every rectangle's second — and
 /// that is the same picture only while no pixel lies under two scissors. It usually does not: a
 /// [`DamageSet`](zgui_bits::DamageSet) holds pairwise disjoint rectangles by construction. A
 /// backdrop widens the set afterwards and can put one rectangle inside another, which is the case
 /// this returns `None` for.
-fn shared_draws<'plan>(
+fn shared_shape<'plan>(
     plan: &'plan FramePlan,
     passes: &[&PlannedPass],
     scissors: &[Rect<i32, Device>],
 ) -> Option<&'plan [PlannedDraw]> {
-    let first = plan.draws_of(passes[0]);
+    let template = passes
+        .iter()
+        .map(|held| plan.draws_of(held))
+        .max_by_key(|draws| draws.len())?;
     if passes.len() == 1 {
-        return Some(first);
+        return Some(template);
     }
-    if !passes[1..].iter().all(|held| plan.draws_of(held) == first) {
+    // The block describing the target is bound once for the whole run, so a rectangle wanting a
+    // different one has to be drawn on its own.
+    if !passes[1..]
+        .iter()
+        .all(|held| held.globals == passes[0].globals)
+    {
+        return None;
+    }
+    let subsequences = passes
+        .iter()
+        .all(|held| subsequence(plan.draws_of(held), template));
+    if !subsequences {
         return None;
     }
     let disjoint = scissors.iter().enumerate().all(|(index, rect)| {
@@ -673,7 +693,49 @@ fn shared_draws<'plan>(
             .iter()
             .any(|other| other.intersects(*rect))
     });
-    disjoint.then_some(first)
+    disjoint.then_some(template)
+}
+
+/// Whether `draws` appears inside `template` in order, matching on shape.
+fn subsequence(draws: &[PlannedDraw], template: &[PlannedDraw]) -> bool {
+    let mut wanted = draws.iter();
+    let mut next = wanted.next();
+    for shape in template {
+        if next.is_some_and(|draw| same_shape(draw, shape)) {
+            next = wanted.next();
+        }
+    }
+    next.is_none()
+}
+
+/// Whether two draws are the same kind drawn by the same pipeline with the same bindings.
+///
+/// Which instances they draw is left out, and for the two that carry a run of the order list that
+/// is the only thing allowed to differ. Everything else has to match exactly, because everything
+/// else is state that is set once for the whole sweep.
+fn same_shape(a: &PlannedDraw, b: &PlannedDraw) -> bool {
+    match (a, b) {
+        (
+            PlannedDraw::Instances { kind, texture, .. },
+            PlannedDraw::Instances {
+                kind: other,
+                texture: from,
+                ..
+            },
+        ) => kind == other && texture == from,
+        (
+            PlannedDraw::Shaded { shader, params, .. },
+            PlannedDraw::Shaded {
+                shader: other,
+                params: from,
+                ..
+            },
+        ) => shader == other && params == from,
+        (PlannedDraw::Vector { target, .. }, PlannedDraw::Vector { target: other, .. }) => {
+            target == other
+        }
+        _ => a == b,
+    }
 }
 
 /// A device-pixel rectangle in a target's own texels, cut to its extent.

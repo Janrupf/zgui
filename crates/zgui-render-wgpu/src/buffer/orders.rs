@@ -31,6 +31,12 @@ pub struct DrawOrders {
     staged: Vec<(u8, u32)>,
     /// The entries those positions resolve to, rebuilt at upload.
     resolved: Vec<OrderEntry>,
+    /// What the buffer already holds, so a frame resolving to the same list uploads nothing.
+    ///
+    /// A replay whose visible set and residence held resolves to exactly the list of the frame
+    /// before it — a blink, an animation elsewhere — and owes the order buffer nothing. Without
+    /// this a resident frame still re-uploads its whole order list every frame it draws.
+    last: Vec<OrderEntry>,
     /// Where they are uploaded to.
     buffer: StorageBuffer,
 }
@@ -41,6 +47,7 @@ impl DrawOrders {
         Self {
             staged: Vec::new(),
             resolved: Vec::new(),
+            last: Vec::new(),
             buffer: StorageBuffer::vertex(gpu, "zgui.draw_orders"),
         }
     }
@@ -80,7 +87,13 @@ impl DrawOrders {
                 .copied()
                 .unwrap_or_default()
         }));
-        self.buffer.upload(gpu, belt, encoder, &self.resolved)
+        if self.resolved == self.last {
+            return 0;
+        }
+        let uploaded = self.buffer.upload(gpu, belt, encoder, &self.resolved);
+        self.last.clear();
+        self.last.extend_from_slice(&self.resolved);
+        uploaded
     }
 
     /// The buffer a draw binds as its instance input.
