@@ -266,6 +266,93 @@ pub fn finish(gpu: &Gpu, how: Signal) -> Option<OwnedFd> {
     }
 }
 
+/// A fence a frame left in the command stream, and what it takes to wait for it.
+///
+/// The point of it is that it can leave this thread. An EGL sync object belongs to its **display**
+/// rather than to a context, and `EGL_KHR_fence_sync` states that any thread may wait on one — so
+/// the wait, which is the whole time the card takes to draw a frame, happens somewhere that is not
+/// the frame loop. [`crate::scanout::waiter`] is what does the waiting.
+#[derive(Debug)]
+pub struct Placed {
+    /// The display the sync object belongs to.
+    display: *mut c_void,
+    /// The sync object itself.
+    sync: *mut c_void,
+    /// `eglClientWaitSyncKHR`, read once here so the waiting thread reaches no EGL loader.
+    wait: ClientWait,
+    /// `eglDestroySyncKHR`, for the same reason.
+    destroy: DestroySync,
+}
+
+// SAFETY: an EGLDisplay is process-wide and an EGLSyncKHR belongs to that display rather than to
+// the context it was created under, so waiting on one needs no context current on the thread that
+// waits. `place` hands the only handle over and keeps no copy, so nothing else touches it. The two
+// function pointers are EGL's own and are valid for as long as the library is loaded, which is the
+// life of the process.
+unsafe impl Send for Placed {}
+
+impl Placed {
+    /// Blocks until the frame has been drawn, and releases the sync object.
+    ///
+    /// Taken by value: a fence is waited for once, and the object is gone afterwards.
+    pub fn settle(self) {
+        (self.wait)(self.display, self.sync, 0, FOREVER);
+        (self.destroy)(self.display, self.sync);
+    }
+}
+
+/// Places a fence in the command stream and answers what waits for it.
+///
+/// The two tiers that wait on this side are the ones with anything to place. Under
+/// [`Signal::Kernel`] the descriptor goes to the commit and the kernel waits, and under
+/// [`Signal::Finish`] there is no sync object at all — both answer nothing, and their callers wait
+/// the way they always did.
+///
+/// The command stream is **flushed** before this returns. A fence still sitting in this thread's
+/// buffer is one nothing has begun to signal, and a thread waiting on it would wait until something
+/// else happened to flush.
+pub fn place(gpu: &Gpu, how: Signal) -> Option<Placed> {
+    if how != Signal::Client {
+        return None;
+    }
+    // SAFETY: as `display_extensions`.
+    let adapter = unsafe { gpu.adapter().as_hal::<wgpu::hal::api::Gles>() }?;
+    let context = adapter.adapter_context();
+    let egl = context.egl_instance()?;
+    let display = *context.raw_display()?;
+    // SAFETY: the three names are EGL's own and each signature is the one in `eglext.h`.
+    let (create, wait, destroy) = unsafe {
+        (
+            core::mem::transmute::<extern "system" fn(), CreateSync>(
+                egl.get_proc_address("eglCreateSyncKHR")?,
+            ),
+            core::mem::transmute::<extern "system" fn(), ClientWait>(
+                egl.get_proc_address("eglClientWaitSyncKHR")?,
+            ),
+            core::mem::transmute::<extern "system" fn(), DestroySync>(
+                egl.get_proc_address("eglDestroySyncKHR")?,
+            ),
+        )
+    };
+
+    let gl = context.lock();
+    let sync = create(display.as_ptr(), SYNC_FENCE, [khronos_egl::NONE].as_ptr());
+    if sync.is_null() {
+        return None;
+    }
+    // SAFETY: the context is current for as long as `gl` lives.
+    unsafe {
+        use glow::HasContext as _;
+        gl.flush();
+    }
+    Some(Placed {
+        display: display.as_ptr(),
+        sync,
+        wait,
+        destroy,
+    })
+}
+
 /// The extensions the graphics device's EGL display offers, where it has one.
 fn display_extensions(gpu: &Gpu) -> Option<String> {
     // SAFETY: `as_hal` asks that the resource behind the guard is not destroyed. The guard is read

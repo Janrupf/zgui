@@ -775,6 +775,7 @@ fn a_display_that_composites_no_pointer_keeps_the_copied_shape() {
         &machine.gpu,
         false,
         matches!(FORMAT, wgpu::TextureFormat::Bgra8Unorm),
+        None,
     )
     .expect("every machine can allocate the buffers the copied shape uses");
     assert!(
