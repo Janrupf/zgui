@@ -131,6 +131,7 @@ fn exact(name: &str) -> Option<(&'static str, Category)> {
         "draw.in" => ("Hand the scene to the renderer", Render),
         "draw.undamaged" => ("Skip an undamaged frame", Render),
         "r.tables" => ("Prepare GPU tables", Render),
+        "r.prepared" => ("Open the staging belt", Render),
         "r.buffers" => ("Update GPU buffers", Render),
         "r.vectors" => ("Encode vector paths", Render),
         "r.plan" => ("Plan the passes", Render),

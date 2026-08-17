@@ -157,6 +157,7 @@ impl Renderer for WgpuRenderer {
 
         zgui_profile::latency::mark("r.tables");
         self.buffers.prepare_tables(scene);
+        zgui_profile::latency::mark("r.prepared");
         self.buffers.begin_frame(&self.gpu);
         // Staged before the plan, because the plan stages the target blocks into the same frame
         // and a slot allocator hands out offsets in the order it is asked.
