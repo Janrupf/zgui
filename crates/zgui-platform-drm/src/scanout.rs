@@ -754,7 +754,6 @@ impl Scanout {
                     return Ok(true);
                 };
                 self.show(device, commit, ready)?;
-                zgui_profile::latency::mark("s.flipped");
                 return Ok(true);
             }
             // The other two tiers wait on this side, and the wait is the whole time the card takes.
@@ -857,11 +856,28 @@ impl Scanout {
             {
                 return Ok(());
             }
-            // One frame waits for one flip. A second finished frame stays outstanding until the
-            // completion takes the first off, which is also what keeps the pictures reaching the
-            // screen in the order they were drawn.
-            if self.rotation.holding() {
-                return Ok(());
+            // A frame with a finished one behind it is a picture nobody will ever see: the display
+            // takes one frame per vertical blank, so showing it would spend a whole refresh interval
+            // putting up an image the next flip replaces, and delay that newer image by the same.
+            // So it is dropped here and its buffer goes back.
+            //
+            // Only where a thread reports the one behind. Where none does, finding out costs a wait
+            // for the card, and a frame is not worth waiting for in order to throw it away.
+            if submitted
+                .iter()
+                .nth(1)
+                .and_then(|next| next.watched.as_ref())
+                .is_some_and(waiter::Watched::drawn)
+            {
+                let Buffers::DrawnGl { submitted, .. } = &mut self.buffers else {
+                    return Ok(());
+                };
+                let Some(stale) = submitted.pop_front() else {
+                    return Ok(());
+                };
+                self.rotation.refused(stale.slot);
+                zgui_profile::latency::mark("s.skipped");
+                continue;
             }
             let watched = outstanding.watched.is_some();
             let Buffers::DrawnGl { submitted, .. } = &mut self.buffers else {
@@ -886,6 +902,16 @@ impl Scanout {
             // here is the staging memory the frame just finished was written through, in time for
             // the frame after next to be written through it again instead of allocating.
             gpu.reclaim();
+            // A frame already waiting for a completion is one this frame supersedes, and neither has
+            // reached the driver. Taking its place costs nothing and saves the refresh interval the
+            // older one would have spent on the screen before this one replaced it.
+            if self.rotation.holding() {
+                if let Some(stale) = self.rotation.replaces_held(slot, fence) {
+                    self.rotation.refused(stale);
+                }
+                zgui_profile::latency::mark("s.skipped");
+                continue;
+            }
             let Some(ready) = self.rotation.finished(slot, fence) else {
                 continue;
             };
@@ -895,7 +921,6 @@ impl Scanout {
                 self.rotation.refused(slot);
                 return Err(refusal);
             }
-            zgui_profile::latency::mark("s.flipped");
         }
     }
 
@@ -1309,6 +1334,11 @@ impl Scanout {
             // A modeset carries no completion, so nothing is owed after one.
             self.owed_since = None;
         }
+        // Marked here rather than at the callers, because a frame reaches the driver from three
+        // places — the settle that finds it finished, the completion that takes a held one, and the
+        // restore that puts a display back — and only one of them used to say so. A trace that
+        // counts these counts every picture that reached a screen.
+        zgui_profile::latency::mark("s.flipped");
         Ok(())
     }
 
