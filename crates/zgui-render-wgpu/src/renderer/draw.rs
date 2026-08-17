@@ -313,7 +313,15 @@ impl Renderer for WgpuRenderer {
             presented_px = scissors.iter().map(|rect| damage::area(*rect)).sum();
             draw_calls += self.blit(&mut encoder, view, formats.blit_undoes_srgb(), &scissors);
         }
-        self.gpu.queue().submit([encoder.finish()]);
+        // Marked either side, because the two halves are different work and only one of them is
+        // this crate's. `finish` walks the recorded commands and validates them into a command
+        // buffer; `submit` is where a backend that defers its calls actually makes them. On the
+        // 32-bit target the split is about one millisecond against five, so the draws themselves
+        // are the cost and the validation is not.
+        zgui_profile::latency::mark("r.finish");
+        let recorded = encoder.finish();
+        zgui_profile::latency::mark("r.finished");
+        self.gpu.queue().submit([recorded]);
         // Ties the frame's retired arena ranges to the submission just made, so they come back
         // only once nothing in flight can read them.
         self.buffers.chunks.submitted(&self.gpu);
@@ -322,8 +330,10 @@ impl Renderer for WgpuRenderer {
         // a frame's submit is very nearly a constant times this number.
         zgui_profile::latency::note_with("sub.out", || {
             format!(
-                "draws={draw_calls} rects={} drawn_px={redrawn} presented_px={presented_px}",
-                self.composed_rects.len()
+                "draws={draw_calls} rects={} drawn_px={redrawn} presented_px={presented_px} \
+                 uploaded={}",
+                self.composed_rects.len(),
+                zgui_profile::counter::get(zgui_profile::Counter::BytesUploaded)
             )
         });
 
