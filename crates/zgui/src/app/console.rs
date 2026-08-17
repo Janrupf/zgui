@@ -242,7 +242,7 @@ struct Presenting<'a> {
 
 impl Bracket for Presenting<'_> {
     fn acquire(&self) -> Result<Option<usize>, PlatformError> {
-        self.display.acquire()
+        self.display.acquire(self.gpu)
     }
 
     fn present_drawn(&self) -> Result<bool, PlatformError> {

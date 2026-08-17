@@ -165,7 +165,7 @@ use std::cell::RefCell;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::io::Errno;
@@ -683,6 +683,44 @@ fn drive(
                 .min();
             let bound = owed_at.filter(|due| presence.is_active() && outlasts(parked, *due));
             let waiting = bound.map_or(parked, Parked::Until);
+
+            // A frame the graphics device is still drawing reaches the screen at the next acquire,
+            // and that is where its wait belongs: everything the loop does in between runs while
+            // the card draws. A loop about to block for longer than a refresh has no acquire coming
+            // inside the time that frame could still be shown in, so it settles the frame here
+            // instead — otherwise the last frame an application draws before it goes idle never
+            // appears at all.
+            if let Some(gpu) = gpu
+                && presence.is_active()
+            {
+                let within = match waiting {
+                    Parked::Indefinitely => None,
+                    Parked::Until(due) => Some(due.saturating_duration_since(clock.now())),
+                    // `Never` and any future policy a block could not happen under: settle at once,
+                    // because there is no wait to fold this into.
+                    _ => Some(Duration::ZERO),
+                };
+                for scanout in &scanouts {
+                    let mut committing = commit.borrow_mut();
+                    if let Err(error) = scanout.borrow_mut().settle_before_blocking(
+                        device,
+                        &mut **committing,
+                        gpu,
+                        within,
+                    ) {
+                        warn!(
+                            target: "zgui::platform",
+                            "the frame a display had finished could not be put on the screen, so \
+                             it stays dark until the frame after this one: {error}"
+                        );
+                    }
+                }
+            }
+
+            // Written out here, where the turn is over and the loop is about to block: often enough
+            // that a run killed from outside still leaves a usable trace, and never in the middle
+            // of one.
+            zgui_profile::latency::flush();
 
             match wait(
                 device,

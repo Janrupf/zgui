@@ -205,10 +205,33 @@ impl DrmDisplay {
     ///
     /// # Errors
     ///
+    /// The frame before this one is settled here, so `gpu` is the device that drew it — see
+    /// [`Scanout::settle`].
+    ///
+    /// # Errors
+    ///
     /// Returns [`PlatformError::Backend`] when the graphics device refuses or does not finish the
-    /// barrier that takes the buffer back.
-    pub fn acquire(&self) -> Result<Option<usize>, PlatformError> {
-        self.scanout.borrow_mut().acquire()
+    /// barrier that takes the buffer back, and when the driver refuses the settled frame's flip.
+    pub fn acquire(&self, gpu: &Gpu) -> Result<Option<usize>, PlatformError> {
+        let mut commit = self.commit.borrow_mut();
+        self.scanout
+            .borrow_mut()
+            .acquire(&self.device, &mut **commit, gpu)
+    }
+
+    /// Waits for the frame that was submitted last, and puts it on the screen.
+    ///
+    /// [`Scanout::settle`]'s own answer. A loop about to block calls it, so that the last frame
+    /// before an application goes idle is not left waiting for a frame that never comes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::Backend`] when the driver refuses the mode or the flip.
+    pub fn settle(&self, gpu: &Gpu) -> Result<(), PlatformError> {
+        let mut commit = self.commit.borrow_mut();
+        self.scanout
+            .borrow_mut()
+            .settle(&self.device, &mut **commit, gpu)
     }
 
     /// Gives the buffer the frame was drawn into to the display engine, and shows it.

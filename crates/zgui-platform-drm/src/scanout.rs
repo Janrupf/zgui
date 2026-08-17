@@ -225,6 +225,15 @@ enum Buffers {
         framebuffers: Vec<Framebuffer>,
         /// How a finished frame is signalled, decided once when the buffers were made.
         signal: gl::Signal,
+        /// The slot of a frame that was submitted and not yet waited for, and when it was.
+        ///
+        /// Only the two tiers that wait on this side put anything here. Under
+        /// [`gl::Signal::Kernel`] the frame goes to the driver with its own descriptor and the
+        /// kernel does the waiting, so nothing is ever outstanding.
+        ///
+        /// The moment is what stops a frame being stranded by a loop that keeps waking and never
+        /// draws — see [`Scanout::settle_before_blocking`].
+        submitted: Option<(usize, Instant)>,
     },
     /// Images the renderer draws into, which the display engine reads where they lie.
     Imported {
@@ -507,14 +516,23 @@ impl Scanout {
     /// Answers nothing on the copied shape as well. There a frame is composed into the renderer's
     /// own target, so this would name a buffer no caller draws into.
     ///
+    /// **The frame before this one is settled here**, which is what [`Scanout::settle`] describes:
+    /// the previous frame's wait happens at the latest moment that still leaves a buffer to name.
+    ///
     /// # Errors
     ///
     /// Returns [`PlatformError::Backend`] when the graphics device refuses or does not finish the
-    /// barrier that takes the buffer back.
-    pub fn acquire(&mut self) -> Result<Option<usize>, PlatformError> {
+    /// barrier that takes the buffer back, and when the driver refuses the settled frame's flip.
+    pub fn acquire(
+        &mut self,
+        device: &Device,
+        commit: &mut dyn Commit,
+        gpu: &Gpu,
+    ) -> Result<Option<usize>, PlatformError> {
         if matches!(self.buffers, Buffers::Copied { .. }) {
             return Ok(None);
         }
+        self.settle(device, commit, gpu)?;
         let Some(slot) = self.rotation.drawing() else {
             return Ok(None);
         };
@@ -638,8 +656,11 @@ impl Scanout {
     /// without blocking on the graphics device at all.
     ///
     /// Where the kernel cannot be told — a display on the legacy interface, a plane with no
-    /// `IN_FENCE_FD` property, a graphics driver that exports no sync file — this blocks until the
-    /// barrier has run and then commits, which is the only other place the wait can happen.
+    /// `IN_FENCE_FD` property, a graphics driver that exports no sync file — the wait falls to this
+    /// side, and this **defers** it. The frame is recorded as outstanding and [`Scanout::settle`]
+    /// waits for it at the next acquire, so the loop's next front half runs while the card is still
+    /// drawing this one. The frame reaches the screen one acquire later, which is what `true` says
+    /// here and why an idle loop settles before it blocks.
     ///
     /// **A frame that finishes while a flip is on its way is held rather than declined.** The
     /// kernel takes one page flip per CRTC, so it cannot be committed yet; it goes to the driver
@@ -670,19 +691,27 @@ impl Scanout {
                 return Ok(false);
             };
             // What stands in for the Vulkan barrier. Under the top tier this answers a descriptor
-            // and the kernel does the waiting; under the other two it has already waited by the
-            // time it returns, and the flip carries no fence.
+            // and the kernel does the waiting, so the frame goes to the driver here.
             //
             // Marked either side, because the two halves fail differently: a long wait here is the
             // graphics device still drawing, and a long commit is the display engine.
-            zgui_profile::latency::mark("s.fence");
-            let fence = gl::finish(gpu, signal);
-            zgui_profile::latency::mark("s.drawn");
-            let Some(ready) = self.rotation.finished(slot, fence) else {
+            if matches!(signal, gl::Signal::Kernel) {
+                zgui_profile::latency::mark("s.fence");
+                let fence = gl::finish(gpu, signal);
+                zgui_profile::latency::mark("s.drawn");
+                let Some(ready) = self.rotation.finished(slot, fence) else {
+                    return Ok(true);
+                };
+                self.show(device, commit, ready)?;
+                zgui_profile::latency::mark("s.flipped");
                 return Ok(true);
-            };
-            self.show(device, commit, ready)?;
-            zgui_profile::latency::mark("s.flipped");
+            }
+            // The other two tiers wait on this side, and the wait is the whole time the card takes.
+            // It is left to [`Scanout::settle`] rather than paid here: the frame's own work is over,
+            // and everything the loop does next is work the card can be drawing underneath.
+            if let Buffers::DrawnGl { submitted, .. } = &mut self.buffers {
+                *submitted = Some((slot, Instant::now()));
+            }
             return Ok(true);
         }
         let Buffers::Imported { handover, .. } = &mut self.buffers else {
@@ -705,6 +734,111 @@ impl Scanout {
         };
         self.show(device, commit, ready)?;
         Ok(true)
+    }
+
+    /// Waits for the frame [`Scanout::present_drawn`] left outstanding, and gives its buffer over.
+    ///
+    /// A machine whose driver exports no sync file has to wait for its own drawing, and that wait
+    /// is the whole time the card takes — 23 ms of a 34 ms frame on the slowest machine this runs
+    /// on. Paying it where the frame is submitted leaves the processor idle for every one of them.
+    /// So the frame is recorded as outstanding instead and the wait happens here, and everything
+    /// the loop does in between — the rest of the frame, and the next frame's events, style, layout
+    /// and paint — runs while the card draws.
+    ///
+    /// **Called from [`Scanout::acquire`]**, which is the last moment it can be: the buffer the next
+    /// frame is drawn into cannot be the one the outstanding frame is in, and the outstanding frame
+    /// has to reach the driver for its buffer to move on. A loop about to block calls it too, so
+    /// that the last frame of an animation is not left waiting for a frame that never comes.
+    ///
+    /// Does nothing for a display with nothing outstanding, which is every display on the copied
+    /// and imported shapes and one that has not drawn since it last settled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::Backend`] when the driver refuses the mode or the flip. The frame
+    /// is no longer outstanding either way: a flip refused once is refused again, and a display
+    /// that kept it would never take another frame.
+    pub fn settle(
+        &mut self,
+        device: &Device,
+        commit: &mut dyn Commit,
+        gpu: &Gpu,
+    ) -> Result<(), PlatformError> {
+        let Buffers::DrawnGl {
+            signal, submitted, ..
+        } = &mut self.buffers
+        else {
+            return Ok(());
+        };
+        let signal = *signal;
+        let Some((slot, _)) = submitted.take() else {
+            return Ok(());
+        };
+        // Marked either side, because the two halves fail differently: a long wait here is the
+        // graphics device still drawing, and a long commit is the display engine.
+        zgui_profile::latency::mark("s.fence");
+        let fence = gl::finish(gpu, signal);
+        zgui_profile::latency::mark("s.drawn");
+        let Some(ready) = self.rotation.finished(slot, fence) else {
+            return Ok(());
+        };
+        self.show(device, commit, ready)?;
+        zgui_profile::latency::mark("s.flipped");
+        Ok(())
+    }
+
+    /// Settles a frame the loop is about to block too long to reach an acquire for.
+    ///
+    /// What a loop calls before it waits, where [`Scanout::settle`] is what an acquire calls.
+    /// `within` is how long that wait is, and nothing where the loop is about to block until
+    /// something happens.
+    ///
+    /// **A frame younger than one refresh, before a wait shorter than one refresh, is left
+    /// outstanding.** That is the whole point of deferring it: the acquire the frame after it makes
+    /// falls inside that window, and settling here instead would put the card's whole drawing back
+    /// in front of the loop.
+    ///
+    /// One refresh, because that is how long a frame can usefully wait: one that has not reached an
+    /// acquire by then has missed the flip it would have been shown at, so nothing is left to lose
+    /// by waiting here. Both halves are needed. The wait covers an application that stops animating
+    /// and parks, and the age covers one that keeps waking for something else and never draws
+    /// again — which would otherwise strand the last frame it did draw for the rest of the run.
+    ///
+    /// # Errors
+    ///
+    /// As [`Scanout::settle`].
+    pub fn settle_before_blocking(
+        &mut self,
+        device: &Device,
+        commit: &mut dyn Commit,
+        gpu: &Gpu,
+        within: Option<Duration>,
+    ) -> Result<(), PlatformError> {
+        let Buffers::DrawnGl {
+            submitted: Some((_, since)),
+            ..
+        } = &self.buffers
+        else {
+            return Ok(());
+        };
+        let refresh = self.refresh_interval();
+        let soon = within.is_some_and(|wait| wait <= refresh);
+        let fresh = since.elapsed() <= refresh;
+        if soon && fresh {
+            return Ok(());
+        }
+        self.settle(device, commit, gpu)
+    }
+
+    /// Returns how long this display takes to show one frame.
+    ///
+    /// Worked out from the mode rather than stated, and a mode that reports no rate at all answers
+    /// a sixtieth of a second — which is what nearly every display this runs on does anyway.
+    fn refresh_interval(&self) -> Duration {
+        match self.mode.refresh_rate_millihertz() {
+            0 => Duration::from_nanos(16_666_667),
+            rate => Duration::from_nanos(1_000_000_000_000 / u64::from(rate)),
+        }
     }
 
     /// Reads this display's completion out of `events`, and shows the frame that waited for it.
@@ -967,6 +1101,7 @@ impl Scanout {
                 handles,
                 framebuffers,
                 signal,
+                submitted: None,
             },
         ))
     }
