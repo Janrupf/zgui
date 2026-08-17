@@ -111,8 +111,8 @@ impl FrameBuffers {
     }
 
     /// Releases every block staged for the previous frame and reclaims completed upload chunks.
-    pub fn begin_frame(&mut self, gpu: &Gpu) {
-        self.uploader.begin_frame(gpu);
+    pub fn begin_frame(&mut self) {
+        self.uploader.begin_frame();
         self.globals.reset();
         self.blocks.reset();
         self.effect_params.reset();
@@ -136,24 +136,63 @@ impl FrameBuffers {
         let tables = self.prepared.tables();
         let mut uploaded = if self.tables_released {
             self.tables_released = false;
-            let mut uploaded = self.clips.upload(gpu, &tables.clips);
-            uploaded += self.paints.upload(gpu, &tables.paints);
-            uploaded += self.stops.upload(gpu, &tables.stops);
-            uploaded += self.spatial.upload(gpu, &tables.spatial);
+            let mut uploaded = self
+                .clips
+                .upload(gpu, &mut self.uploader, encoder, &tables.clips);
+            uploaded += self
+                .paints
+                .upload(gpu, &mut self.uploader, encoder, &tables.paints);
+            uploaded += self
+                .stops
+                .upload(gpu, &mut self.uploader, encoder, &tables.stops);
+            uploaded += self
+                .spatial
+                .upload(gpu, &mut self.uploader, encoder, &tables.spatial);
             uploaded
         } else {
             let dirty = self.prepared.dirty();
-            let mut uploaded = upload_dirty(gpu, &mut self.clips, &tables.clips, &dirty.clips);
-            uploaded += upload_dirty(gpu, &mut self.paints, &tables.paints, &dirty.paints);
-            uploaded += upload_dirty(gpu, &mut self.stops, &tables.stops, &dirty.stops);
-            uploaded += upload_dirty(gpu, &mut self.spatial, &tables.spatial, &dirty.spatial);
+            let belt = &mut self.uploader;
+            let mut uploaded = upload_dirty(
+                gpu,
+                belt,
+                encoder,
+                &mut self.clips,
+                &tables.clips,
+                &dirty.clips,
+            );
+            uploaded += upload_dirty(
+                gpu,
+                belt,
+                encoder,
+                &mut self.paints,
+                &tables.paints,
+                &dirty.paints,
+            );
+            uploaded += upload_dirty(
+                gpu,
+                belt,
+                encoder,
+                &mut self.stops,
+                &tables.stops,
+                &dirty.stops,
+            );
+            uploaded += upload_dirty(
+                gpu,
+                belt,
+                encoder,
+                &mut self.spatial,
+                &tables.spatial,
+                &dirty.spatial,
+            );
             uploaded
         };
 
         // The chunk delta and the frame's transient content go into the persistent arenas; the
         // frame arrays themselves are never uploaded. What each draw reads is the resolved remap
         // — arena slots in draw order — built beside the transient gathering.
-        uploaded += self.chunks.upload_frame(gpu, scene);
+        uploaded += self
+            .chunks
+            .upload_frame(gpu, &mut self.uploader, encoder, scene);
         for (lane, buffer) in self.remaps.iter_mut().enumerate() {
             let resolved = self.chunks.resolved_remap(lane);
             // A frame whose visible set and residence held still resolves to the same list — a
@@ -170,7 +209,7 @@ impl FrameBuffers {
         uploaded += self
             .effect_params
             .upload_with(gpu, &mut self.uploader, encoder);
-        uploaded += self.vectors.upload_with(gpu);
+        uploaded += self.vectors.upload_with(gpu, &mut self.uploader, encoder);
         // After the chunk store has resolved this frame's remaps, because that is what the
         // positions the planner staged are resolved through.
         let resolved = [
@@ -449,6 +488,8 @@ fn lane_label(lane: usize) -> &'static str {
 /// Uploads dirty slots as coalesced ranges. A half-dirty table is cheaper as one full copy.
 fn upload_dirty<T: Pod>(
     gpu: &Gpu,
+    belt: &mut UploadBelt,
+    encoder: &mut wgpu::CommandEncoder,
     table: &mut TableTexture,
     values: &[T],
     dirty: &DirtySlots,
@@ -461,7 +502,7 @@ fn upload_dirty<T: Pod>(
         .count()
         + usize::from(!dirty.slots.is_empty());
     if dirty.all || dirty.slots.len().saturating_mul(2) >= values.len() || ranges > MAX_RANGES {
-        return table.upload(gpu, values);
+        return table.upload(gpu, belt, encoder, values);
     }
     let mut uploaded = 0;
     let mut slots = dirty.slots.iter().copied().peekable();
@@ -470,7 +511,7 @@ fn upload_dirty<T: Pod>(
         while slots.next_if_eq(&end).is_some() {
             end += 1;
         }
-        uploaded += table.upload_range(gpu, values, first as usize, end as usize);
+        uploaded += table.upload_range(gpu, belt, encoder, values, first as usize, end as usize);
     }
     uploaded
 }

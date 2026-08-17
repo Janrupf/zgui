@@ -23,6 +23,7 @@ use zgui_profile::{Counter, counter};
 use zgui_scene::{ChunkPrims, PrimitiveKind, Scene};
 
 use crate::buffer::tables::{TEXELS_WIDE, write_texels};
+use crate::buffer::upload::UploadBelt;
 use crate::gpu::device::Gpu;
 
 /// How many bytes one texel of an arena holds. `buffer::tables` states the format.
@@ -195,7 +196,14 @@ impl Arena {
     /// The caller holds packed records and the texture holds padded ones, so the run is re-spaced
     /// on the way in. A chunk is uploaded once and read for as long as it stays resident, so this
     /// is paid on the rare side of that trade.
-    fn upload(&mut self, gpu: &Gpu, start: u32, bytes: &[u8]) -> u64 {
+    fn upload(
+        &mut self,
+        gpu: &Gpu,
+        belt: &mut UploadBelt,
+        encoder: &mut wgpu::CommandEncoder,
+        start: u32,
+        bytes: &[u8],
+    ) -> u64 {
         if bytes.is_empty() {
             return 0;
         }
@@ -209,7 +217,7 @@ impl Arena {
         }
 
         let texels = self.stride / TEXEL;
-        write_texels(gpu, &self.texture, start * texels, &run);
+        write_texels(gpu, belt, encoder, &self.texture, start * texels, &run);
         run.len() as u64
     }
 
@@ -433,7 +441,13 @@ impl ChunkStore {
     /// Uploads the frame's chunk changes and transient content, and resolves each lane's remap
     /// into arena slots. Returns the bytes copied; the resolved remaps are in
     /// [`ChunkStore::resolved_remap`] afterwards.
-    pub fn upload_frame(&mut self, gpu: &Gpu, scene: &Scene) -> u64 {
+    pub fn upload_frame(
+        &mut self,
+        gpu: &Gpu,
+        belt: &mut UploadBelt,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &Scene,
+    ) -> u64 {
         self.ledger.reclaim(&mut self.arenas);
         let mut uploaded = 0;
 
@@ -448,17 +462,24 @@ impl ChunkStore {
         }
 
         for upload in scene.chunk_inserted() {
-            uploaded += self.insert(gpu, upload.revision, &upload.prims);
+            uploaded += self.insert(gpu, belt, encoder, upload.revision, &upload.prims);
         }
 
-        uploaded += self.resolve_and_gather(gpu, scene);
+        uploaded += self.resolve_and_gather(gpu, belt, encoder, scene);
         counter::set(Counter::ChunksResident, self.residence.len() as u64);
         counter::add(Counter::ChunkBytesUploaded, uploaded);
         uploaded
     }
 
     /// Uploads one chunk's lanes into the arenas, making it resident.
-    fn insert(&mut self, gpu: &Gpu, revision: u64, prims: &Arc<ChunkPrims>) -> u64 {
+    fn insert(
+        &mut self,
+        gpu: &Gpu,
+        belt: &mut UploadBelt,
+        encoder: &mut wgpu::CommandEncoder,
+        revision: u64,
+        prims: &Arc<ChunkPrims>,
+    ) -> u64 {
         if self.residence.contains_key(&revision) {
             return 0;
         }
@@ -503,13 +524,13 @@ impl ChunkStore {
                 None => {
                     // Grow the lane and settle every resident chunk into the new buffer, then
                     // take the range that now must fit.
-                    uploaded += self.grow(gpu, lane, counts[lane]);
+                    uploaded += self.grow(gpu, belt, encoder, lane, counts[lane]);
                     self.arenas[lane]
                         .alloc(counts[lane])
                         .expect("the arena was grown for exactly this request")
                 }
             };
-            uploaded += self.arenas[lane].upload(gpu, range.start, lanes[lane]);
+            uploaded += self.arenas[lane].upload(gpu, belt, encoder, range.start, lanes[lane]);
             ranges[lane] = Some(range);
         }
         self.residence.insert(
@@ -528,7 +549,14 @@ impl ChunkStore {
     /// Nothing in flight can be corrupted: the old texture is dropped, and the device keeps it
     /// alive until the submissions reading it complete. The ledger's claims on the old texture
     /// are meaningless afterwards, so they are forgotten with it.
-    fn grow(&mut self, gpu: &Gpu, lane: usize, incoming: u32) -> u64 {
+    fn grow(
+        &mut self,
+        gpu: &Gpu,
+        belt: &mut UploadBelt,
+        encoder: &mut wgpu::CommandEncoder,
+        lane: usize,
+        incoming: u32,
+    ) -> u64 {
         let live: u32 = self
             .residence
             .values()
@@ -567,7 +595,7 @@ impl ChunkStore {
             let range = self.arenas[lane]
                 .alloc(count)
                 .expect("the arena was sized for everything resident");
-            uploaded += self.arenas[lane].upload(gpu, range.start, &bytes);
+            uploaded += self.arenas[lane].upload(gpu, belt, encoder, range.start, &bytes);
             self.residence
                 .get_mut(&revision)
                 .expect("iterating known keys")
@@ -578,7 +606,13 @@ impl ChunkStore {
 
     /// Builds each lane's resolved remap — arena slots in draw order — gathering transient
     /// content into per-frame ranges, and uploads the gathered bytes.
-    fn resolve_and_gather(&mut self, gpu: &Gpu, scene: &Scene) -> u64 {
+    fn resolve_and_gather(
+        &mut self,
+        gpu: &Gpu,
+        belt: &mut UploadBelt,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &Scene,
+    ) -> u64 {
         let mut uploaded = 0;
         self.frame_offsets.clear();
         self.frame_offsets.push([0.0, 0.0]);
@@ -618,7 +652,7 @@ impl ChunkStore {
                 match self.arenas[lane].alloc(transients) {
                     Some(range) => range,
                     None => {
-                        uploaded += self.grow(gpu, lane, transients);
+                        uploaded += self.grow(gpu, belt, encoder, lane, transients);
                         self.arenas[lane]
                             .alloc(transients)
                             .expect("the arena was grown for exactly this request")
@@ -658,7 +692,8 @@ impl ChunkStore {
             debug_assert_eq!(placed, transients);
             if !self.gathered[lane].is_empty() {
                 let gathered = core::mem::take(&mut self.gathered[lane]);
-                uploaded += self.arenas[lane].upload(gpu, transient_range.start, &gathered);
+                uploaded +=
+                    self.arenas[lane].upload(gpu, belt, encoder, transient_range.start, &gathered);
                 self.gathered[lane] = gathered;
             }
             // This frame's transient elements are reclaimable once its submission completes.

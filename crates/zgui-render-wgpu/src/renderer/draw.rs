@@ -158,7 +158,7 @@ impl Renderer for WgpuRenderer {
         zgui_profile::latency::mark("r.tables");
         self.buffers.prepare_tables(scene);
         zgui_profile::latency::mark("r.prepared");
-        self.buffers.begin_frame(&self.gpu);
+        self.buffers.begin_frame();
         // Staged before the plan, because the plan stages the target blocks into the same frame
         // and a slot allocator hands out offsets in the order it is asked.
         self.buffers.stage_effect_params(scene);
@@ -277,6 +277,10 @@ impl Renderer for WgpuRenderer {
         // how much earlier than it needed to be the frame was started.
         self.acquire_block = asked.elapsed();
         zgui_profile::latency::note("acq.out", presented.acquisition.name());
+        // The one place in the frame where the device is known to have caught up: what acquisition
+        // just handed back is a buffer nothing in flight still reads. `Gpu::reclaim` says why that
+        // matters — the same call made anywhere else on this path waits for the card on GL.
+        self.gpu.reclaim();
         if crate::gpu::surface::human_visible_wait(self.acquire_block) {
             tracing::warn!(
                 stage = "acquire",

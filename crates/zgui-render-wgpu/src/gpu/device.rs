@@ -195,6 +195,23 @@ impl Gpu {
     pub fn wait(&self) {
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
     }
+
+    /// Hands back what the device has finished with: completed mappings, and the memory behind
+    /// retired resources.
+    ///
+    /// **Call this only where the device is known to have caught up.** `wgpu::PollType::Poll` is
+    /// documented as a poll that never waits, and on the GL backend it waits for the card:
+    /// `Device::poll` asks the fence for its status, and on Mesa's nouveau `glGetSynciv` blocks
+    /// until the fence signals and then answers `SIGNALED`. Measured on a G86 that is 21 ms, the
+    /// whole time a frame takes to draw, against 2 microseconds for the same query once the fence
+    /// has signalled.
+    ///
+    /// Two places know: acquisition, where the buffer just handed back is one the device has
+    /// finished with, and a console backend settling a frame whose fence has signalled. Nowhere on
+    /// the path that builds a frame.
+    pub fn reclaim(&self) {
+        let _ = self.device.poll(wgpu::PollType::Poll);
+    }
 }
 
 /// What a device created from `adapter` turned out to be able to do.
