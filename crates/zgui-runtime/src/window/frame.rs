@@ -1546,6 +1546,11 @@ impl Window {
         // Uploaded pictures whose tiles this frame found gone — evicted, or lost with the device
         // — have no host copy to re-upload from; the loader decodes them again from their
         // sources, and the completion's wake brings the frame that shows them.
+        // Marked apart from the rest of the stage, because the two fail differently and one of them
+        // is where a frame meets the card: writing into an atlas the card is still reading waits
+        // for it to finish, and on the slowest machine this runs on that wait is the whole time a
+        // frame takes to draw. What follows is the caches, which wait for nothing.
+        mark("p.flushed");
         let missing = self.content.take_missing_images();
         if !missing.is_empty() && self.images.redecode_missing(&missing) {
             self.request_frame();

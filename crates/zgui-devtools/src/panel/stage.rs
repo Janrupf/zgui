@@ -124,6 +124,7 @@ fn exact(name: &str) -> Option<(&'static str, Category)> {
         "p.emit" => ("Emit and rasterise text", Paint),
         "p.finish" => ("Finish the scene", Paint),
         "p.upload" => ("Upload textures", Paint),
+        "p.flushed" => ("Finish the texture uploads", Paint),
         "p.budget" => ("Enforce cache budgets", Paint),
         "p.draw" => ("Draw", Paint),
         // The renderer.
