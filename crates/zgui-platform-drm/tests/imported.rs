@@ -46,6 +46,9 @@ use zgui_render_wgpu::{Gpu, SharedGraphics, wgpu};
 ///
 /// Three: one on the screen, one an outstanding flip names, and one the renderer draws into. The
 /// crate states the same number, and this is the count a caller sees.
+///
+/// The drawn shape counts a fourth, for the frame the card is still drawing. Nothing here is that
+/// shape: an image handed over with a fence is never outstanding on this side.
 const BUFFERS: usize = 3;
 
 /// The fourcc the imported shape registers its framebuffers under.
