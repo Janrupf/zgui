@@ -173,6 +173,23 @@ impl<F> Rotation<F> {
         self.held().is_some()
     }
 
+    /// Puts the frame in `slot` in the place of the one already waiting for a completion, and
+    /// answers the buffer that one was in.
+    ///
+    /// The held frame has not reached the driver and the display has never read it, so nothing is
+    /// taken back from anybody: it is dropped, and its fence closes with it. What it buys is a
+    /// refresh interval — committing the older frame would put up a picture the very next flip
+    /// replaces, and the newer one would then wait another completion for its turn.
+    ///
+    /// Answers nothing where no frame is held, which is where [`Rotation::finished`] belongs
+    /// instead.
+    pub(crate) fn replaces_held(&mut self, slot: usize, fence: Option<F>) -> Option<usize> {
+        let held = self.held()?;
+        self.slots[held] = Slot::Free;
+        self.slots[slot] = Slot::Held(fence);
+        Some(held)
+    }
+
     /// Gives `slot` back after a commit the driver refused.
     ///
     /// The frame in it reached no screen and the display never took the buffer, so the next frame
@@ -867,6 +884,50 @@ mod tests {
         );
         assert_eq!(rotation.slots[0], Slot::Free, "the display gave it back");
         holds(&rotation);
+    }
+
+    #[test]
+    fn a_newer_finished_frame_takes_the_place_of_the_one_waiting_for_a_completion() {
+        // Both are drawn and neither has reached the driver, so showing the older one would spend a
+        // refresh interval putting up a picture the next flip replaces.
+        let mut rotation = rotation(FOUR);
+        assert_eq!(frame(&mut rotation, false), Some((0, true)));
+        assert_eq!(frame(&mut rotation, true), Some((1, true)));
+        assert_eq!(
+            frame(&mut rotation, true),
+            Some((2, false)),
+            "a flip is outstanding, so this frame is held"
+        );
+        let newer = rotation.drawing().expect("the fourth buffer is free");
+        rotation.submitted(newer);
+
+        assert_eq!(
+            rotation.replaces_held(newer, carried(newer)),
+            Some(2),
+            "the held frame's buffer comes back"
+        );
+
+        assert_eq!(rotation.slots[2], Slot::Free);
+        assert_eq!(rotation.slots[newer], Slot::Held(carried(newer)));
+        assert_eq!(
+            rotation.completed().map(|ready| ready.slot),
+            Some(newer),
+            "the completion commits the newer picture, and the older one never reaches a screen"
+        );
+        holds(&rotation);
+    }
+
+    #[test]
+    fn nothing_is_replaced_where_no_frame_is_waiting_for_a_completion() {
+        // The caller commits it the ordinary way instead. Answering a buffer here would free one
+        // the display is reading.
+        let mut rotation = rotation(FOUR);
+        assert_eq!(frame(&mut rotation, false), Some((0, true)));
+        let drawing = rotation.drawing().expect("a buffer is free");
+        rotation.submitted(drawing);
+
+        assert_eq!(rotation.replaces_held(drawing, carried(drawing)), None);
+        assert_eq!(rotation.slots[0], Slot::OnScreen);
     }
 
     #[test]
