@@ -140,13 +140,14 @@ fn a_fragment_that_only_moved_is_marked_for_repositioning_and_damages_both_place
     // rather than producing it again, and both rectangles have to be redrawn — the one being
     // vacated as much as the one being filled.
     //
-    // The two are not cut to the same thing, and the asymmetry is deliberate. Where the piece has
-    // *arrived* is cut to what its clip chain admits, because a primitive the chain admits nothing
-    // of is refused before it is drawn — this row is four hundred pixels tall in a hundred-pixel
-    // port, so three quarters of it is pixels no frame will ever put anything into. Where it was
-    // is not cut at all: the chain it named belongs to a frame that is gone, and cutting a vacated
-    // rectangle to a region that has since moved is how a scrolled row's old pixels get left on
-    // the screen.
+    // Each rectangle is cut to what the row's clip chain admits, and each to the chain it had at
+    // the time. Where the piece has *arrived* is cut to what the chain admits now, because a
+    // primitive the chain admits nothing of is refused before it is drawn — this row is four
+    // hundred pixels tall in a hundred-pixel port, so three quarters of it is pixels no frame will
+    // ever put anything into. Where it was is cut to what the chain admitted when the row was last
+    // composed, which is the region the frame that is gone really drew it in. The pixels outside
+    // that region hold whatever was behind the port, so erasing them is work with nothing to
+    // undo.
     let fixture = Fixture::new(
         Element::new("root").children(vec![
             Element::new("port").children(vec![Element::new("row")]),
@@ -204,7 +205,17 @@ fn a_fragment_that_only_moved_is_marked_for_repositioning_and_damages_both_place
     let arrived = after
         .intersection(port_rect)
         .expect("the row is still in the port");
-    assert!(covers(&frame.damage, before), "the rectangle it left");
+    let vacated = before
+        .intersection(port_rect)
+        .expect("the row was in the port before it moved");
+    assert!(
+        covers(&frame.damage, vacated),
+        "the part of the rectangle it left that it had drawn in",
+    );
+    assert!(
+        !covers(&frame.damage, before),
+        "and not the three hundred pixels of that one the port never showed",
+    );
     assert!(
         covers(&frame.damage, arrived),
         "and the part of the one it arrived at that it can actually draw in",

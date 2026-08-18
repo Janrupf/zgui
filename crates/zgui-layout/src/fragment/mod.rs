@@ -233,6 +233,13 @@ pub struct Fragment {
     pub padding: Edges<DevicePx>,
     /// The chain of clips this fragment is drawn under.
     pub clip: ClipId,
+    /// The device pixels that chain admitted when this fragment was last composed.
+    ///
+    /// Kept because a `ClipId` is a name and not a rectangle: next frame it resolves to wherever
+    /// its clipping box has moved to since, which is the wrong region to judge *last* frame's ink
+    /// by. Damage for a fragment that moved is the pixels it used to occupy as well as the ones it
+    /// will, and the first of those can only be cut to where it was allowed to draw at the time.
+    pub admitted: Rect<DevicePx, Device>,
     /// The matrix the clip chain's own rectangles are measured in, if it is not the identity.
     ///
     /// A clip is recorded in the space of the box that imposed it, which is *not* the space of the
@@ -312,6 +319,7 @@ impl Fragment {
             border: Edges::ZERO,
             padding: Edges::ZERO,
             clip: ClipId::ROOT,
+            admitted: Rect::ZERO,
             clip_transform: None,
             transform: None,
             transform_hash: 0,
