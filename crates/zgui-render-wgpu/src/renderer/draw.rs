@@ -299,6 +299,9 @@ impl Renderer for WgpuRenderer {
         // arrangement where those pixels cross a bus it is the largest thing a frame spends, and
         // this is the only place it can be counted.
         let mut presented_px = 0;
+        // How many rectangles that area is spread over, which is what says whether the stale set is
+        // merging because it ran out of room or because they touched.
+        let mut presented_rects = 0;
         if let Some(view) = &presented.view {
             // What the copy has to cover. A supplied set is rotated through and its textures
             // persist, so a frame copies the rectangles it drew plus the ones drawn while this
@@ -316,6 +319,7 @@ impl Renderer for WgpuRenderer {
                 }
             };
             presented_px = scissors.iter().map(|rect| damage::area(*rect)).sum();
+            presented_rects = scissors.len();
             draw_calls += self.blit(&mut encoder, view, formats.blit_undoes_srgb(), &scissors);
         }
         // Marked either side, because the two halves are different work and only one of them is
@@ -336,7 +340,7 @@ impl Renderer for WgpuRenderer {
         zgui_profile::latency::note_with("sub.out", || {
             format!(
                 "draws={draw_calls} rects={} drawn_px={redrawn} presented_px={presented_px} \
-                 uploaded={}",
+                 presented_rects={presented_rects} uploaded={}",
                 self.composed_rects.len(),
                 zgui_profile::counter::get(zgui_profile::Counter::BytesUploaded)
             )
