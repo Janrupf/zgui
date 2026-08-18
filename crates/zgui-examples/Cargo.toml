@@ -105,3 +105,10 @@ required-features = ["drm"]
 
 [lints]
 workspace = true
+
+# A page of text redrawn every frame, which is the glyph cost `tty_motion` cannot show: its blocks
+# are shadowed, and the shadow is most of its frame.
+[[example]]
+name = "tty_text"
+path = "../../examples/tty_text.rs"
+required-features = ["drm"]
