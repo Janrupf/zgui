@@ -33,28 +33,29 @@ fn vs_mono_sprite(
     @builtin(vertex_index) vertex: u32,
     @location(0) slot: u32,
     @location(1) shift: vec2<f32>,
-) -> SpriteVarying {
+) -> CoverageVarying {
     let sprite = load_sprite(slot);
     let corner = unit_corner(vertex);
+    // The chunk's shift moves where the sprite is drawn; the coverage fragment reads only the
+    // atlas texel and the device position, so it is applied here and not carried across.
     let local = bounds_origin(sprite.bounds) + corner * bounds_size(sprite.bounds) + shift;
-    var out: SpriteVarying;
+    var out: CoverageVarying;
     out.position = to_clip_position(local, sprite.transform);
-    out.local = local;
     out.texel = tile_texel(corner, sprite.tile);
-    out.instance = slot;
-    out.shift = shift;
+    out.color = rgba_of(sprite.color);
+    out.tile_rect = tile_bounds(sprite.tile);
+    out.clip = sprite.clip;
     return out;
 }
 
 @fragment
-fn fs_mono_sprite(in: SpriteVarying) -> @location(0) vec4<f32> {
-    let sprite = load_sprite(in.instance);
-    let clip = clip_coverage(device_position(in.position.xy), sprite.clip);
+fn fs_mono_sprite(in: CoverageVarying) -> @location(0) vec4<f32> {
+    let clip = clip_coverage(device_position(in.position.xy), in.clip);
     if clip <= 0.0 {
         return vec4<f32>(0.0);
     }
-    let color = rgba_of(sprite.color);
-    let sample = sample_atlas(in.texel, sprite.tile, 0.0).r;
+    let color = in.color;
+    let sample = sample_atlas_rect(in.texel, in.tile_rect, 0.0).r;
     let coverage = correct_coverage(sample, straight_rgb(color), globals.text.x);
     return color * coverage * clip;
 }

@@ -36,27 +36,28 @@ fn vs_subpixel_sprite(
     @builtin(vertex_index) vertex: u32,
     @location(0) slot: u32,
     @location(1) shift: vec2<f32>,
-) -> SpriteVarying {
+) -> CoverageVarying {
     let sprite = load_sprite(slot);
     let corner = unit_corner(vertex);
+    // The chunk's shift moves where the sprite is drawn; the coverage fragment reads only the
+    // atlas texel and the device position, so it is applied here and not carried across.
     let local = bounds_origin(sprite.bounds) + corner * bounds_size(sprite.bounds) + shift;
-    var out: SpriteVarying;
+    var out: CoverageVarying;
     out.position = to_clip_position(local, sprite.transform);
-    out.local = local;
     out.texel = tile_texel(corner, sprite.tile);
-    out.instance = slot;
-    out.shift = shift;
+    out.color = rgba_of(sprite.color);
+    out.tile_rect = tile_bounds(sprite.tile);
+    out.clip = sprite.clip;
     return out;
 }
 
 @fragment
-fn fs_subpixel_sprite(in: SpriteVarying) -> SubpixelOutput {
-    let sprite = load_sprite(in.instance);
-    let clip = clip_coverage(device_position(in.position.xy), sprite.clip);
-    let color = rgba_of(sprite.color);
+fn fs_subpixel_sprite(in: CoverageVarying) -> SubpixelOutput {
+    let clip = clip_coverage(device_position(in.position.xy), in.clip);
+    let color = in.color;
     let straight = straight_rgb(color);
 
-    var sample = sample_atlas(in.texel, sprite.tile, 0.0).rgb;
+    var sample = sample_atlas_rect(in.texel, in.tile_rect, 0.0).rgb;
     if globals.text.z != 0.0 {
         // The display's subpixels run the other way round, so the coverage does too.
         sample = sample.bgr;

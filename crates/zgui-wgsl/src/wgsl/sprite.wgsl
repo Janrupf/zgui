@@ -35,6 +35,23 @@ struct ColorSprite {
 
 const GRAYSCALE: u32 = 1u;
 
+// What the fragment stage of a coverage sprite reads, carried rather than fetched again.
+//
+// The vertex stage loads the record anyway to place the quad, so filling these costs it nothing;
+// reading them again per fragment is five texture fetches for every pixel of every glyph. The
+// bounds are dropped — neither coverage fragment reads them — and the tile arrives as the
+// rectangle it resolves to rather than as a tile, because that is all a sample needs.
+//
+// Four locations against the fifteen a GL 3.3 context guarantees, so this fits where a whole
+// record would not.
+struct CoverageVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) texel: vec2<f32>,
+    @location(1) @interpolate(flat) color: vec4<f32>,
+    @location(2) @interpolate(flat) tile_rect: vec4<f32>,
+    @location(3) @interpolate(flat) clip: u32,
+}
+
 struct SpriteVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) local: vec2<f32>,
@@ -68,7 +85,14 @@ fn tile_texel(corner: vec2<f32>, tile: Tile) -> vec2<f32> {
 // control flow are undefined. Pools without mip chains clamp every level to zero, which is the
 // behaviour a single-level texture always had.
 fn sample_atlas(texel: vec2<f32>, tile: Tile, lod: f32) -> vec4<f32> {
-    let rect = tile_bounds(tile);
+    return sample_atlas_rect(texel, tile_bounds(tile), lod);
+}
+
+// The same, by the tile's rectangle rather than the tile.
+//
+// What a fragment needs of a tile is where it is, and a stage handed the rectangle needs no record
+// to look it up in.
+fn sample_atlas_rect(texel: vec2<f32>, rect: vec4<f32>, lod: f32) -> vec4<f32> {
     let inset = min(vec2<f32>(0.5), rect.zw * 0.5);
     let clamped = clamp(texel, rect.xy + inset, rect.xy + rect.zw - inset);
     return textureSampleLevel(
