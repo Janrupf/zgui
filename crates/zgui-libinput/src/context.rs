@@ -20,7 +20,7 @@ use std::ffi::{CStr, CString, c_char};
 use std::marker::PhantomData;
 use std::os::fd::{BorrowedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::time::Duration;
@@ -300,12 +300,13 @@ impl Context {
     /// The device arrives as [`Event::DeviceAdded`] rather than here, because that is also how it
     /// arrives after a resume, and a caller that reads it in one place reads it in every case.
     ///
-    /// Four things are refused without asking libinput: a node this context already holds, a name
-    /// that is not an evdev node's, a path that is not a character device, and a path with a zero
-    /// byte in it. The first would give two live devices for one node, and every keystroke twice.
-    /// libinput draws one `client bug: Invalid path` line for a path that is not a character
-    /// device, and it refuses a character device that is not evdev silently, so both are settled
-    /// here. A path with a zero byte would reach libinput cut short.
+    /// Five things are refused without asking libinput: a node this context already holds, a name
+    /// that is not an evdev node's, a path that is not a character device, a path with a zero byte
+    /// in it, and a node udev has no record of. The first would give two live devices for one node,
+    /// and every keystroke twice. libinput draws one `client bug: Invalid path` line for a path that
+    /// is not a character device, and it refuses a character device that is not evdev silently, so
+    /// both are settled here. A path with a zero byte would reach libinput cut short. The last is
+    /// [`udev_has_not_examined`], and it is refused for the time it costs.
     ///
     /// A node this process may not open is refused quietly: [`Files::open`] says no, and libinput
     /// answers null.
@@ -315,6 +316,9 @@ impl Context {
             return false;
         }
         if !is_a_node(path) {
+            return false;
+        }
+        if udev_has_not_examined(Path::new(UDEV_RECORDS), path) {
             return false;
         }
         let Ok(name) = CString::new(path.as_os_str().as_bytes()) else {
@@ -785,6 +789,65 @@ fn is_a_node(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|about| about.file_type().is_char_device())
 }
 
+/// Where udev writes what it knows about a device.
+///
+/// One file each, named for the kind of node and its two numbers — `c13:64` for
+/// `/dev/input/event0`. The file appears when udev has finished examining the device, so its
+/// presence is the answer to whether that happened.
+const UDEV_RECORDS: &str = "/run/udev/data";
+
+/// Returns `true` when udev keeps records on this machine and holds none for this node.
+///
+/// **This is a refusal about time.** libinput reads no device udev has not examined: it asks udev
+/// again every ten milliseconds, two hundred times, and then refuses the device with `udev device
+/// never initialized`. That is two seconds a node, paid one node after another on the thread that
+/// asked — half a minute on a machine holding fifteen of them, before its caller draws a first
+/// frame. A machine whose coldplug never ran answers the same way two seconds later as it does now,
+/// so the wait buys nothing and costs the picture.
+///
+/// **A node refused here is offered again.** udev takes ownership of a node once it has finished
+/// with it, and a caller watching the directory is told — `zgui-evdev`'s watch asks for that report
+/// as well as for the creation. So a device examined a moment after this was asked arrives a moment
+/// later, rather than being lost for the run.
+///
+/// The question is put to the record directory, and only where that directory exists. A machine
+/// running mdev, or no device manager at all, keeps no records, and its nodes go to libinput
+/// exactly as before.
+fn udev_has_not_examined(records: &Path, path: &Path) -> bool {
+    if !records.is_dir() {
+        return false;
+    }
+    let Ok(about) = std::fs::metadata(path) else {
+        // Whatever is wrong with the path, it is not this. `is_a_node` has already read it, and
+        // libinput draws its own line for a node that has gone between the two.
+        return false;
+    };
+    let node = about.rdev();
+    !records
+        .join(format!("c{}:{}", major(node), minor(node)))
+        .exists()
+}
+
+/// The major number of a device, as Linux packs the two into one word.
+///
+/// Twelve bits low and twenty more above them. An evdev node needs only the low ones — its major is
+/// 13 — and the whole number is read anyway, because this says what a device number *is* rather
+/// than what these devices happen to use.
+///
+/// Each half is a thirty-two bit field, which is what bounds the two masks. Reading the upper half
+/// as a whole word instead would carry a major above 4095 down into [`minor`], because that is
+/// where such a major is kept.
+const fn major(node: u64) -> u64 {
+    ((node >> 8) & 0xfff) | ((node >> 32) & 0xffff_f000)
+}
+
+/// The minor number of a device, as Linux packs the two into one word.
+///
+/// Eight bits low and twenty-four above them, bounded as [`major`] describes.
+const fn minor(node: u64) -> u64 {
+    (node & 0xff) | ((node >> 12) & 0xffff_ff00)
+}
+
 /// Reads one of libinput's strings about a device.
 ///
 /// The string belongs to libinput, so it is copied. A device that answers nothing gives an empty
@@ -920,6 +983,86 @@ pub(crate) mod tests {
              the library path."
         );
         true
+    }
+
+    /// A directory of udev records named for one test, empty and its own.
+    ///
+    /// Made rather than borrowed from the machine: what a real `/run/udev/data` holds is whatever
+    /// the machine booted with, and a test asserting a record is absent has to own the directory it
+    /// asks about.
+    fn records(test: &str) -> PathBuf {
+        let made = std::env::temp_dir().join(format!("zgui-libinput-{test}"));
+        drop(std::fs::remove_dir_all(&made));
+        std::fs::create_dir_all(&made).expect("a directory under the temporary one");
+        made
+    }
+
+    /// The node every Linux machine has, and the two numbers it is known by.
+    ///
+    /// A real device node rather than an ordinary file: the question is asked of the device number,
+    /// which only a device node carries. `/dev/null` is character device 1:3 everywhere.
+    const KNOWN: (&str, &str) = ("/dev/null", "c1:3");
+
+    #[test]
+    fn a_node_udev_keeps_no_record_of_is_refused_without_libinput_waiting_for_it() {
+        // The whole point of the refusal. libinput would ask udev two hundred times over two
+        // seconds and refuse this node anyway, and a caller walking a directory of them pays that
+        // once a node before it draws anything.
+        let records = records("no-record");
+
+        assert!(
+            udev_has_not_examined(&records, Path::new(KNOWN.0)),
+            "a node with no record in a directory of records was not refused"
+        );
+
+        drop(std::fs::remove_dir_all(&records));
+    }
+
+    #[test]
+    fn a_node_udev_has_examined_goes_to_libinput() {
+        // The ordinary machine: udev ran, so it wrote the file, so libinput reads the device
+        // without waiting at all.
+        let records = records("recorded");
+        std::fs::write(records.join(KNOWN.1), "").expect("a record to write");
+
+        assert!(
+            !udev_has_not_examined(&records, Path::new(KNOWN.0)),
+            "a node udev had a record for was refused"
+        );
+
+        drop(std::fs::remove_dir_all(&records));
+    }
+
+    #[test]
+    fn a_machine_that_keeps_no_records_at_all_refuses_nothing() {
+        // mdev, or nothing at all. There is no record to find and the absence of one says nothing,
+        // so every node goes to libinput exactly as it did before this question was asked.
+        let records = records("no-directory");
+        drop(std::fs::remove_dir_all(&records));
+
+        assert!(
+            !udev_has_not_examined(&records, Path::new(KNOWN.0)),
+            "a machine that keeps no records had a node refused for having no record"
+        );
+    }
+
+    #[test]
+    fn the_two_numbers_are_the_ones_linux_packs_into_a_device() {
+        // `/dev/null` is 1:3 on every Linux machine, which is the low bits alone. The wide value
+        // beside it is the packing itself: twelve bits of major low, twenty more above the word,
+        // and the minor in what is left. An evdev node never reaches the high bits, and reading
+        // only the low ones would be a silent wrong answer on a machine whose devices do.
+        let about = std::fs::metadata(KNOWN.0).expect("every Linux machine has /dev/null");
+
+        assert_eq!((major(about.rdev()), minor(about.rdev())), (1, 3));
+        // A minor above 255, which is the whole reason the field is split at all.
+        assert_eq!((major(0x0010_0d2c), minor(0x0010_0d2c)), (13, 300));
+        // A major above 4095, which is kept above the word the minor is read out of. Reading that
+        // word whole gives this one a minor of four thousand million.
+        assert_eq!(
+            (major(0x0000_1000_0000_0005), minor(0x0000_1000_0000_0005)),
+            (4096, 5)
+        );
     }
 
     #[test]
