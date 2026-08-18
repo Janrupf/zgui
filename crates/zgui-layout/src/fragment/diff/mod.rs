@@ -28,7 +28,7 @@ use zgui_scene::ClipId;
 
 use crate::fragment::build::{Descent, Placed, Tables};
 use crate::fragment::hit::HitIndex;
-use crate::fragment::{FragKey, FragmentFlags, FragmentKind, build};
+use crate::fragment::{FragKey, Fragment, FragmentFlags, FragmentKind, build};
 use crate::tree::store::LayoutStore;
 
 mod damage;
@@ -299,6 +299,18 @@ impl RigidMoves {
             }
         }
     }
+}
+
+/// Where a fragment was allowed to draw when it was last composed, unioned with where it is
+/// allowed to draw now.
+///
+/// The union is for staleness. A fragment skipped as clean keeps the record it had when it was
+/// last composed, and if its clipping box *grew* while it was skipped it was drawn in a larger
+/// region than the one it remembers. The second term covers that, and costs little: both terms are
+/// the same clipping box, so this is still a scrollport against a document, and the two are one
+/// rectangle for as long as the box holds still.
+fn was_admitted(previous: &Fragment, now: Rect<DevicePx, Device>) -> Admitted {
+    Admitted(previous.admitted.union(now))
 }
 
 /// The device pixels a fragment's clip chain lets it draw in.
@@ -665,8 +677,9 @@ impl<D: FrameDirty> Pass<'_, '_, D> {
             .extend(self.store.fragments_of_box(key).iter().skip(keep).copied());
         for index in mark..self.scratch.stale.len() {
             let frag = self.scratch.stale[index];
-            // Where a destroyed piece *was*, so it is cut to nothing for the same reason a
-            // vacated rectangle is: the chain it named is last frame's.
+            // Taken whole, unlike a vacated rectangle. This is a subtree's ink, and a descendant
+            // that escapes the clip — an absolutely positioned one whose containing block is above
+            // the clipping box — was drawn outside what this fragment's own chain admitted.
             let Some(gone) = self.store.fragment(frag).map(|it| it.subtree_ink) else {
                 continue;
             };
@@ -848,6 +861,9 @@ impl<D: FrameDirty> Pass<'_, '_, D> {
             None => return Change::Identical,
         };
         let previous = self.store.fragment(frag).cloned();
+        // Resolved before the store is borrowed to write, and recorded on the fragment so that the
+        // frame after this one can cut this frame's ink to it.
+        let admits_now = self.admits(next.clip);
         // A name is kept across a change of content — a line that is still line two of its box is
         // still the same line — so the content is compared here rather than at the name. Nothing
         // else would catch it: the geometry of a line whose characters changed for characters of
@@ -873,6 +889,7 @@ impl<D: FrameDirty> Pass<'_, '_, D> {
             fragment.ink = next.ink;
             fragment.local_ink = next.local_ink;
             fragment.clip = next.clip;
+            fragment.admitted = admits_now;
             fragment.clip_transform = next.clip_transform;
             fragment.transform = next.transform;
             fragment.transform_hash = next.transform_hash;
@@ -894,11 +911,15 @@ impl<D: FrameDirty> Pass<'_, '_, D> {
 
         let own = owed.own;
         // What this fragment's chain admits *now*, which is the region its next ink can be drawn
-        // in. Where it *was* is deliberately not cut to anything: the chain it was drawn under
-        // belongs to a frame that is gone, and the node it named holds where its clipping box has
-        // moved to since. Cutting the old rectangle to the new region is how a scrolled row's
-        // vacated pixels get left on the screen — so the old rectangle is taken whole, which is an
-        // over-approximation and is always safe.
+        // in. Where it *was* is cut to what its chain admitted *then*, which the fragment recorded
+        // when it was composed — see `Fragment::admitted`. The old region is the one that applies:
+        // cutting a vacated rectangle to the *new* region leaves a scrolled row's old pixels on the
+        // screen, because the chain has moved since. Nothing outside the old region was drawn last
+        // frame, so nothing outside it has to be erased.
+        //
+        // The difference is a scroller's whole content height against its scrollport. A page of
+        // text scrolled a pixel a frame damaged 880x1024 for a window 880x560 tall, and a
+        // virtualised list's spacers are taller still.
         let admitted = self.admitted(next.clip);
         match change {
             Change::Identical => {
@@ -928,7 +949,7 @@ impl<D: FrameDirty> Pass<'_, '_, D> {
                     Dirty::REPOSITION | Dirty::REHIT | self.a11y(node),
                 );
                 if let Some(previous) = &previous {
-                    self.damage_beyond_a_move(previous.ink, Admitted::everything());
+                    self.damage_beyond_a_move(previous.ink, was_admitted(previous, admits_now));
                 }
                 self.damage_beyond_a_move(next.ink, admitted);
                 self.touch_hit(frag, change, false);
@@ -947,7 +968,10 @@ impl<D: FrameDirty> Pass<'_, '_, D> {
                         .is_some_and(|previous| repositioned_within(previous, next));
                 if !repositioned {
                     if let Some(previous) = &previous {
-                        self.damage_beyond_a_move(previous.ink, Admitted::everything());
+                        self.damage_beyond_a_move(
+                            previous.ink,
+                            was_admitted(previous, admits_now),
+                        );
                     }
                     self.damage_beyond_a_move(next.ink, admitted);
                 }
