@@ -1,5 +1,8 @@
 //! Allocating a buffer that a display scans out of and a graphics device draws into.
 //!
+//! The crate names no zgui crate and is usable on its own. It is written to be named by
+//! `zgui-platform-drm` and `zgui-scanout`, one step along the same layer, and by nothing else.
+//!
 //! The kernel's dumb buffers are the obvious thing to reach for and they are the wrong thing. A
 //! dumb buffer is *CPU-writable and scanout-capable*, which is not the same as renderable: a
 //! graphics driver handed one as a render target puts it where its own engine wants it, another
@@ -24,6 +27,13 @@
 //! For the reason every other library here is: a console session has to start on a machine that
 //! has none of them. A build needs neither the library nor its headers, and a display whose
 //! machine has no `libgbm` falls back to copying each frame.
+
+#![deny(missing_docs)]
+// This crate is on the unsafe ledger's allowlist for one reason: libgbm is opened at run time and
+// every call into it is a call through a pointer resolved here. A build that linked it would stop a
+// console session starting on a machine that has no such library, which is the case the copied
+// scanout path exists to answer.
+#![allow(unsafe_code)]
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -191,6 +201,15 @@ impl Device {
             library: Arc::clone(library),
             raw,
         })
+    }
+
+    /// The allocator itself, for an interface that takes one.
+    ///
+    /// EGL is the caller this exists for: a display over `EGL_PLATFORM_GBM_KHR` is made from this
+    /// pointer, and there is no other way to name the device it stands for. The pointer is valid for
+    /// as long as this [`Device`] is, and using it after that is the caller's to avoid.
+    pub fn as_ptr(&self) -> *mut c_void {
+        self.raw
     }
 
     /// The driver behind this allocator, for a log line that says which card a buffer came from.

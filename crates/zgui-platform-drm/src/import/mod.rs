@@ -67,7 +67,6 @@
 // four files is this module's own business.
 mod barrier;
 mod fence;
-pub mod gbm;
 pub mod gl;
 mod image;
 mod modifier;
@@ -79,6 +78,13 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use ash::{ext, khr, vk};
 use zgui_drm::format::Modifier;
 use zgui_render_wgpu::{Gpu, wgpu};
+
+/// libgbm, which lives in a crate of its own.
+///
+/// One crate opens one library, because a `dlopen` appears in no manifest and no lock file, so the
+/// crate that opens it is the only record that a run needs it. This re-export keeps the path every
+/// caller here already spells.
+pub use zgui_gbm as gbm;
 
 pub use crate::import::barrier::Handover;
 pub use crate::import::image::Plane;

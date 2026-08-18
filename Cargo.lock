@@ -5896,6 +5896,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "zgui-gbm"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "zgui-geom"
 version = "0.1.0"
 dependencies = [
@@ -6024,7 +6031,6 @@ dependencies = [
  "ash",
  "glow",
  "khronos-egl",
- "libloading",
  "raw-window-handle",
  "rustix 1.1.4",
  "tracing",
@@ -6032,6 +6038,7 @@ dependencies = [
  "zgui-color",
  "zgui-drm",
  "zgui-evdev",
+ "zgui-gbm",
  "zgui-geom",
  "zgui-libinput",
  "zgui-platform",
@@ -6250,6 +6257,15 @@ dependencies = [
  "zgui-view",
  "zgui-view-dom",
  "zgui-vocab",
+]
+
+[[package]]
+name = "zgui-scanout"
+version = "0.1.0"
+dependencies = [
+ "khronos-egl",
+ "rustix 1.1.4",
+ "zgui-gbm",
 ]
 
 [[package]]

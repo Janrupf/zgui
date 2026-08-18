@@ -39,7 +39,7 @@ tracing.workspace = true
 # `libgbm`, for the buffers a display scans out of and a graphics device draws into. Loaded at run
 # time like every other library here, so a console session still starts where it is absent — such a
 # machine copies each frame instead.
-libloading.workspace = true
+zgui-gbm = { path = "../zgui-gbm", version = "0.1.0" }
 # The EGL display and GL context wgpu's GL backend already holds, reached through its hal so that
 # a buffer can be imported as the texture a frame is composed into. The counterpart to `ash` above,
 # for the machines that have no Vulkan — which are exactly the machines this path is for.
