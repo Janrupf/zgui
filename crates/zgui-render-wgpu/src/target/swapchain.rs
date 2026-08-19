@@ -304,6 +304,13 @@ pub trait PeerCopy: std::fmt::Debug {
     ///
     /// Answers whether it did. A refusal is not fatal and not fatal to the frame: the caller sends
     /// the rectangles the long way instead, which is what it did before one of these was attached.
+    ///
+    /// **Whether this waits for the copy is the peer's own business, and it should not.** The
+    /// rectangles it fills are the ones this frame will not draw, so nothing here reads them; and
+    /// the copy reads a texture the renderer's device may still be writing, so a peer that waits
+    /// waits for that device — 11.3 ms of a 20.5 ms frame on the machine this was written for.
+    /// A peer whose completion the caller's own presentation already covers answers at once, and
+    /// the copy runs while the frame is recorded and submitted.
     fn copy(&mut self, from: usize, to: usize, rects: &[Rect<i32, Device>]) -> bool;
 }
 

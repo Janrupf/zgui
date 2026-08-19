@@ -98,8 +98,9 @@ fn a_frame_composed_into_an_imported_buffer_reaches_the_buffer(gpu: &Gpu, alloca
         before[0], 0xFF,
         "the buffer already held the colour this is about to draw, so nothing would be proved"
     );
+    a_scanout_buffer_answers_what_is_writing_it(&drawn);
     compose(gpu, drawn.texture(), BLUE);
-    gl::finish(gpu, gl::signal(gpu, false));
+    gl::finish(gpu, gl::signal(gpu, false, false), None);
 
     let after = drawn.peek().expect("a gbm buffer maps");
     assert_eq!(
@@ -125,7 +126,7 @@ fn every_buffer_of_a_set_is_its_own_memory(gpu: &Gpu, allocator: &gbm::Device) {
     };
 
     compose(gpu, first.texture(), BLUE);
-    gl::finish(gpu, gl::signal(gpu, false));
+    gl::finish(gpu, gl::signal(gpu, false, false), None);
 
     assert_eq!(
         first.peek().expect("a gbm buffer maps")[0],
@@ -141,22 +142,59 @@ fn every_buffer_of_a_set_is_its_own_memory(gpu: &Gpu, allocator: &gbm::Device) {
 
 /// Whichever tier a device lands on, it has to be one it can actually perform.
 fn the_tier_that_signals_a_frame_is_one_this_device_has(gpu: &Gpu) {
-    // Asked both ways round, because the top tier needs the display to take an in-fence as well as
-    // the driver to export one, and a display that cannot must never be told it can.
-    let without = gl::signal(gpu, false);
-    assert_ne!(
-        without,
-        gl::Signal::Kernel,
-        "a display that takes no in-fence has nowhere to put a descriptor, so the kernel cannot be \
-         the one that waits"
-    );
-    let with = gl::signal(gpu, true);
+    // Asked every way round, because both kernel tiers need the display to take an in-fence as well
+    // as something to export one, and a display that cannot must never be told it can.
+    for buffers in [false, true] {
+        let without = gl::signal(gpu, false, buffers);
+        assert!(
+            !matches!(without, gl::Signal::Kernel | gl::Signal::Written),
+            "a display that takes no in-fence has nowhere to put a descriptor, so the kernel \
+             cannot be the one that waits, and it was told it could: {without:?}"
+        );
+    }
+    let without = gl::signal(gpu, false, false);
+    let with = gl::signal(gpu, true, false);
     assert!(
         with == without || with == gl::Signal::Kernel,
         "offering an in-fence may raise the tier and may change nothing, and it did neither: \
          {without:?} became {with:?}"
     );
-    eprintln!("drawn_gl: this device signals a frame by {with:?} where the display takes a fence");
+    // A device whose driver exports a sync file itself keeps that tier; one whose driver does not
+    // takes the buffer's, which is the whole point of the tier.
+    let buffered = gl::signal(gpu, true, true);
+    assert!(
+        matches!(buffered, gl::Signal::Kernel | gl::Signal::Written),
+        "a display that takes an in-fence and buffers that say what writes them leave the waiting \
+         to the kernel, and this device answered {buffered:?}"
+    );
+    eprintln!(
+        "drawn_gl: this device signals a frame by {with:?} where the display takes a fence, and \
+         by {buffered:?} where its buffers also answer"
+    );
+}
+
+/// A buffer these tests allocated says what is still writing it, or says the kernel cannot.
+fn a_scanout_buffer_answers_what_is_writing_it(buffer: &gl::Drawn) {
+    let Some(descriptor) = buffer.exported() else {
+        eprintln!("drawn_gl: this buffer was never exported, so nothing was asserted");
+        return;
+    };
+    match zgui_drm::sync::writers_of(descriptor) {
+        // Nothing has been drawn into it here, so what comes back is a descriptor that is already
+        // signalled. That it comes back at all is the fact the tier is chosen on.
+        Ok(Some(fence)) => eprintln!(
+            "drawn_gl: this kernel says what writes a scanout buffer, so a frame is waited for by \
+             the kernel (descriptor {fence:?})"
+        ),
+        Ok(None) => eprintln!(
+            "drawn_gl: this kernel does not serve the request, so a frame is waited for by the \
+             program"
+        ),
+        Err(refusal) => panic!(
+            "a dma-buf either answers a descriptor or reports that this kernel has no such \
+             request, and this one refused: {refusal}"
+        ),
+    }
 }
 
 /// Composes a frame of one colour into `texture`, through the device the renderer draws on.

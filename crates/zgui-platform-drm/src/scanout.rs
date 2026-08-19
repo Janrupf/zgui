@@ -71,12 +71,11 @@
 //! fourcc the buffers are registered under comes from it.
 
 pub(crate) mod rotation;
-pub(crate) mod waiter;
+pub(crate) mod watched;
 
 use std::collections::VecDeque;
 use std::fmt;
 use std::ops::Range;
-use std::os::fd::OwnedFd as WakeFd;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::time::{Duration, Instant};
 
@@ -230,11 +229,11 @@ struct Outstanding {
     slot: usize,
     /// When it was submitted, which is what bounds how long it may stay here.
     since: Instant,
-    /// The flag the waiting thread sets when the card has finished.
+    /// The descriptor that says when the card has finished this frame.
     ///
-    /// Nothing here where no fence could be placed or no thread started, and then the wait happens
-    /// on the loop's own thread, the way it did before there was one.
-    watched: Option<waiter::Watched>,
+    /// Nothing here where the buffer answered none, and then the wait happens on the loop's own
+    /// thread at the next acquire.
+    watched: Option<watched::Watched>,
 }
 
 /// The buffers a display is driven from, in one of the two shapes.
@@ -273,14 +272,18 @@ enum Buffers {
         framebuffers: Vec<Framebuffer>,
         /// How a finished frame is signalled, decided once when the buffers were made.
         signal: gl::Signal,
+        /// Whether the commit takes a fence, which decides what a frame's descriptor is used for.
+        ///
+        /// Where it does, the flip carries it and the kernel waits. Where it does not — a legacy
+        /// display, or a plane with no `IN_FENCE_FD` — the loop parks on it instead. Both leave the
+        /// waiting to a `poll`, and neither blocks in the graphics driver.
+        fenced: bool,
         /// The frames that were submitted and not yet given over, oldest first.
         ///
-        /// Only the two tiers that wait on this side put anything here. Under
-        /// [`gl::Signal::Kernel`] the frame goes to the driver with its own descriptor and the
-        /// kernel does the waiting, so nothing is ever outstanding.
+        /// Under [`gl::Signal::Kernel`], and under [`gl::Signal::Written`] on a display that takes
+        /// a fence, the frame goes to the driver with its own descriptor and nothing is ever
+        /// outstanding.
         submitted: VecDeque<Outstanding>,
-        /// The thread the fences are waited on, where one could be started.
-        waiter: Option<waiter::Waiter>,
     },
     /// Images the renderer draws into, which the display engine reads where they lie.
     Imported {
@@ -320,7 +323,6 @@ impl Scanout {
         gpu: &Gpu,
         pointer_on_a_plane: bool,
         bgra: bool,
-        wake: Option<WakeFd>,
     ) -> Result<Self, PlatformError> {
         // Vulkan first, then the same arrangement through GL, then the copy every machine can do.
         // The two drawn shapes are tried in that order rather than chosen by backend, so a device
@@ -335,7 +337,7 @@ impl Scanout {
             }
             Err(reason) => reason,
         };
-        match Self::drawn_gl(device, output, gpu, pointer_on_a_plane, wake) {
+        match Self::drawn_gl(device, output, gpu, pointer_on_a_plane) {
             Ok(scanout) => {
                 info!(
                     crtc = output.pipe.crtc,
@@ -501,6 +503,26 @@ impl Scanout {
         ))
     }
 
+    /// Returns a descriptor for every frame the card is still drawing, oldest first.
+    ///
+    /// **What a loop puts in its own wait set.** Each becomes readable when the card has finished
+    /// the frame it belongs to, so a loop parked on them learns that a frame is ready to be shown
+    /// where it is allowed to block — beside the card, the input devices and its own timers.
+    /// Nothing else here has to be asked, and asking the graphics driver instead is what
+    /// [`watched`] says the cost of is.
+    ///
+    /// Empty on every shape but the drawn one, and empty where the frames carry no descriptor.
+    pub fn drawing(&self) -> impl Iterator<Item = BorrowedFd<'_>> {
+        let submitted = match &self.buffers {
+            Buffers::DrawnGl { submitted, .. } => Some(submitted),
+            Buffers::Copied { .. } | Buffers::Imported { .. } => None,
+        };
+        submitted
+            .into_iter()
+            .flatten()
+            .filter_map(|frame| Some(frame.watched.as_ref()?.descriptor()))
+    }
+
     /// Returns the images the renderer composes into, in the order they were made.
     ///
     /// What `SharedGraphics::renderer_supplied` is given, one texture out of each. Empty on the
@@ -547,9 +569,14 @@ impl Scanout {
     /// that device, and where any step of opening one refuses. Each of those is a display that goes
     /// on sending every owed rectangle the long way, which is what it did before.
     pub fn peer_copy(&mut self, node: BorrowedFd<'_>) -> Option<Box<dyn PeerCopy>> {
-        let Buffers::DrawnGl { buffers, .. } = &mut self.buffers else {
+        let Buffers::DrawnGl {
+            buffers, signal, ..
+        } = &mut self.buffers
+        else {
             return None;
         };
+        // Read before the buffers are borrowed again below.
+        let covered = matches!(*signal, gl::Signal::Kernel | gl::Signal::Written);
         // Exported in one pass and read back in another: the export takes `&mut`, and a list of
         // descriptors is several of those borrows at once.
         for buffer in buffers.iter_mut() {
@@ -577,9 +604,10 @@ impl Scanout {
             Ok(copier) => {
                 info!(
                     target: "zgui::platform",
+                    covered,
                     "these scanout buffers repair each other on the display's own device: {copier:?}"
                 );
-                Some(Box::new(Peer(copier)))
+                Some(Box::new(Peer { copier, covered }))
             }
             Err(reason) => {
                 info!(
@@ -645,8 +673,8 @@ impl Scanout {
         // A frame the card has not finished keeps the buffer it was drawn into — the rotation holds
         // it in `Slot::Submitted` and answers a free one instead, which is the whole of what lets
         // this frame be composed while that one is drawn. Where none is free nothing is taken back,
-        // so nothing is owed back: the caller keeps its damage and asks again, and the waiting
-        // thread's wake is what brings it here.
+        // so nothing is owed back: the caller keeps its damage and asks again, and the frame's own
+        // descriptor becoming readable is what brings it here.
         let Some(slot) = self.rotation.drawing() else {
             return Ok(None);
         };
@@ -799,41 +827,53 @@ impl Scanout {
         commit: &mut dyn Commit,
         gpu: &Gpu,
     ) -> Result<bool, PlatformError> {
-        if let Buffers::DrawnGl { signal, .. } = &self.buffers {
-            let signal = *signal;
+        if let Buffers::DrawnGl { signal, fenced, .. } = &self.buffers {
+            let (signal, fenced) = (*signal, *fenced);
             let Some(slot) = self.rotation.drawn() else {
                 return Ok(false);
             };
-            // What stands in for the Vulkan barrier. Under the top tier this answers a descriptor
-            // and the kernel does the waiting, so the frame goes to the driver here.
+            // What stands in for the Vulkan barrier. The two descriptor tiers answer one here, and
+            // where the commit takes a fence the frame goes to the driver at once with it.
             //
             // Marked either side, because the two halves fail differently: a long wait here is the
             // graphics device still drawing, and a long commit is the display engine.
-            if matches!(signal, gl::Signal::Kernel) {
-                zgui_profile::latency::mark("s.fence");
-                let fence = gl::finish(gpu, signal);
-                zgui_profile::latency::mark("s.drawn");
+            let answers = matches!(signal, gl::Signal::Kernel | gl::Signal::Written);
+            let fence = answers
+                .then(|| {
+                    zgui_profile::latency::mark("s.fence");
+                    let fence = gl::finish(gpu, signal, self.drawn_descriptor(slot));
+                    // Whether the descriptor was **already** signalled when it was taken, which is
+                    // the one thing that says whether it describes this frame at all. A card cannot
+                    // have drawn a frame submitted a moment ago, so `already` on every frame means
+                    // the command stream had not reached the kernel and the buffer answered a
+                    // fence for the frame before it. Asked only under a trace: it is a poll.
+                    zgui_profile::latency::note_with("s.drawn", || {
+                        match fence.as_ref().map(|fence| already_drawn(fence.as_fd())) {
+                            Some(true) => "already".to_owned(),
+                            Some(false) => "drawing".to_owned(),
+                            None => "no descriptor".to_owned(),
+                        }
+                    });
+                    fence
+                })
+                .flatten();
+            if answers && fenced {
                 let Some(ready) = self.rotation.finished(slot, fence) else {
                     return Ok(true);
                 };
                 self.show(device, commit, ready)?;
                 return Ok(true);
             }
-            // The other two tiers wait on this side, and the wait is the whole time the card takes.
-            // It is left to [`Scanout::settle`] rather than paid here: the frame's own work is over,
-            // and everything the loop does next is work the card can be drawing underneath.
-            // The fence is placed while the graphics device is this thread's, and handed to the
-            // thread that waits. A machine that could give neither leaves `watched` empty, and the
-            // wait falls back to the loop's own thread at the next acquire.
-            let placed = gl::place(gpu, signal);
-            if let Buffers::DrawnGl {
-                submitted, waiter, ..
-            } = &mut self.buffers
-            {
-                let watched = placed.zip(waiter.as_ref()).and_then(|(placed, waiter)| {
-                    zgui_profile::latency::mark("s.handed");
-                    waiter.watch(placed)
-                });
+            // Everything else leaves the frame outstanding and the wait to [`Scanout::settle`]: the
+            // frame's own work is over, and everything the loop does next is work the card can be
+            // drawing underneath.
+            //
+            // A descriptor here is one the loop parks on beside the card and the input devices, so
+            // it learns the frame is drawn where it is allowed to block. Nothing here — a tier that
+            // answers none, or a buffer that would not say — leaves `watched` empty, and the wait
+            // falls to this thread at the next acquire.
+            let watched = fence.map(watched::Watched::on);
+            if let Buffers::DrawnGl { submitted, .. } = &mut self.buffers {
                 submitted.push_back(Outstanding {
                     slot,
                     since: Instant::now(),
@@ -906,9 +946,9 @@ impl Scanout {
             let Some(outstanding) = submitted.front() else {
                 return Ok(());
             };
-            // A frame a thread is waiting for is given over when that thread says the card has
+            // A frame with a descriptor is given over when that descriptor says the card has
             // finished, and left alone until then. Nothing blocks here: the loop keeps its timers,
-            // its input and its page flips, and the wake the thread sends is what brings it back.
+            // its input and its page flips, and the descriptor is in the wait it parks on.
             //
             // The oldest first and no further: the fences signal in the order the frames were
             // submitted, so a younger one cannot be finished before it.
@@ -924,13 +964,13 @@ impl Scanout {
             // putting up an image the next flip replaces, and delay that newer image by the same.
             // So it is dropped here and its buffer goes back.
             //
-            // Only where a thread reports the one behind. Where none does, finding out costs a wait
-            // for the card, and a frame is not worth waiting for in order to throw it away.
+            // Only where the one behind carries a descriptor. Where it does not, finding out costs
+            // a wait for the card, and a frame is not worth waiting for in order to throw it away.
             if submitted
                 .iter()
                 .nth(1)
                 .and_then(|next| next.watched.as_ref())
-                .is_some_and(waiter::Watched::drawn)
+                .is_some_and(watched::Watched::drawn)
             {
                 let Buffers::DrawnGl { submitted, .. } = &mut self.buffers else {
                     return Ok(());
@@ -951,13 +991,14 @@ impl Scanout {
             };
             let slot = outstanding.slot;
             // Marked either side, because the two halves fail differently: a long wait here is the
-            // graphics device still drawing, and a long commit is the display engine. A frame a
-            // thread waited for has nothing left to wait for and the two marks fall together.
+            // graphics device still drawing, and a long commit is the display engine. A frame whose
+            // descriptor has signalled has nothing left to wait for and the two marks fall
+            // together.
             zgui_profile::latency::mark("s.fence");
             let fence = if watched {
                 None
             } else {
-                gl::finish(gpu, signal)
+                gl::finish(gpu, signal, self.drawn_descriptor(slot))
             };
             zgui_profile::latency::mark("s.drawn");
             // The moment the graphics device is known to have finished something, which is the one
@@ -993,12 +1034,12 @@ impl Scanout {
     /// `within` is how long that wait is, and nothing where the loop is about to block until
     /// something happens.
     ///
-    /// **Where a thread is waiting for the frame this always settles**, because it never blocks:
-    /// asking the thread whether it has finished is a load of a flag, and the wake that thread
-    /// sends is what brings the loop here in the first place.
+    /// **Where the frame carries a descriptor this always settles**, because it never blocks:
+    /// asking whether the card has finished is a poll of no length, and the loop is parked on that
+    /// same descriptor, so the wake that brings it here is the frame itself.
     ///
-    /// Where none is — a machine whose driver placed no fence — the wait falls to this thread, and
-    /// then a frame younger than one refresh, before a wait shorter than one refresh, is left
+    /// Where it carries none — a buffer that would not say what writes it — the wait falls to this
+    /// thread, and then a frame younger than one refresh, before a wait shorter than one refresh, is left
     /// outstanding: the acquire the frame after it makes falls inside that window. One refresh,
     /// because that is how long a frame can usefully wait: one that has not reached an acquire by
     /// then has missed the flip it would have been shown at. Both halves are needed. The wait
@@ -1021,9 +1062,9 @@ impl Scanout {
         let Some(outstanding) = submitted.front() else {
             return Ok(());
         };
-        // A frame a thread is waiting for costs nothing to ask about and blocks nothing, so it is
-        // always asked: the thread's wake is what brought the loop here, and this is where the
-        // frame reaches the screen.
+        // A frame carrying a descriptor costs nothing to ask about and blocks nothing, so it is
+        // always asked: that descriptor is what brought the loop here, and this is where the frame
+        // reaches the screen.
         if outstanding.watched.is_some() {
             return self.settle(device, commit, gpu);
         }
@@ -1226,7 +1267,6 @@ impl Scanout {
         output: &Output,
         gpu: &Gpu,
         pointer_on_a_plane: bool,
-        wake: Option<WakeFd>,
     ) -> Result<Self, Copied> {
         if !pointer_on_a_plane {
             return Err(Copied::NoCursorPlane);
@@ -1258,8 +1298,6 @@ impl Scanout {
             );
             false
         });
-        let signal = gl::signal(gpu, fenced);
-
         let mut buffers = buffers;
         let mut handles = Vec::with_capacity(buffers.len());
         let mut framebuffers = Vec::with_capacity(buffers.len());
@@ -1301,6 +1339,35 @@ impl Scanout {
             framebuffers.push(framebuffer);
         }
 
+        // Asked of a buffer rather than of the device, and therefore only now: the answer is
+        // whether this kernel says what is writing one of them. A buffer nothing has drawn into yet
+        // answers a descriptor that is already signalled, which is an answer and not a refusal.
+        let from_buffers = buffers.first().and_then(gl::Drawn::exported).is_some_and(
+            |descriptor| match zgui_drm::sync::writers_of(descriptor) {
+                Ok(fence) => fence.is_some(),
+                Err(refusal) => {
+                    warn!(
+                        "this kernel would not say what is writing a scanout buffer, so the frame \
+                         loop waits for the graphics device instead: {refusal}"
+                    );
+                    false
+                }
+            },
+        );
+        let signal = gl::signal(gpu, fenced, from_buffers);
+        // Which of the four, and the two facts that chose it. A frame's largest single cost on a
+        // machine whose driver exports no sync file is who waits for the card, and reading that off
+        // a trace means guessing at it from where the frame stalled.
+        info!(
+            crtc = output.pipe.crtc,
+            plane = output.pipe.plane,
+            atomic = device.is_atomic(),
+            ?signal,
+            plane_takes_a_fence = fenced,
+            buffers_answer = from_buffers,
+            "this display's frames are waited for"
+        );
+
         Ok(Self::new(
             output,
             Buffers::DrawnGl {
@@ -1308,8 +1375,8 @@ impl Scanout {
                 handles,
                 framebuffers,
                 signal,
+                fenced,
                 submitted: VecDeque::new(),
-                waiter: wake.map(waiter::Waiter::new),
             },
         ))
     }
@@ -1346,6 +1413,18 @@ impl Scanout {
             Buffers::DrawnGl { framebuffers, .. } | Buffers::Imported { framebuffers, .. } => {
                 framebuffers[slot]
             }
+        }
+    }
+
+    /// Returns the descriptor the buffer at `slot` was exported as, on the drawn shape.
+    ///
+    /// What [`gl::Signal::Written`] asks for the frame's fence. Nothing where this display draws no
+    /// buffers of its own, and nothing where the buffer was never exported — neither is reachable
+    /// under that tier, and both answer the same way a kernel that will not say does.
+    fn drawn_descriptor(&self, slot: usize) -> Option<BorrowedFd<'_>> {
+        match &self.buffers {
+            Buffers::DrawnGl { buffers, .. } => buffers.get(slot)?.exported(),
+            Buffers::Copied { .. } | Buffers::Imported { .. } => None,
         }
     }
 
@@ -2020,7 +2099,18 @@ mod tests {
 /// driver composing the frame holds it — and splitting the copy so that the frame is composed inside
 /// it hides a millisecond and changes no frame rate.
 #[derive(Debug)]
-struct Peer(zgui_scanout::egl::Egl);
+struct Peer {
+    /// The device that does the copying.
+    copier: zgui_scanout::egl::Egl,
+    /// Whether the frame's own descriptor already covers this copy.
+    ///
+    /// A sync file taken from the buffer covers **everything** writing it, this copy included — see
+    /// [`gl::Signal::Written`] — so under the tiers that take one there is nothing here to wait
+    /// for and the copy is only started. Under the tiers that do not, the frame goes up when the
+    /// graphics device has finished and this copy is on another device, so it has to be waited for
+    /// before it can be handed on.
+    covered: bool,
+}
 
 impl PeerCopy for Peer {
     fn copy(&mut self, from: usize, to: usize, rects: &[Rect<i32, DeviceSpace>]) -> bool {
@@ -2033,7 +2123,14 @@ impl PeerCopy for Peer {
                 height: rect.size.height,
             })
             .collect();
-        match zgui_scanout::Copier::copy(&mut self.0, from, to, &rects) {
+        // Started either way. The issue flushes, so the copy is on its way to the kernel by the
+        // time this answers, and a buffer asked for its writers then reports it.
+        let issued = if self.covered {
+            zgui_scanout::Copier::begin(&mut self.copier, from, to, &rects)
+        } else {
+            zgui_scanout::Copier::copy(&mut self.copier, from, to, &rects)
+        };
+        match issued {
             Ok(()) => true,
             Err(reason) => {
                 warn!("the buffers could not be repaired from each other: {reason}");
@@ -2041,4 +2138,19 @@ impl PeerCopy for Peer {
             }
         }
     }
+}
+
+/// Whether `fence` has already signalled, which is a poll of no length.
+///
+/// For the trace above and for nothing else. Answers `true` where the kernel refuses the question,
+/// which is the same answer [`watched::Watched::drawn`] gives and for the same reason.
+fn already_drawn(fence: BorrowedFd<'_>) -> bool {
+    let mut asked = [rustix::event::PollFd::from_borrowed_fd(
+        fence,
+        rustix::event::PollFlags::IN,
+    )];
+    !matches!(
+        rustix::event::poll(&mut asked, Some(&rustix::event::Timespec::default())),
+        Ok(0)
+    )
 }

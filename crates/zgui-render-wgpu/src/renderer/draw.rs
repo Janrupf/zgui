@@ -284,6 +284,10 @@ impl Renderer for WgpuRenderer {
         // just handed back is a buffer nothing in flight still reads. `Gpu::reclaim` says why that
         // matters — the same call made anywhere else on this path waits for the card on GL.
         self.gpu.reclaim();
+        // Split from the acquisition before it and the repair after it, because the three wait for
+        // different things: a buffer to draw into, the graphics device to take back what it has
+        // finished with, and the display's own device to fill in what this frame will not.
+        zgui_profile::latency::mark("r.reclaimed");
         if crate::gpu::surface::human_visible_wait(self.acquire_block) {
             tracing::warn!(
                 stage = "acquire",
@@ -329,6 +333,7 @@ impl Renderer for WgpuRenderer {
                     }
                 }
             };
+            zgui_profile::latency::mark("r.repaired");
             let scissors = owed.from_composed;
             repaired_px = owed.repaired;
             presented_px = scissors.iter().map(|rect| damage::area(*rect)).sum();

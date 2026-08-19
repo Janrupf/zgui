@@ -140,6 +140,8 @@ fn exact(name: &str) -> Option<(&'static str, Category)> {
         "r.record" => ("Record GPU commands", Render),
         // The device and the compositor.
         "acq.in" | "acq.out" => ("Acquire the surface", Gpu),
+        "r.reclaimed" => ("Take back finished staging", Gpu),
+        "r.repaired" => ("Repair the acquired buffer", Gpu),
         "sub.out" => ("Submit to the queue", Gpu),
         "pres.out" => ("Present", Gpu),
         // Text, and the window itself.
