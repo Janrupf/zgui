@@ -128,9 +128,19 @@ impl TableTexture {
         // copied into a row-sized run and the remainder left as whatever the allocation held. What
         // is past the last element is never read: an index past the table is a fault the caller
         // does not make.
-        let mut rows = vec![0_u8; (last - first) * ROW];
+        //
+        // A table that fits in one row is narrowed to the texels it really holds. A copy is
+        // rectangular, so only a single row can be shortened without dropping what follows it —
+        // and a small table is exactly the case where the whole of it is that tail. A table of
+        // four clips cost four kilobytes to write and now costs two hundred and fifty-six bytes.
         let from = first * ROW;
         let to = (last * ROW).min(all.len());
+        let wide = if last - first == 1 {
+            ((to - from).div_ceil(TEXEL) as u32).min(TEXELS_WIDE)
+        } else {
+            TEXELS_WIDE
+        };
+        let mut rows = vec![0_u8; (last - first) * wide as usize * TEXEL];
         rows[..to - from].copy_from_slice(&all[from..to]);
 
         belt.write_texels(
@@ -139,7 +149,7 @@ impl TableTexture {
             &self.texture,
             0,
             (0, first as u32),
-            (TEXELS_WIDE, (last - first) as u32),
+            (wide, (last - first) as u32),
             TEXEL as u32,
             &rows,
         );
