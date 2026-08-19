@@ -37,6 +37,45 @@ const MOVED: u8 = 0x5a;
 /// What the target is filled with, and what an untouched byte still reads as.
 const KEPT: u8 = 0x21;
 
+/// The same `area` of pixels cut several ways, plus the whole screen for the ceiling.
+///
+/// A rectangle's cost has two parts and they cannot be told apart from one shape: the pixels it
+/// moves, and whatever the device pays to begin one at all. Holding the area still and changing the
+/// count is what separates them.
+fn shapes(area: usize) -> Vec<(&'static str, Vec<Rect>)> {
+    let one = |w: i32, h: i32| {
+        vec![Rect {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        }]
+    };
+    let tiled = |side: i32| {
+        let across = WIDTH as i32 / side;
+        let wanted = area as i32 / (side * side);
+        (0..wanted)
+            .map(|which| Rect {
+                x: (which % across) * side,
+                y: (which / across) * side,
+                width: side,
+                height: side,
+            })
+            .filter(|rect| rect.y + rect.height <= HEIGHT as i32)
+            .collect::<Vec<_>>()
+    };
+    let wide = area as i32 / WIDTH as i32;
+    let square = (area as f64).sqrt() as i32;
+    vec![
+        ("one wide band", one(WIDTH as i32, wide)),
+        ("one square", one(square, square)),
+        ("a frame's damage", damage()),
+        ("64-pixel tiles", tiled(64)),
+        ("32-pixel tiles", tiled(32)),
+        ("the whole screen", one(WIDTH as i32, HEIGHT as i32)),
+    ]
+}
+
 /// Writes `value` into every byte a buffer holds, through its descriptor.
 ///
 /// Through the dma-buf rather than through `gbm_bo_map`, which faults inside the driver on the
@@ -246,6 +285,33 @@ fn a_copy_between_two_scanout_buffers_moves_the_pixels_and_says_what_it_cost() {
         "the copy moved {moved} bytes where {} were asked for",
         area * 4,
     );
+
+    // **What limits it**, which decides how much of a frame a display device can be asked to do.
+    // The same area in different shapes: a rate that holds is a memory bus, and one that falls with
+    // the rectangle count is a cost paid per rectangle rather than per pixel. The whole screen is
+    // there for the ceiling, because that is what a repair costs in the worst case.
+    println!("  --- the same {area} pixels, in different shapes ---");
+    for (what, shape) in shapes(area) {
+        // Twice, and the second is the one reported: the first pays for whatever the driver
+        // validates once per shape.
+        for round in 0..2 {
+            let wall = Instant::now();
+            copier.copy(0, 1, &shape).expect("the copy was refused");
+            let took = wall.elapsed();
+            if round == 1 {
+                let bytes: usize = shape
+                    .iter()
+                    .map(|rect| rect.width as usize * rect.height as usize * 4)
+                    .sum();
+                println!(
+                    "  {what:<22} {:>3} rects  {:>6.2} ms  {:>7.1} MB/s",
+                    shape.len(),
+                    took.as_secs_f64() * 1e3,
+                    bytes as f64 / took.as_secs_f64() / 1e6,
+                );
+            }
+        }
+    }
 
     // What did it cost, and **who spent it**? Wall time beside processor time: a copy the device
     // makes leaves the processor idle and the two diverge, and one the driver makes on the
