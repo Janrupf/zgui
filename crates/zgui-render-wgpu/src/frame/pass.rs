@@ -22,6 +22,13 @@ use crate::target::scene_texture::SceneTexture;
 pub struct Recorded {
     /// How many draw calls were issued.
     pub draw_calls: u32,
+    /// How many of those cleared a damage rectangle before it was redrawn.
+    ///
+    /// One a rectangle, because a render pass clears all of its attachment or none of it and a
+    /// scissored clear is a draw. Counted apart because it is the one term that grows with the
+    /// number of rectangles and with nothing else, and a frame's submit is very nearly a constant
+    /// times its draw count.
+    pub clears: u32,
     /// How many planned draws could not be issued, for want of a pipeline or a texture.
     pub dropped: u32,
 }
@@ -248,7 +255,12 @@ impl Recorder<'_> {
                         continue;
                     }
                     match self.issue(&mut pass, passes[0], tables.as_ref(), shape, format, &run) {
-                        Some(issued) => recorded.draw_calls += issued,
+                        Some(issued) => {
+                            recorded.draw_calls += issued;
+                            if matches!(shape, PlannedDraw::Clear) {
+                                recorded.clears += issued;
+                            }
+                        }
                         None => recorded.dropped += 1,
                     }
                 }
@@ -259,7 +271,12 @@ impl Recorder<'_> {
                         run.clear();
                         run.push((*scissor, draw));
                         match self.issue(&mut pass, planned, tables.as_ref(), draw, format, &run) {
-                            Some(issued) => recorded.draw_calls += issued,
+                            Some(issued) => {
+                                recorded.draw_calls += issued;
+                                if matches!(draw, PlannedDraw::Clear) {
+                                    recorded.clears += issued;
+                                }
+                            }
                             None => recorded.dropped += 1,
                         }
                     }

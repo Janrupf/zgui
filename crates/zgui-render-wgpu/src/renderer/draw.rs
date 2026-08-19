@@ -220,6 +220,9 @@ impl Renderer for WgpuRenderer {
         }
         zgui_profile::latency::mark("r.buffers");
         let uploaded = self.buffers.upload_frame(&self.gpu, &mut encoder, scene);
+        // Split from the flush that follows it, because the two wait for different things: writing
+        // the frame's own bytes, and giving the belt back to the device.
+        zgui_profile::latency::mark("r.uploaded");
         let upload_allocations = self.buffers.upload_allocations();
         self.buffers.finish_uploads();
         if upload_allocations == 0 {
@@ -294,6 +297,8 @@ impl Renderer for WgpuRenderer {
             );
         }
         let mut draw_calls = recorded.draw_calls;
+        // Read before `recorded` is shadowed by the command buffer below.
+        let clears = recorded.clears;
         // What the copy to the surface covers, which is not what this frame drew: a supplied
         // texture is owed every rectangle drawn while it was not the one being written. On an
         // arrangement where those pixels cross a bus it is the largest thing a frame spends, and
@@ -347,8 +352,10 @@ impl Renderer for WgpuRenderer {
         // a frame's submit is very nearly a constant times this number.
         zgui_profile::latency::note_with("sub.out", || {
             format!(
-                "draws={draw_calls} rects={} drawn_px={redrawn} presented_px={presented_px} \
-                 presented_rects={presented_rects} repaired_px={repaired_px} uploaded={}",
+                "draws={draw_calls} clears={} rects={} drawn_px={redrawn} \
+                 presented_px={presented_px} presented_rects={presented_rects} \
+                 repaired_px={repaired_px} uploaded={}",
+                clears,
                 self.composed_rects.len(),
                 zgui_profile::counter::get(zgui_profile::Counter::BytesUploaded)
             )
