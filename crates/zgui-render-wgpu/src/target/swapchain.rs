@@ -633,14 +633,26 @@ impl Supplied {
         let Some(peer) = self.peer.as_mut() else {
             return sent_whole();
         };
-        if !peer.copy(donor, slot, &debt) {
+        // **What the copy that follows will write anyway is not worth copying.** The two overlap by
+        // construction — the donor's debt is a subset of the slot's — and a rectangle of the slot's
+        // debt that lies wholly inside one the composed target is about to write is carried twice
+        // for no reason. Wholly inside, not merely touching: a rectangle half-covered still owes its
+        // other half, and dropping it would leave that half in neither copy.
+        let carried: Vec<Rect<i32, Device>> = debt
+            .iter()
+            .copied()
+            .filter(|rect| {
+                !donor_owes
+                    .iter()
+                    .any(|written| written.contains_rect(*rect))
+            })
+            .collect();
+        if !peer.copy(donor, slot, &carried) {
             return sent_whole();
         }
         Owed {
             from_composed: donor_owes,
-            // Counted from what the peer carried rather than from the difference, because the two
-            // overlap and the overlap is written twice on purpose.
-            repaired: owed_here,
+            repaired: area(&carried),
         }
     }
 
