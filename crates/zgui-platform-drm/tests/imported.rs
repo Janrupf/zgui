@@ -648,7 +648,7 @@ fn a_frame_is_given_to_the_display_engine_before_anything_is_committed() {
     // A machine holding DRM master puts the frame on the screen here. A machine without it gets as
     // far as the commit and is refused there — which is the assertion: the barrier ran and
     // finished first, because a refusal from the barrier names the barrier.
-    match scanout.present_drawn(&machine.device, &mut *commit, &machine.gpu) {
+    match scanout.present_drawn(&machine.device, &mut *commit, &machine.gpu, &[]) {
         Ok(shown) => {
             assert!(shown, "nothing is outstanding in front of the first frame");
             eprintln!("{test}: this process holds the device, so the frame reached the screen");
@@ -709,7 +709,7 @@ fn a_commit_that_is_refused_keeps_no_descriptor_of_this_programs() {
             panic!("nothing is outstanding, so a buffer is always named");
         };
         draw(&machine.gpu, &scanout.buffers()[slot]);
-        scanout.present_drawn(&machine.device, &mut *commit, &machine.gpu)
+        scanout.present_drawn(&machine.device, &mut *commit, &machine.gpu, &[])
     };
     let first = frame(&mut scanout);
     let Some(before) = descriptors() else {
@@ -861,7 +861,7 @@ fn a_frame_that_drew_nothing_leaves_the_next_one_the_buffer_it_took_back() {
     // which happens after the barrier has run — so the display engine holds the buffer either way
     // and the acquire below is a barrier that really runs.
     draw(&machine.gpu, &scanout.borrow().buffers()[0]);
-    let next = match display.present_drawn(&machine.gpu) {
+    let next = match display.present_drawn(&machine.gpu, &[]) {
         Ok(true) => {
             eprintln!("{test}: this process holds the device, so the frame reached the screen");
             1

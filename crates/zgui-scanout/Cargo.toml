@@ -21,16 +21,17 @@ khronos-egl.workspace = true
 # libgbm, for the allocator an EGL display over `EGL_PLATFORM_GBM_KHR` is made from. Opened by that
 # crate and by no other, which is why this one does not name `libloading`.
 zgui-gbm = { path = "../zgui-gbm", version = "0.1.0" }
+# The `poll` a copier's own thread waits on a fence descriptor with, where the driver exports one.
+rustix.workspace = true
 
-# The hardware test allocates its own buffers to copy between, and waits on the descriptor the
-# copier answers with. Neither is anything the crate itself does.
+# The hardware test allocates its own buffers to copy between, and reads them back. Neither is
+# anything the crate itself does.
 [dev-dependencies]
 # The buffers the hardware test copies between are allocated with the same crate the copier makes
 # its display over.
 zgui-gbm = { path = "../zgui-gbm", version = "0.1.0" }
-# The hardware test maps a buffer to fill it and to count what a copy moved, and waits on the
-# descriptor a copier answers with. It maps through the dma-buf rather than through `gbm_bo_map`,
-# which faults inside the driver on the hardware this was written for.
+# The test maps a buffer to fill it and to count what a copy moved, through the dma-buf rather than
+# through `gbm_bo_map`, which faults inside the driver on the hardware this was written for.
 rustix.workspace = true
 
 [lints]

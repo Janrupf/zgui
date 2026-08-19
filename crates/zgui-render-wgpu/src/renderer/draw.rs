@@ -305,15 +305,19 @@ impl Renderer for WgpuRenderer {
             // those pixels crosses a bus. Everything else is copied whole: an acquired surface
             // texture is a new resource marked wholly uninitialised on every acquisition, so a
             // partial copy onto one comes out black everywhere it did not write.
-            let scissors = match &mut self.presentation {
+            let owed = match &mut self.presentation {
                 Presentation::Supplied(supplied) => {
                     let slot = supplied.selected();
                     supplied.owed(slot, &self.composed_rects)
                 }
                 Presentation::Surface(_) | Presentation::Offscreen(_) => {
-                    vec![self.composed.used()]
+                    crate::target::swapchain::Owed {
+                        from_composed: vec![self.composed.used()],
+                        repaired: 0,
+                    }
                 }
             };
+            let scissors = owed.from_composed;
             self.blit(&mut encoder, view, formats.blit_undoes_srgb(), &scissors);
             draw_calls += 1;
         }

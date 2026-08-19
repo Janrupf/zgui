@@ -65,6 +65,7 @@ use std::sync::Arc;
 use tracing::warn;
 use zgui_atlas::TextureSink;
 use zgui_bits::DamageSet;
+use zgui_geom::{Device, Rect};
 use zgui_platform::{PlatformError, Surface};
 use zgui_platform_drm::{Displays, DrmDisplay};
 use zgui_render::{
@@ -137,9 +138,13 @@ impl DrmRenderer {
         let inner = &mut self.inner;
         drawn_into_scanout(&presenting, |slot| {
             if !inner.present_into(slot) {
-                return refused_slot(slot);
+                return (refused_slot(slot), Vec::new());
             }
-            inner.draw(scene, damage)
+            let drawn = inner.draw(scene, damage);
+            // Read after the frame, because it is what the frame decided to draw rather than what
+            // it was asked to: a frame that had to widen its damage wrote more than the caller
+            // named, and a display copying only what was asked for would miss it.
+            (drawn, inner.composed_rects().to_vec())
         })
     }
 
@@ -226,7 +231,11 @@ trait Bracket {
     /// arrives, because the kernel takes one page flip per CRTC. Either way the frame reaches the
     /// screen, which `true` says.
     ///
-    fn present_drawn(&self) -> Result<bool, PlatformError>;
+    ///
+    /// `wrote` is the rectangles the frame put in the buffer it was given. A display that
+    /// composites its own frames copies exactly those onto the buffer it scans out of, so a
+    /// rectangle missing here is a rectangle that never reaches the screen.
+    fn present_drawn(&self, wrote: &[Rect<i32, Device>]) -> Result<bool, PlatformError>;
 }
 
 /// A display and the device whose frames go on it, so that the pair can answer [`Bracket`].
@@ -245,8 +254,8 @@ impl Bracket for Presenting<'_> {
         self.display.acquire(self.gpu)
     }
 
-    fn present_drawn(&self) -> Result<bool, PlatformError> {
-        self.display.present_drawn(self.gpu)
+    fn present_drawn(&self, wrote: &[Rect<i32, Device>]) -> Result<bool, PlatformError> {
+        self.display.present_drawn(self.gpu, wrote)
     }
 }
 
@@ -275,7 +284,7 @@ impl Bracket for Presenting<'_> {
 /// device that could not be rebuilt, and a frame that damaged nothing.
 fn drawn_into_scanout(
     display: &dyn Bracket,
-    compose: impl FnOnce(usize) -> FrameOutcome,
+    compose: impl FnOnce(usize) -> (FrameOutcome, Vec<Rect<i32, Device>>),
 ) -> FrameOutcome {
     let slot = match display.acquire() {
         Ok(Some(slot)) => slot,
@@ -296,12 +305,12 @@ fn drawn_into_scanout(
         }
     };
 
-    let drawn = compose(slot);
+    let (drawn, wrote) = compose(slot);
     if !matches!(drawn, FrameOutcome::Presented(_)) {
         return drawn;
     }
 
-    match display.present_drawn() {
+    match display.present_drawn(&wrote) {
         // The frame reached the display engine. It goes on the screen at the next vertical blank,
         // either as the flip this asked for or as the frame the outstanding flip's completion
         // commits — which is the display's business rather than this frame's.
@@ -480,7 +489,25 @@ fn renderer(
         let inner = graphics.renderer_offscreen(target, zgui_platform_drm::FORMAT, false)?;
         (inner, Delivery::Copied)
     } else {
-        let inner = graphics.renderer_supplied(target, textures)?;
+        let mut inner = graphics.renderer_supplied(target, textures)?;
+        // **What a display hands out on the drawn shape is staging, not scanout.** It composites
+        // what a frame wrote onto a buffer of its own and never reads that staging buffer again, so
+        // a frame carries its own rectangles and no debt — see `Supplied::owed`. Where the display
+        // hands out the buffers it reads directly, they rotate and the debt is real.
+        if !inner.presented_textures_are_consumed(display.composites_its_own_frames()) {
+            warn!("this renderer presents into nothing that was supplied, so nothing was told");
+        }
+        // **Only where the textures rotate.** A display that composites its own frames hands out
+        // staging, fills its own buffers' debts on its own device, and never reads a staging buffer
+        // twice — so there is no debt here for a peer to fill. Where the renderer draws straight
+        // into the buffers the display reads, they rotate, the debt is real, and a peer that can
+        // copy between them fills it without crossing to the renderer's device a second time.
+        if !display.composites_its_own_frames()
+            && let Some(peer) = display.peer_copy()
+            && !inner.attach_peer_copy(peer)
+        {
+            warn!("this renderer presents into nothing that rotates, so it repairs nothing");
+        }
         (inner, Delivery::Drawn)
     };
     // Without this a display list's vector passes are planned, counted and then drawn from nothing,
@@ -564,7 +591,7 @@ mod tests {
         fn frame(&self, composed: FrameOutcome) -> FrameOutcome {
             drawn_into_scanout(self, |slot| {
                 self.note(format!("compose into {slot}"));
-                composed
+                (composed, Vec::new())
             })
         }
     }
@@ -581,7 +608,7 @@ mod tests {
             Ok(Some(back))
         }
 
-        fn present_drawn(&self) -> Result<bool, PlatformError> {
+        fn present_drawn(&self, _wrote: &[Rect<i32, Device>]) -> Result<bool, PlatformError> {
             if self.busy.get() {
                 self.note("give over: no buffer is free");
                 return Ok(false);
@@ -610,7 +637,7 @@ mod tests {
             ))
         }
 
-        fn present_drawn(&self) -> Result<bool, PlatformError> {
+        fn present_drawn(&self, _wrote: &[Rect<i32, Device>]) -> Result<bool, PlatformError> {
             panic!("a frame nothing was drawn for was given to the display engine");
         }
     }

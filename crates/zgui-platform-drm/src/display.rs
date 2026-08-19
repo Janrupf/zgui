@@ -33,12 +33,14 @@
 
 use std::cell::RefCell;
 use std::ops::Range;
+use std::os::fd::AsFd;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use zgui_drm::Device;
 use zgui_drm::commit::Commit;
 use zgui_platform::{PlatformError, SurfaceId};
+use zgui_render_wgpu::target::swapchain::PeerCopy;
 use zgui_render_wgpu::{Gpu, Pixels, wgpu};
 
 use crate::cursor::Cursor;
@@ -188,6 +190,22 @@ impl DrmDisplay {
         self.scanout.borrow().textures()
     }
 
+    /// Whether this display builds its own frames out of what the renderer hands it.
+    ///
+    /// See [`Scanout::composites_its_own_frames`]: on the drawn shape what [`DrmDisplay::textures`]
+    /// answers is staging, and the display's own device puts a frame on the buffer it reads.
+    pub fn composites_its_own_frames(&self) -> bool {
+        self.scanout.borrow().composites_its_own_frames()
+    }
+
+    /// Returns something that can copy between this display's buffers without the renderer.
+    ///
+    /// [`Scanout::peer_copy`]'s own answer, over this display's own node. Asked once, beside
+    /// [`DrmDisplay::textures`], because it is settled when the buffers are made and never moves.
+    pub fn peer_copy(&self) -> Option<Box<dyn PeerCopy>> {
+        self.scanout.borrow_mut().peer_copy(self.device.as_fd())
+    }
+
     /// Takes the buffer the next frame is drawn into back from the display engine, and names it.
     ///
     /// [`Scanout::acquire`]'s own answer, and the **only** way to learn which buffer to draw into.
@@ -259,11 +277,18 @@ impl DrmDisplay {
     /// Returns [`PlatformError::Backend`] when this display is on the copied shape, when the buffer
     /// was never taken back, when the graphics device refuses or does not finish the barrier, and
     /// when the driver refuses the mode or the flip.
-    pub fn present_drawn(&self, gpu: &Gpu) -> Result<bool, PlatformError> {
+    /// `wrote` is the rectangles the frame put in the staging buffer, which is what the display's
+    /// own device copies onto the scanout buffer. Nothing else knows them: the renderer chose them
+    /// from its damage, and a copy of what it did not write would move whatever the buffer held.
+    pub fn present_drawn(
+        &self,
+        gpu: &Gpu,
+        wrote: &[zgui_geom::Rect<i32, zgui_geom::Device>],
+    ) -> Result<bool, PlatformError> {
         let mut commit = self.commit.borrow_mut();
         self.scanout
             .borrow_mut()
-            .present_drawn(&self.device, &mut **commit, gpu)
+            .present_drawn(&self.device, &mut **commit, gpu, wrote)
     }
 }
 

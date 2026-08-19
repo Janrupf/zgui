@@ -139,6 +139,8 @@ fn exact(name: &str) -> Option<(&'static str, Category)> {
         // The device and the compositor.
         "acq.in" | "acq.out" => ("Acquire the surface", Gpu),
         "r.reclaimed" => ("Take back finished staging", Gpu),
+        "s.composite" => ("Build the frame on the display", Gpu),
+        "s.built" => ("The frame is on its buffer", Gpu),
         "r.repaired" => ("Repair the acquired buffer", Gpu),
         "sub.out" => ("Submit to the queue", Gpu),
         "pres.out" => ("Present", Gpu),

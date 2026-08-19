@@ -20,6 +20,7 @@ use zgui_geom::{Device, Rect, Size};
 /// against, and a rectangle merged away wastes far more than that in pixels.
 const STALE: usize = zgui_bits::MAX_DAMAGE * 2;
 
+use crate::frame::damage::beyond;
 use crate::gpu::device::Gpu;
 use crate::gpu::formats::{self, Formats};
 use crate::gpu::surface::ConfiguredSurface;
@@ -285,6 +286,52 @@ impl Offscreen {
     }
 }
 
+/// Fills rectangles of one supplied texture from another, without the renderer's device.
+///
+/// **The pixels a rotated texture is owed are already correct in whichever one was written last.**
+/// Where the supplied textures live on a different device from the renderer — a display card on the
+/// far side of a link — producing them again means sending them across that link a second time, and
+/// they are already on the far side. A caller that can copy between its own textures there installs
+/// one of these with [`Supplied::attach_peer`], and what crosses the link falls to what nothing on
+/// the far side has yet.
+///
+/// The copy has finished when `copy` answers, and that is deliberate rather than lazy. Splitting it
+/// so that a frame is composed inside it was tried and measured: about three quarters of a copy is
+/// the device working, and starting it when the buffer is chosen really does hide a millisecond of
+/// that behind the composition — and the frame rate does not move, because the wait simply
+/// relocates. What is left is a contract with an ordering hazard in it, for nothing.
+pub trait PeerCopy: std::fmt::Debug {
+    /// Copies each of `rects` from the texture at `from` to the texture at `to`.
+    ///
+    /// Answers whether it did. A refusal is not fatal and not fatal to the frame: the caller sends
+    /// the rectangles the long way instead, which is what it did before one of these was attached.
+    ///
+    /// **Whether this waits for the copy is the peer's own business, and it should not.** The
+    /// rectangles it fills are the ones this frame will not draw, so nothing here reads them; and
+    /// the copy reads a texture the renderer's device may still be writing, so a peer that waits
+    /// waits for that device — 11.3 ms of a 20.5 ms frame on the machine this was written for.
+    /// A peer whose completion the caller's own presentation already covers answers at once, and
+    /// the copy runs while the frame is recorded and submitted.
+    fn copy(&mut self, from: usize, to: usize, rects: &[Rect<i32, Device>]) -> bool;
+}
+
+/// What the copy at the end of a frame owes, and what a peer serviced instead.
+#[derive(Debug, Default)]
+pub struct Owed {
+    /// The rectangles that have to come from the composed target, which is the renderer's device.
+    pub from_composed: Vec<Rect<i32, Device>>,
+    /// How many pixels a peer copy filled, and therefore did not cross a link.
+    pub repaired: u64,
+}
+
+/// How many pixels a list of rectangles covers.
+fn area(rects: &[Rect<i32, Device>]) -> u64 {
+    rects
+        .iter()
+        .map(|rect| crate::frame::damage::area(*rect))
+        .sum()
+}
+
 /// Textures a caller supplies and rotates between.
 ///
 /// What a display controller scans out of. The buffers belong to whatever drives the display, and
@@ -313,6 +360,22 @@ pub struct Supplied {
     /// capacity is its own: this set costs a scissor and a draw per rectangle inside one pass,
     /// where the renderer's costs a whole pass, so it can afford to be finer.
     stale: Vec<DamageSet<STALE>>,
+    /// Whether the caller reads each texture out and throws it away rather than rotating them.
+    ///
+    /// A display that composites its own frames hands out staging buffers: it copies exactly what
+    /// a frame wrote onto a buffer of its own and never reads one again. There is nothing for such
+    /// a texture to owe, and a debt would be pixels sent for nobody. Set by whoever supplied them,
+    /// because only it knows what it does with them afterwards.
+    consumed: bool,
+    /// Which texture was written in full last, where one was.
+    ///
+    /// The donor a repair reads from. It is the freshest of the set by construction — it was
+    /// written more recently than the one being written now, so what it lacks is a subset of what
+    /// the slot lacks, and copying the slot's whole debt from it and then writing the donor's own
+    /// debt over the top leaves the slot current. See [`Supplied::owed`].
+    donor: Option<usize>,
+    /// What can copy between these textures without the renderer's device, where anything can.
+    peer: Option<Box<dyn PeerCopy>>,
     /// Whether the renderer was configured for an extent these textures do not have.
     ///
     /// The renderer cannot reallocate a supplied set, so this is a state a frame has to stop in
@@ -354,10 +417,16 @@ impl Supplied {
         );
         Some(Self {
             stale,
+            // Rotated until whoever supplied them says otherwise, which is the safe direction: a
+            // set wrongly called consumed shows a stale rectangle, and one wrongly called rotated
+            // sends pixels nobody needed.
+            consumed: false,
             textures,
             selected: 0,
             size,
             formats,
+            donor: None,
+            peer: None,
             diverged: false,
         })
     }
@@ -495,13 +564,40 @@ impl Supplied {
         !self.diverged
     }
 
-    /// Returns which texture the next frame is copied into.
     /// Records what this frame wrote against every texture, and takes what `slot` is owed.
     ///
-    /// The answer is what the copy at the end of the frame has to cover: the rectangles this frame
+    /// The debt is what the copy at the end of the frame has to cover: the rectangles this frame
     /// drew **and** the ones drawn while this texture was not the one being written. Taking it
-    /// leaves the texture owing nothing, because the copy that follows writes exactly those.
-    pub fn owed(&mut self, slot: usize, rects: &[Rect<i32, Device>]) -> Vec<Rect<i32, Device>> {
+    /// leaves the texture owing nothing, because what follows writes exactly those.
+    ///
+    /// # Where a peer services part of it
+    ///
+    /// With a [`PeerCopy`] attached the debt is split, and the split is the point. Call the slot
+    /// being written *S* and the donor — the one written in full last — *D*.
+    ///
+    /// * Everything S lacks, D already has, **except what D itself lacks**. D was written more
+    ///   recently, so its own debt is a subset of S's.
+    /// * So the peer copies S's whole debt out of D, and the copy that follows writes D's debt over
+    ///   the top of it. A pixel in S's debt and not in D's was last changed before D was written,
+    ///   which is why D's copy of it is current; a pixel in both is written twice and ends current.
+    ///
+    /// What crosses to the renderer's device therefore falls from *everything S lacks* to
+    /// *everything D lacks*, which for a set rotated once a frame is one frame's damage rather than
+    /// as many frames as the set is deep. No rectangle arithmetic is needed for it: the second write
+    /// covering part of the first is what makes the answer exact.
+    ///
+    /// A peer that refuses leaves the whole debt to be sent, which is what happens with none
+    /// attached.
+    pub fn owed(&mut self, slot: usize, rects: &[Rect<i32, Device>]) -> Owed {
+        // **A set that is read out and thrown away every frame owes nothing.** Where the caller
+        // composites what it was handed onto a buffer of its own, this frame's rectangles are the
+        // whole of what it needs and a debt would be pixels sent across a link for nobody.
+        if self.consumed {
+            return Owed {
+                from_composed: rects.to_vec(),
+                repaired: 0,
+            };
+        }
         let whole = Rect::new(zgui_geom::Point::new(0, 0), self.size);
         for held in &mut self.stale {
             for rect in rects {
@@ -509,15 +605,90 @@ impl Supplied {
             }
         }
         let Some(held) = self.stale.get_mut(slot) else {
-            return vec![whole];
+            return Owed {
+                from_composed: vec![whole],
+                repaired: 0,
+            };
         };
-        let owed = if held.is_full() {
+        let debt = if held.is_full() {
             vec![whole]
         } else {
             held.rects().to_vec()
         };
         *held = DamageSet::<STALE>::new();
-        owed
+        // Read after this frame's rectangles were absorbed, so it already covers them. That is what
+        // makes it the whole of what the copy has to carry.
+        let donor_owes = self
+            .donor
+            .and_then(|donor| self.stale.get(donor))
+            .map_or_else(|| vec![whole], |held| held.rects().to_vec());
+
+        let answer = self.repair(slot, donor_owes, debt);
+        self.donor = Some(slot);
+        answer
+    }
+
+    /// Hands the slot's debt to the peer, and answers what is left to send.
+    ///
+    /// `donor_owes` is what even the donor lacks, read after this frame's rectangles were absorbed
+    /// — so it already covers them, and it is the whole of what has to come from the composed
+    /// target once the donor has supplied the rest.
+    fn repair(
+        &mut self,
+        slot: usize,
+        donor_owes: Vec<Rect<i32, Device>>,
+        debt: Vec<Rect<i32, Device>>,
+    ) -> Owed {
+        let sent_whole = || Owed {
+            from_composed: debt.clone(),
+            repaired: 0,
+        };
+        let Some(donor) = self.donor.filter(|donor| *donor != slot) else {
+            return sent_whole();
+        };
+        if self.stale.get(donor).is_none_or(DamageSet::is_full) {
+            return sent_whole();
+        }
+        // **Only where it saves something.** A repair replaces what the slot lacks with what the
+        // donor lacks, so a donor that lacks as much buys nothing and the copy is pure addition.
+        // That is not a corner case: a scene whose damage is one rectangle in the same place every
+        // frame — a scrolling panel is exactly that — has the two equal, and repairing it would copy
+        // the panel locally and then send the panel anyway.
+        let (owed_here, owed_there) = (area(&debt), area(&donor_owes));
+        if owed_there >= owed_here {
+            return sent_whole();
+        }
+        let Some(peer) = self.peer.as_mut() else {
+            return sent_whole();
+        };
+        // **What the copy that follows will write anyway is not worth copying.** The two overlap by
+        // construction — the donor's debt is a subset of the slot's — so the peer carries the
+        // difference rather than the whole, cut out rectangle by rectangle. Dropping whole
+        // rectangles caught 8% of it; the parts of a rectangle are most of the rest.
+        let carried = beyond(&debt, &donor_owes);
+        if !peer.copy(donor, slot, &carried) {
+            return sent_whole();
+        }
+        Owed {
+            from_composed: donor_owes,
+            repaired: area(&carried),
+        }
+    }
+
+    /// Records that the caller reads each texture out and throws it away.
+    ///
+    /// See [`Supplied::consumed`]. A caller that composites what it is handed onto a buffer of its
+    /// own says so here, and every frame then carries its own rectangles and no debt.
+    pub fn is_consumed(&mut self, consumed: bool) {
+        self.consumed = consumed;
+    }
+
+    /// Installs what can copy between these textures without the renderer's device.
+    ///
+    /// Answers what was there before. See [`PeerCopy`] for when one is worth having, which is
+    /// narrower than it looks: on one device the copy costs what the drawing costs.
+    pub fn attach_peer(&mut self, peer: Box<dyn PeerCopy>) -> Option<Box<dyn PeerCopy>> {
+        self.peer.replace(peer)
     }
 
     /// Which texture the next frame is copied into.
@@ -561,5 +732,95 @@ impl Supplied {
     fn view(&self) -> wgpu::TextureView {
         self.texture()
             .create_view(&wgpu::TextureViewDescriptor::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! What a repair may leave to somebody else, checked pixel by pixel.
+    //!
+    //! [`beyond`] decides what a peer copy carries, and the copy that follows covers the rest. A
+    //! pixel in neither is a pixel nothing writes — one frame of the wrong colour, in a place that
+    //! depends on where two damage sets happened to overlap, which is the kind of fault that is
+    //! never reproduced and never found. So it is checked exhaustively over a small grid rather
+    //! than argued about.
+
+    use super::{Rect, beyond};
+    use zgui_geom::{Point, Size};
+
+    /// A rectangle from its edges, which is how the cases below read best.
+    fn at(left: i32, top: i32, right: i32, bottom: i32) -> Rect<i32, zgui_geom::Device> {
+        Rect::new(Point::new(left, top), Size::new(right - left, bottom - top))
+    }
+
+    /// Whether `rects` covers the pixel whose top-left corner is `(x, y)`.
+    fn covers(rects: &[Rect<i32, zgui_geom::Device>], x: i32, y: i32) -> bool {
+        rects.iter().any(|rect| {
+            x >= rect.origin.x
+                && y >= rect.origin.y
+                && x < rect.origin.x + rect.size.width
+                && y < rect.origin.y + rect.size.height
+        })
+    }
+
+    /// The two properties, over every pixel of a grid that contains everything asked about.
+    fn holds(rects: &[Rect<i32, zgui_geom::Device>], cut: &[Rect<i32, zgui_geom::Device>]) {
+        let carried = beyond(rects, cut);
+        for y in -1..14 {
+            for x in -1..14 {
+                let inside = covers(rects, x, y);
+                let written = covers(cut, x, y);
+                let taken = covers(&carried, x, y);
+                // Owed and unwritten implies carried: nothing may fall between the two copies.
+                assert!(
+                    !inside || written || taken,
+                    "({x}, {y}) is owed and nothing carries or writes it: \
+                     rects={rects:?} cut={cut:?} carried={carried:?}"
+                );
+                // Carried implies owed: the cut may leave too much, never something new.
+                assert!(
+                    !taken || inside,
+                    "({x}, {y}) is carried and was never owed: \
+                     rects={rects:?} cut={cut:?} carried={carried:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn what_is_carried_covers_everything_the_other_copy_will_not_write() {
+        // A miss, a total cover, an edge, a corner, a bite out of the middle — and two bites, which
+        // is the case that splinters.
+        holds(&[at(2, 2, 10, 10)], &[]);
+        holds(&[at(2, 2, 10, 10)], &[at(20, 20, 30, 30)]);
+        holds(&[at(2, 2, 10, 10)], &[at(0, 0, 12, 12)]);
+        holds(&[at(2, 2, 10, 10)], &[at(2, 2, 10, 6)]);
+        holds(&[at(2, 2, 10, 10)], &[at(0, 0, 6, 6)]);
+        holds(&[at(2, 2, 10, 10)], &[at(4, 4, 8, 8)]);
+        holds(&[at(2, 2, 10, 10)], &[at(4, 4, 8, 8), at(3, 3, 5, 9)]);
+        holds(
+            &[at(0, 0, 6, 6), at(6, 6, 12, 12)],
+            &[at(4, 4, 8, 8), at(0, 5, 12, 7)],
+        );
+    }
+
+    #[test]
+    fn a_rectangle_that_splinters_is_carried_whole_rather_than_in_pieces() {
+        // Five separate bites out of one rectangle would leave more pieces than are worth tracking.
+        // Carrying it whole is bigger and still correct, which the properties above also check.
+        let rect = at(0, 0, 12, 12);
+        let cut = [
+            at(1, 1, 2, 2),
+            at(4, 4, 5, 5),
+            at(7, 7, 8, 8),
+            at(9, 2, 10, 3),
+            at(2, 9, 3, 10),
+        ];
+        holds(&[rect], &cut);
+        assert_eq!(
+            beyond(&[rect], &cut),
+            vec![rect],
+            "a rectangle in too many pieces is kept whole"
+        );
     }
 }

@@ -426,6 +426,24 @@ impl WgpuRenderer {
         true
     }
 
+    /// Installs what can copy between the supplied textures without this renderer's device.
+    ///
+    /// Answers whether it was taken, which is `false` for the two presentations that rotate through
+    /// nothing. See [`PeerCopy`](crate::target::swapchain::PeerCopy) for what one is for: where the
+    /// supplied textures live on a device this one reaches across a link, the rectangles a rotated
+    /// texture is owed are already correct on the far side, and copying them there is what stops
+    /// them crossing twice.
+    #[must_use = "a refused copier leaves every owed rectangle crossing the link"]
+    pub fn attach_peer_copy(&mut self, peer: Box<dyn crate::target::swapchain::PeerCopy>) -> bool {
+        match &mut self.presentation {
+            Presentation::Supplied(supplied) => {
+                drop(supplied.attach_peer(peer));
+                true
+            }
+            Presentation::Surface(_) | Presentation::Offscreen(_) => false,
+        }
+    }
+
     /// Answers the next `times` acquisitions with `answer` instead of asking the surface.
     ///
     /// Six of the seven answers a surface can give are ordinary events in a window's life and none
@@ -499,6 +517,22 @@ impl WgpuRenderer {
     pub fn present_into(&mut self, slot: usize) -> bool {
         match &mut self.presentation {
             Presentation::Supplied(supplied) => supplied.select(slot),
+            Presentation::Surface(_) | Presentation::Offscreen(_) => false,
+        }
+    }
+
+    /// Records that whatever supplied the presented textures reads each one out and throws it away.
+    ///
+    /// Answers whether anything took it: only a supplied set has textures to say this about. See
+    /// [`Supplied::is_consumed`](crate::target::swapchain::Supplied::is_consumed) — a set that is
+    /// consumed carries one frame's rectangles and never a debt.
+    #[must_use = "a set that was not told is a set that keeps sending a debt nobody reads"]
+    pub fn presented_textures_are_consumed(&mut self, consumed: bool) -> bool {
+        match &mut self.presentation {
+            Presentation::Supplied(supplied) => {
+                supplied.is_consumed(consumed);
+                true
+            }
             Presentation::Surface(_) | Presentation::Offscreen(_) => false,
         }
     }
