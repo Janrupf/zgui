@@ -324,6 +324,75 @@ fn area(rects: &[Rect<i32, Device>]) -> u64 {
         .sum()
 }
 
+/// How many pieces one rectangle may be cut into before the cutting is given up on.
+///
+/// A rectangle with a bite out of the middle is four pieces, and a second bite is up to sixteen. The
+/// point of the cut is to carry *less*, so a rectangle that has become a crowd of slivers is kept
+/// whole instead — the copy is then bigger and the bookkeeping is not.
+const PIECES: usize = 8;
+
+/// The parts of `rects` that no rectangle of `cut` covers.
+///
+/// Exact where it answers: every pixel of `rects` outside `cut` is inside some answer, which is what
+/// makes it safe to leave the rest to whoever writes `cut`. It over-answers rather than
+/// under-answers when a rectangle splinters — see [`PIECES`] — because carrying a pixel twice is
+/// waste and carrying it never is corruption.
+fn beyond(rects: &[Rect<i32, Device>], cut: &[Rect<i32, Device>]) -> Vec<Rect<i32, Device>> {
+    let mut answer = Vec::with_capacity(rects.len());
+    let mut pieces: Vec<Rect<i32, Device>> = Vec::with_capacity(PIECES);
+    let mut next: Vec<Rect<i32, Device>> = Vec::with_capacity(PIECES);
+    for rect in rects {
+        pieces.clear();
+        pieces.push(*rect);
+        for taken in cut {
+            if pieces.is_empty() {
+                break;
+            }
+            next.clear();
+            for piece in &pieces {
+                without(*piece, *taken, &mut next);
+            }
+            if next.len() > PIECES {
+                // Too many slivers to be worth it. The whole rectangle goes, which is what this did
+                // before any of it was cut.
+                pieces.clear();
+                pieces.push(*rect);
+                break;
+            }
+            core::mem::swap(&mut pieces, &mut next);
+        }
+        answer.extend(pieces.iter().copied());
+    }
+    answer
+}
+
+/// Appends the parts of `rect` that `cut` does not cover.
+///
+/// Up to four: above, below, and the left and right of what remains between them. A `cut` that
+/// misses appends the rectangle unchanged, and one that covers it appends nothing.
+fn without(rect: Rect<i32, Device>, cut: Rect<i32, Device>, into: &mut Vec<Rect<i32, Device>>) {
+    let Some(taken) = rect.intersection(cut) else {
+        into.push(rect);
+        return;
+    };
+    let (left, top) = (rect.origin.x, rect.origin.y);
+    let (right, bottom) = (left + rect.size.width, top + rect.size.height);
+    let (cut_left, cut_top) = (taken.origin.x, taken.origin.y);
+    let (cut_right, cut_bottom) = (cut_left + taken.size.width, cut_top + taken.size.height);
+    let mut piece = |x: i32, y: i32, width: i32, height: i32| {
+        if width > 0 && height > 0 {
+            into.push(Rect::new(
+                zgui_geom::Point::new(x, y),
+                Size::new(width, height),
+            ));
+        }
+    };
+    piece(left, top, right - left, cut_top - top);
+    piece(left, cut_bottom, right - left, bottom - cut_bottom);
+    piece(left, cut_top, cut_left - left, cut_bottom - cut_top);
+    piece(cut_right, cut_top, right - cut_right, cut_bottom - cut_top);
+}
+
 /// Textures a caller supplies and rotates between.
 ///
 /// What a display controller scans out of. The buffers belong to whatever drives the display, and
@@ -634,19 +703,10 @@ impl Supplied {
             return sent_whole();
         };
         // **What the copy that follows will write anyway is not worth copying.** The two overlap by
-        // construction — the donor's debt is a subset of the slot's — and a rectangle of the slot's
-        // debt that lies wholly inside one the composed target is about to write is carried twice
-        // for no reason. Wholly inside, not merely touching: a rectangle half-covered still owes its
-        // other half, and dropping it would leave that half in neither copy.
-        let carried: Vec<Rect<i32, Device>> = debt
-            .iter()
-            .copied()
-            .filter(|rect| {
-                !donor_owes
-                    .iter()
-                    .any(|written| written.contains_rect(*rect))
-            })
-            .collect();
+        // construction — the donor's debt is a subset of the slot's — so the peer carries the
+        // difference rather than the whole, cut out rectangle by rectangle. Dropping whole
+        // rectangles caught 8% of it; the parts of a rectangle are most of the rest.
+        let carried = beyond(&debt, &donor_owes);
         if !peer.copy(donor, slot, &carried) {
             return sent_whole();
         }
@@ -705,5 +765,95 @@ impl Supplied {
     fn view(&self) -> wgpu::TextureView {
         self.texture()
             .create_view(&wgpu::TextureViewDescriptor::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! What a repair may leave to somebody else, checked pixel by pixel.
+    //!
+    //! [`beyond`] decides what a peer copy carries, and the copy that follows covers the rest. A
+    //! pixel in neither is a pixel nothing writes — one frame of the wrong colour, in a place that
+    //! depends on where two damage sets happened to overlap, which is the kind of fault that is
+    //! never reproduced and never found. So it is checked exhaustively over a small grid rather
+    //! than argued about.
+
+    use super::{Rect, beyond};
+    use zgui_geom::{Point, Size};
+
+    /// A rectangle from its edges, which is how the cases below read best.
+    fn at(left: i32, top: i32, right: i32, bottom: i32) -> Rect<i32, zgui_geom::Device> {
+        Rect::new(Point::new(left, top), Size::new(right - left, bottom - top))
+    }
+
+    /// Whether `rects` covers the pixel whose top-left corner is `(x, y)`.
+    fn covers(rects: &[Rect<i32, zgui_geom::Device>], x: i32, y: i32) -> bool {
+        rects.iter().any(|rect| {
+            x >= rect.origin.x
+                && y >= rect.origin.y
+                && x < rect.origin.x + rect.size.width
+                && y < rect.origin.y + rect.size.height
+        })
+    }
+
+    /// The two properties, over every pixel of a grid that contains everything asked about.
+    fn holds(rects: &[Rect<i32, zgui_geom::Device>], cut: &[Rect<i32, zgui_geom::Device>]) {
+        let carried = beyond(rects, cut);
+        for y in -1..14 {
+            for x in -1..14 {
+                let inside = covers(rects, x, y);
+                let written = covers(cut, x, y);
+                let taken = covers(&carried, x, y);
+                // Owed and unwritten implies carried: nothing may fall between the two copies.
+                assert!(
+                    !inside || written || taken,
+                    "({x}, {y}) is owed and nothing carries or writes it: \
+                     rects={rects:?} cut={cut:?} carried={carried:?}"
+                );
+                // Carried implies owed: the cut may leave too much, never something new.
+                assert!(
+                    !taken || inside,
+                    "({x}, {y}) is carried and was never owed: \
+                     rects={rects:?} cut={cut:?} carried={carried:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn what_is_carried_covers_everything_the_other_copy_will_not_write() {
+        // A miss, a total cover, an edge, a corner, a bite out of the middle — and two bites, which
+        // is the case that splinters.
+        holds(&[at(2, 2, 10, 10)], &[]);
+        holds(&[at(2, 2, 10, 10)], &[at(20, 20, 30, 30)]);
+        holds(&[at(2, 2, 10, 10)], &[at(0, 0, 12, 12)]);
+        holds(&[at(2, 2, 10, 10)], &[at(2, 2, 10, 6)]);
+        holds(&[at(2, 2, 10, 10)], &[at(0, 0, 6, 6)]);
+        holds(&[at(2, 2, 10, 10)], &[at(4, 4, 8, 8)]);
+        holds(&[at(2, 2, 10, 10)], &[at(4, 4, 8, 8), at(3, 3, 5, 9)]);
+        holds(
+            &[at(0, 0, 6, 6), at(6, 6, 12, 12)],
+            &[at(4, 4, 8, 8), at(0, 5, 12, 7)],
+        );
+    }
+
+    #[test]
+    fn a_rectangle_that_splinters_is_carried_whole_rather_than_in_pieces() {
+        // Five separate bites out of one rectangle would leave more pieces than are worth tracking.
+        // Carrying it whole is bigger and still correct, which the properties above also check.
+        let rect = at(0, 0, 12, 12);
+        let cut = [
+            at(1, 1, 2, 2),
+            at(4, 4, 5, 5),
+            at(7, 7, 8, 8),
+            at(9, 2, 10, 3),
+            at(2, 9, 3, 10),
+        ];
+        holds(&[rect], &cut);
+        assert_eq!(
+            beyond(&[rect], &cut),
+            vec![rect],
+            "a rectangle in too many pieces is kept whole"
+        );
     }
 }
