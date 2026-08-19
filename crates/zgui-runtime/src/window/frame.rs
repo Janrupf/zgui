@@ -590,6 +590,8 @@ impl Window {
             probe.frame_ended(self);
         }
 
+        // What this frame moved, beside how long each stage of it took — off unless asked for.
+        zgui_profile::counter::census::note("f.counters");
         zgui_profile::latency::note_with("f.end", || {
             format!(
                 "{outcome:?} another={needs_another_frame} owed={owed} \

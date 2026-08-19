@@ -19,6 +19,7 @@
 //! }
 //! ```
 
+pub mod census;
 mod define;
 mod exclusive;
 mod group;
