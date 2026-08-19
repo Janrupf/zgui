@@ -112,3 +112,8 @@ workspace = true
 name = "tty_text"
 path = "../../examples/tty_text.rs"
 required-features = ["drm"]
+
+[[example]]
+name = "tty_scroll"
+path = "../../examples/tty_scroll.rs"
+required-features = ["drm"]
