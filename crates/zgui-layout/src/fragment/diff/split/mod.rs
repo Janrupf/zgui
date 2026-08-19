@@ -116,8 +116,11 @@ pub(crate) enum Part {
 }
 
 thread_local! {
-    /// How the walk on this thread divides its duties.
-    static PASSES: Cell<Passes> = const { Cell::new(Passes::Together) };
+    /// How the walk on this thread divides its duties, once something has decided.
+    ///
+    /// `None` until the first walk asks, which is where the environment gets to answer. Held per
+    /// thread like the accumulator it goes with, so a thread that never walks never reads it.
+    static PASSES: Cell<Option<Passes>> = const { Cell::new(None) };
     /// What it has spent since the last read.
     static SPENT: Cell<Spent> = const { Cell::new(Spent {
         together: 0,
@@ -132,13 +135,62 @@ thread_local! {
 
 /// Asks the walks on this thread to divide their duties this way from now on.
 pub fn set(passes: Passes) {
-    PASSES.with(|cell| cell.set(passes));
+    PASSES.with(|cell| cell.set(Some(passes)));
 }
 
 /// How they are dividing them.
+///
+/// What `ZGUI_DIFF_SPLIT` asked for, until something calls [`set`]: `timed` for the fused descent
+/// timed as a whole, `apart` for the four separate ones. Anything else, and the absence of the
+/// variable, leaves the walk fused and untimed — which is the only shape that costs a frame
+/// nothing.
 #[must_use]
 pub fn current() -> Passes {
-    PASSES.with(Cell::get)
+    PASSES.with(|cell| match cell.get() {
+        Some(held) => held,
+        None => {
+            let held = asked();
+            cell.set(Some(held));
+            held
+        }
+    })
+}
+
+/// What the environment asked for, read once for the process.
+fn asked() -> Passes {
+    static ASKED: std::sync::OnceLock<Passes> = std::sync::OnceLock::new();
+    *ASKED.get_or_init(|| match std::env::var("ZGUI_DIFF_SPLIT").as_deref() {
+        Ok("timed") => Passes::TogetherTimed,
+        Ok("apart") => Passes::Apart,
+        _ => Passes::Together,
+    })
+}
+
+/// Notes what the walks since the last call spent, under `stage`, and resets the accumulator.
+///
+/// Nothing is written where no subtree moved: a frame that offset nothing has no split to report,
+/// and a note on every frame would bury the ones that do.
+pub fn note(stage: &'static str) {
+    if current() == Passes::Together {
+        return;
+    }
+    let spent = take();
+    if spent.walks == 0 {
+        return;
+    }
+    zgui_profile::latency::note(
+        stage,
+        format!(
+            "walks={} together={} skeleton={} warmed={} geometry={} index={} settle={}",
+            spent.walks,
+            spent.together,
+            spent.skeleton,
+            spent.warmed,
+            spent.geometry,
+            spent.index,
+            spent.settle,
+        ),
+    );
 }
 
 /// Everything spent since this was last called, and resets the accumulator.

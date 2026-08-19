@@ -1230,6 +1230,9 @@ impl Window {
         // out inside the frame that delivered it, so the frame's answer is every pass's together.
         // The walk seeds its own `beyond` from whatever the frame had already damaged.
         self.rigid_moves = self.rigid_moves.and(moved);
+        // What the offsetting walk spent, when it was asked to divide its duties. Silent
+        // otherwise, which is every frame of every build that has not asked.
+        zgui_layout::fragment::diff::split::note("f.split");
         layout.reclaim_paragraphs();
         // The fragments name their matrices by an index into the table that was just filled, so
         // the two go to the view layer together: a box's place on the screen is only answerable
