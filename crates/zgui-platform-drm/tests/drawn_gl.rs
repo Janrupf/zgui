@@ -15,6 +15,12 @@
 //! error and returns, the shape `cargo xtask ledger ignored` prescribes for a test that cannot be
 //! switched off.
 
+#![allow(
+    unsafe_code,
+    reason = "the timing below reaches wgpu's own GL context through its hal, which is unsafe to \
+              take and safe to read through — the same access `import::gl` makes"
+)]
+
 use std::path::PathBuf;
 
 use zgui_platform_drm::import::gbm;
@@ -75,6 +81,7 @@ fn main() {
             return;
         }
     };
+    what_one_call_into_this_driver_costs(&gpu);
     a_frame_composed_into_an_imported_buffer_reaches_the_buffer(&gpu, &allocator);
     every_buffer_of_a_set_is_its_own_memory(&gpu, &allocator);
     the_tier_that_signals_a_frame_is_one_this_device_has(&gpu);
@@ -194,6 +201,62 @@ fn a_scanout_buffer_answers_what_is_writing_it(buffer: &gl::Drawn) {
             "a dma-buf either answers a descriptor or reports that this kernel has no such \
              request, and this one refused: {refusal}"
         ),
+    }
+}
+
+/// What a single call into this graphics driver costs, which is what a frame's submit is made of.
+///
+/// On this backend a submit is not a wait — it is the recorded command stream replayed as real
+/// calls, one after another, on the frame loop's own thread. So what a frame spends there is the
+/// call count times this, and knowing one without the other says nothing about which to attack.
+///
+/// Three kinds, because they are not the same cost. A **query** answers out of the driver's own
+/// state and touches nothing. A **setter** marks state dirty and is what most of a command stream
+/// is. A **draw** is where a driver validates everything that was marked, so it carries the cost of
+/// every setter before it — which is why counting calls alone is misleading.
+fn what_one_call_into_this_driver_costs(gpu: &Gpu) {
+    use std::time::Instant;
+    // SAFETY: `as_hal` asks that the resource behind the guard is not destroyed. The guard is read
+    // through and dropped, which its own documentation permits at any time.
+    let Some(adapter) = (unsafe { gpu.adapter().as_hal::<wgpu::hal::api::Gles>() }) else {
+        eprintln!("drawn_gl: this adapter is not the OpenGL one, so no call was timed");
+        return;
+    };
+    let gl = adapter.adapter_context().lock();
+    // SAFETY: the context is current for as long as `gl` lives, and every call below is a state
+    // query or a state setter with arguments the enum types make valid.
+    unsafe {
+        use glow::HasContext as _;
+        const ROUNDS: u32 = 20_000;
+        // Warm whatever the loader resolves lazily, so the first call is not counted as the cost of
+        // every call.
+        let _ = gl.is_enabled(glow::BLEND);
+        gl.bind_buffer(glow::ARRAY_BUFFER, None);
+
+        let at = Instant::now();
+        for _ in 0..ROUNDS {
+            let _ = gl.is_enabled(glow::BLEND);
+        }
+        let query = at.elapsed().as_secs_f64() / f64::from(ROUNDS);
+
+        let at = Instant::now();
+        for _ in 0..ROUNDS {
+            gl.bind_buffer(glow::ARRAY_BUFFER, None);
+        }
+        let setter = at.elapsed().as_secs_f64() / f64::from(ROUNDS);
+
+        let at = Instant::now();
+        for _ in 0..ROUNDS {
+            gl.scissor(0, 0, 16, 16);
+        }
+        let scissor = at.elapsed().as_secs_f64() / f64::from(ROUNDS);
+
+        eprintln!(
+            "drawn_gl: one call into this driver — query {:.3} us, bind {:.3} us, scissor {:.3} us",
+            query * 1e6,
+            setter * 1e6,
+            scissor * 1e6,
+        );
     }
 }
 
