@@ -77,7 +77,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::ops::Range;
 use std::os::fd::OwnedFd as WakeFd;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
@@ -87,7 +87,9 @@ use zgui_drm::format::{Format, Modifier};
 use zgui_drm::framebuffer::Framebuffer;
 use zgui_drm::resources::Mode;
 use zgui_drm::{Device, Event};
+use zgui_geom::{Device as DeviceSpace, Rect};
 use zgui_platform::{PlatformError, Watchdog, refresh_interval};
+use zgui_render_wgpu::target::swapchain::PeerCopy;
 use zgui_render_wgpu::{Gpu, Pixels, wgpu};
 
 use crate::cursor::Cursor;
@@ -525,6 +527,67 @@ impl Scanout {
             }
             Buffers::Imported { buffers, .. } => {
                 buffers.iter().map(|held| held.texture().clone()).collect()
+            }
+        }
+    }
+
+    /// Returns something that can copy between these buffers without the renderer's device.
+    ///
+    /// **Only where the two are different devices.** The buffers a display scans out of are the
+    /// display's, and on a machine that renders elsewhere every pixel of a copy into them crosses
+    /// the link between the two. A rotated buffer is owed the damage it missed while it was not the
+    /// one being written, and those pixels are already correct in the buffer presented last — which
+    /// is on the far side already. Copying them there is the difference between sending a frame's
+    /// damage and sending as many frames of it as the set is deep.
+    ///
+    /// `node` is the **display's** node, because that is the device the buffers live on and the one
+    /// a copier has to be opened over.
+    ///
+    /// Answers `None` where this display keeps the copied shape, where the machine has no EGL for
+    /// that device, and where any step of opening one refuses. Each of those is a display that goes
+    /// on sending every owed rectangle the long way, which is what it did before.
+    pub fn peer_copy(&mut self, node: BorrowedFd<'_>) -> Option<Box<dyn PeerCopy>> {
+        let Buffers::DrawnGl { buffers, .. } = &mut self.buffers else {
+            return None;
+        };
+        // Exported in one pass and read back in another: the export takes `&mut`, and a list of
+        // descriptors is several of those borrows at once.
+        for buffer in buffers.iter_mut() {
+            if let Err(reason) = buffer.descriptor() {
+                warn!("a scanout buffer would not export, so nothing repairs them: {reason}");
+                return None;
+            }
+        }
+        let mut described = Vec::with_capacity(buffers.len());
+        for buffer in buffers.iter() {
+            let descriptor = buffer.exported()?;
+            let modifier = buffer.modifier();
+            described.push(zgui_scanout::Buffer {
+                descriptor,
+                width: buffer.texture().width(),
+                height: buffer.texture().height(),
+                fourcc: gl::FOURCC,
+                stride: buffer.stride(),
+                offset: buffer.offset(),
+                // Named only where the driver named one, as the allocation asked for it.
+                modifier: (modifier != gbm::IMPLICIT).then_some(modifier),
+            });
+        }
+        match zgui_scanout::egl::Egl::open(node, &described) {
+            Ok(copier) => {
+                info!(
+                    target: "zgui::platform",
+                    "these scanout buffers repair each other on the display's own device: {copier:?}"
+                );
+                Some(Box::new(Peer(copier)))
+            }
+            Err(reason) => {
+                info!(
+                    target: "zgui::platform",
+                    "this display's own device cannot copy between its buffers, so every rectangle \
+                     a rotated buffer is owed is drawn again: {reason}"
+                );
+                None
             }
         }
     }
@@ -1947,5 +2010,47 @@ mod tests {
             None,
             "and a fifth plane would reach the kernel as a plane the image does not have"
         );
+    }
+}
+
+/// A [`zgui_scanout`] copier, as the renderer asks for one.
+///
+/// The wait lives here. `PeerCopy` promises the copy has finished when it answers, because the copy
+/// that follows writes over part of the same region — so a device that hands back a descriptor is
+/// waited on here rather than passed along. A driver that exports no descriptor has already waited
+/// inside the copy.
+#[derive(Debug)]
+struct Peer(zgui_scanout::egl::Egl);
+
+impl PeerCopy for Peer {
+    fn copy(&mut self, from: usize, to: usize, rects: &[Rect<i32, DeviceSpace>]) -> bool {
+        let rects: Vec<zgui_scanout::Rect> = rects
+            .iter()
+            .map(|rect| zgui_scanout::Rect {
+                x: rect.origin.x,
+                y: rect.origin.y,
+                width: rect.size.width,
+                height: rect.size.height,
+            })
+            .collect();
+        match zgui_scanout::Copier::copy(&mut self.0, from, to, &rects) {
+            Ok(signalled) => {
+                if let Some(fence) = signalled.descriptor() {
+                    let mut polled = [rustix::event::PollFd::new(
+                        &fence,
+                        rustix::event::PollFlags::IN,
+                    )];
+                    if let Err(errno) = rustix::event::poll(&mut polled, None) {
+                        warn!("a repair's fence could not be waited for: {errno}");
+                        return false;
+                    }
+                }
+                true
+            }
+            Err(reason) => {
+                warn!("the buffers could not be repaired from each other: {reason}");
+                false
+            }
+        }
     }
 }

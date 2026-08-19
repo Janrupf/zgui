@@ -709,7 +709,9 @@ fn drive(
                 let within = match waiting {
                     Parked::Indefinitely => None,
                     Parked::Until(due) => Some(due.saturating_duration_since(clock.now())),
-                    Parked::Never => Some(Duration::ZERO),
+                    // `Never` and any future policy a block could not happen under: settle at once,
+                    // because there is no wait to fold this into.
+                    _ => Some(Duration::ZERO),
                 };
                 for scanout in &scanouts {
                     let mut committing = commit.borrow_mut();

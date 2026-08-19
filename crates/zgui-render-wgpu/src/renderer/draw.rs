@@ -302,6 +302,9 @@ impl Renderer for WgpuRenderer {
         // How many rectangles that area is spread over, which is what says whether the stale set is
         // merging because it ran out of room or because they touched.
         let mut presented_rects = 0;
+        // What a peer filled between the caller's own textures instead, which is what the copy
+        // above did *not* have to carry. Zero everywhere nothing can copy on the far side.
+        let mut repaired_px = 0;
         if let Some(view) = &presented.view {
             // What the copy has to cover. A supplied set is rotated through and its textures
             // persist, so a frame copies the rectangles it drew plus the ones drawn while this
@@ -309,15 +312,20 @@ impl Renderer for WgpuRenderer {
             // those pixels crosses a bus. Everything else is copied whole: an acquired surface
             // texture is a new resource marked wholly uninitialised on every acquisition, so a
             // partial copy onto one comes out black everywhere it did not write.
-            let scissors = match &mut self.presentation {
+            let owed = match &mut self.presentation {
                 Presentation::Supplied(supplied) => {
                     let slot = supplied.selected();
                     supplied.owed(slot, &self.composed_rects)
                 }
                 Presentation::Surface(_) | Presentation::Offscreen(_) => {
-                    vec![self.composed.used()]
+                    crate::target::swapchain::Owed {
+                        from_composed: vec![self.composed.used()],
+                        repaired: 0,
+                    }
                 }
             };
+            let scissors = owed.from_composed;
+            repaired_px = owed.repaired;
             presented_px = scissors.iter().map(|rect| damage::area(*rect)).sum();
             presented_rects = scissors.len();
             draw_calls += self.blit(&mut encoder, view, formats.blit_undoes_srgb(), &scissors);
@@ -340,7 +348,7 @@ impl Renderer for WgpuRenderer {
         zgui_profile::latency::note_with("sub.out", || {
             format!(
                 "draws={draw_calls} rects={} drawn_px={redrawn} presented_px={presented_px} \
-                 presented_rects={presented_rects} uploaded={}",
+                 presented_rects={presented_rects} repaired_px={repaired_px} uploaded={}",
                 self.composed_rects.len(),
                 zgui_profile::counter::get(zgui_profile::Counter::BytesUploaded)
             )

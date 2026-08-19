@@ -147,6 +147,14 @@ impl Drawn {
         self.allocation.descriptor()
     }
 
+    /// The descriptor this was already exported as, where it was.
+    ///
+    /// For a caller building a list out of several buffers at once — see
+    /// [`gbm::Allocation::exported`].
+    pub fn exported(&self) -> Option<BorrowedFd<'_>> {
+        self.allocation.exported()
+    }
+
     /// How long a row is, in bytes.
     pub fn stride(&self) -> u32 {
         self.allocation.stride()

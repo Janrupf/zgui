@@ -198,6 +198,37 @@ pub struct Egl {
     thread_bound: PhantomData<*const ()>,
 }
 
+impl std::fmt::Debug for Egl {
+    /// What a log line about a copier needs: how many buffers it holds and how it moves them.
+    ///
+    /// Written out rather than derived, because EGL's own handles describe nothing and the function
+    /// pointers describe less.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Egl")
+            .field("buffers", &self.textures.len())
+            // What it will *try*. A copier fresh from `open` has run no copy yet, and this device
+            // is only believed about `glCopyImageSubData` until the first one it refuses.
+            .field(
+                "tries",
+                &if self.how.trust_direct {
+                    "glCopyImageSubData"
+                } else {
+                    "glBlitFramebuffer"
+                },
+            )
+            .field(
+                "signals",
+                &match self.told {
+                    Told::Descriptor { .. } => "a descriptor",
+                    Told::Fence { .. } => "a fence waited on here",
+                    Told::Drain => "glFinish",
+                },
+            )
+            .finish()
+    }
+}
+
 impl Egl {
     /// Opens a copier on `node`, holding `buffers`.
     ///

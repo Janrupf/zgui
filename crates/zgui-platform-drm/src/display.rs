@@ -33,12 +33,14 @@
 
 use std::cell::RefCell;
 use std::ops::Range;
+use std::os::fd::AsFd;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use zgui_drm::Device;
 use zgui_drm::commit::Commit;
 use zgui_platform::{PlatformError, SurfaceId};
+use zgui_render_wgpu::target::swapchain::PeerCopy;
 use zgui_render_wgpu::{Gpu, Pixels, wgpu};
 
 use crate::cursor::Cursor;
@@ -186,6 +188,14 @@ impl DrmDisplay {
     /// has gone.
     pub fn textures(&self) -> Vec<wgpu::Texture> {
         self.scanout.borrow().textures()
+    }
+
+    /// Returns something that can copy between this display's buffers without the renderer.
+    ///
+    /// [`Scanout::peer_copy`]'s own answer, over this display's own node. Asked once, beside
+    /// [`DrmDisplay::textures`], because it is settled when the buffers are made and never moves.
+    pub fn peer_copy(&self) -> Option<Box<dyn PeerCopy>> {
+        self.scanout.borrow_mut().peer_copy(self.device.as_fd())
     }
 
     /// Takes the buffer the next frame is drawn into back from the display engine, and names it.

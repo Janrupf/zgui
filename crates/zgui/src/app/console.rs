@@ -480,7 +480,16 @@ fn renderer(
         let inner = graphics.renderer_offscreen(target, zgui_platform_drm::FORMAT, false)?;
         (inner, Delivery::Copied)
     } else {
-        let inner = graphics.renderer_supplied(target, textures)?;
+        let mut inner = graphics.renderer_supplied(target, textures)?;
+        // Asked once, beside the textures, and for the same reason: what a display's own device can
+        // do is settled when its buffers are made. Where it can copy between them, the rectangles a
+        // rotated buffer is owed are filled there instead of crossing to the renderer's device a
+        // second time — see `Supplied::owed`. Where it cannot, nothing changes.
+        if let Some(peer) = display.peer_copy()
+            && !inner.attach_peer_copy(peer)
+        {
+            warn!("this renderer presents into nothing that rotates, so it repairs nothing");
+        }
         (inner, Delivery::Drawn)
     };
     // Without this a display list's vector passes are planned, counted and then drawn from nothing,

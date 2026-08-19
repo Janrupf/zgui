@@ -485,6 +485,24 @@ impl WgpuRenderer {
         self.groups = GroupPool::new(self.composed.used().size, bytes);
     }
 
+    /// Installs what can copy between the supplied textures without this renderer's device.
+    ///
+    /// Answers whether it was taken, which is `false` for the two presentations that rotate through
+    /// nothing. See [`PeerCopy`](crate::target::swapchain::PeerCopy) for what one is for: where the
+    /// supplied textures live on a device this one reaches across a link, the rectangles a rotated
+    /// texture is owed are already correct on the far side, and copying them there is what stops
+    /// them crossing twice.
+    #[must_use = "a refused copier leaves every owed rectangle crossing the link"]
+    pub fn attach_peer_copy(&mut self, peer: Box<dyn crate::target::swapchain::PeerCopy>) -> bool {
+        match &mut self.presentation {
+            Presentation::Supplied(supplied) => {
+                drop(supplied.attach_peer(peer));
+                true
+            }
+            Presentation::Surface(_) | Presentation::Offscreen(_) => false,
+        }
+    }
+
     /// Chooses which supplied texture the next frame is copied into.
     ///
     /// Answers whether the slot was taken. A caller that owns the buffers a display controller

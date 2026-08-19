@@ -491,3 +491,137 @@ fn a_supplied_renderer_cannot_rebuild_itself_after_a_loss() {
         failure.candidates
     );
 }
+
+/// A peer that copies between the supplied textures with the renderer's own device.
+///
+/// Standing in for a display card that can copy between its own buffers. What it does is what a
+/// real one does — the same rectangles, from the same buffer, to the same buffer — so a set repaired
+/// through it has to come out holding exactly what a set sent the whole debt holds. That is the
+/// property under test, and it needs no second device to state.
+#[derive(Debug)]
+struct SameDevice {
+    /// The device the copies are made on.
+    gpu: Arc<Gpu>,
+    /// The textures, in the order the renderer knows them by.
+    textures: Vec<wgpu::Texture>,
+}
+
+impl zgui_render_wgpu::target::swapchain::PeerCopy for SameDevice {
+    fn copy(&mut self, from: usize, to: usize, rects: &[zgui_geom::Rect<i32, Device>]) -> bool {
+        let mut encoder =
+            self.gpu
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("peer"),
+                });
+        for rect in rects {
+            let origin = wgpu::Origin3d {
+                x: rect.origin.x as u32,
+                y: rect.origin.y as u32,
+                z: 0,
+            };
+            let at = |texture| wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin,
+                aspect: wgpu::TextureAspect::All,
+            };
+            encoder.copy_texture_to_texture(
+                at(&self.textures[from]),
+                at(&self.textures[to]),
+                wgpu::Extent3d {
+                    width: rect.size.width as u32,
+                    height: rect.size.height as u32,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        self.gpu.queue().submit([encoder.finish()]);
+        true
+    }
+}
+
+/// A damage set holding one rectangle.
+fn damaged(x: i32, y: i32, width: i32, height: i32) -> DamageSet {
+    let mut set = DamageSet::new();
+    set.absorb(zgui_geom::Rect::new(
+        zgui_geom::Point::new(x, y),
+        Size::new(width, height),
+    ));
+    set
+}
+
+#[test]
+fn a_buffer_repaired_from_its_donor_holds_what_one_sent_the_whole_debt_holds() {
+    // The arithmetic in `Supplied::owed`, stated as the only thing that matters about it: a set
+    // that repairs and a set that does not must end up holding the same pixels. Every frame here
+    // damages part of the target and lands on a different buffer, so each buffer is owed something
+    // different by the time it comes round again — which is the case the split exists for, and the
+    // case that a wrong donor or a missed rectangle shows up in as a stale patch.
+    let _device = device_lock();
+    let graphics = SharedGraphics::new();
+    let Some(gpu) = open(&graphics) else {
+        return;
+    };
+    // The stand-in copies with this device, so its textures are copied *into* — which a real
+    // scanout buffer is not, because a real peer writes them through its own driver and not through
+    // wgpu at all. So the usage is the harness's need and nothing the renderer asks for.
+    let make = || -> Vec<wgpu::Texture> {
+        (0..3)
+            .map(|_| {
+                described(&gpu, |descriptor| {
+                    descriptor.usage |= wgpu::TextureUsages::COPY_DST;
+                })
+            })
+            .collect()
+    };
+    let (plain_textures, repaired_textures) = (make(), make());
+    let mut plain = graphics
+        .renderer_supplied(target(), plain_textures.clone())
+        .expect("a device is open and the textures agree about everything");
+    let mut repaired = graphics
+        .renderer_supplied(target(), repaired_textures.clone())
+        .expect("a device is open and the textures agree about everything");
+    assert!(
+        repaired.attach_peer_copy(Box::new(SameDevice {
+            gpu,
+            textures: repaired_textures.clone(),
+        })),
+        "a supplied presentation takes a copier"
+    );
+
+    // Colours that cannot be confused, over rectangles that overlap each other partly, so a buffer
+    // that missed one is a buffer holding the wrong colour somewhere.
+    let quarter = SIDE / 4;
+    let frames = [
+        (opaque(255, 0, 0), damaged(0, 0, SIDE, SIDE)),
+        (opaque(0, 255, 0), damaged(0, 0, quarter * 2, quarter * 2)),
+        (
+            opaque(0, 0, 255),
+            damaged(quarter, quarter, quarter * 2, quarter * 2),
+        ),
+        (
+            opaque(255, 255, 0),
+            damaged(quarter * 2, 0, quarter * 2, SIDE),
+        ),
+        (opaque(0, 255, 255), damaged(0, quarter * 2, SIDE, quarter)),
+        (opaque(255, 0, 255), damaged(quarter, 0, quarter, SIDE)),
+        (opaque(128, 128, 128), damaged(0, 0, quarter, quarter)),
+    ];
+    for (frame, (colour, damage)) in frames.iter().enumerate() {
+        let slot = frame % 3;
+        let scene = filled(*colour);
+        assert!(plain.present_into(slot));
+        let _ = plain.draw(&scene, damage);
+        assert!(repaired.present_into(slot));
+        let _ = repaired.draw(&scene, damage);
+    }
+
+    for slot in 0..3 {
+        assert_eq!(
+            read(&plain, &plain_textures[slot]).bytes(),
+            read(&repaired, &repaired_textures[slot]).bytes(),
+            "buffer {slot} came out different when its debt was repaired from a donor"
+        );
+    }
+}

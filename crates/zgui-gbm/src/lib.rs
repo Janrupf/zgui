@@ -36,7 +36,7 @@
 #![allow(unsafe_code)]
 
 use std::ffi::{CStr, c_char, c_int, c_void};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 
 /// The buffer is written by the graphics device rather than by the processor.
@@ -345,6 +345,15 @@ impl Allocation {
 }
 
 impl Allocation {
+    /// The descriptor this was already exported as, where it was.
+    ///
+    /// [`Allocation::descriptor`] takes `&mut self` because the first call exports and remembers.
+    /// A caller building a list out of several allocations cannot hold that borrow for each of
+    /// them at once, so it exports them in one pass and reads them back here in another.
+    pub fn exported(&self) -> Option<BorrowedFd<'_>> {
+        self.descriptor.as_ref().map(AsFd::as_fd)
+    }
+
     /// Reads the pixel at the top-left corner, through the allocation's own mapping.
     ///
     /// For a test that has to know whether pixels **arrived**, which is a different question from
