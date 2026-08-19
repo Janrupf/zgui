@@ -600,6 +600,27 @@ impl Scanout {
                 modifier: (modifier != gbm::IMPLICIT).then_some(modifier),
             });
         }
+        // **Off unless asked for, and the reason is measured rather than argued.** Filling a
+        // rotated buffer's debt from a neighbour halves what crosses the link — 566,800 pixels a
+        // frame become 277,610 — and still makes every frame *slower*, because the copy that ends
+        // the frame has to wait for it. The two devices write the same buffer, so the graphics
+        // device's first draw into it waits for the display device to finish: one draw, 5 to 11 ms,
+        // every frame, found at command 13 of 37 with a probe inside the backend's command replay.
+        //
+        // | scene | repaired | not |
+        // | ----- | -------- | --- |
+        // | 48 shadowed blocks | 53.9 frames a second | **58.9** |
+        // | 12 large blocks | 56.1 | **62.2**, at the timer's cap |
+        // | a page of glyphs | 19.2 ms a frame | **17.9 ms** |
+        // | a scrolling list | 62.2 | 62.2, unchanged |
+        //
+        // What would make it worth having is repairing the slot the **next** frame will draw into
+        // rather than this one's, so the display device's copy has a whole frame to finish in and
+        // nothing waits for it. That needs the rotation's next slot to reach the renderer, and it
+        // has to beat 58.9 to earn its place back.
+        if std::env::var_os("ZGUI_SCANOUT_REPAIR").is_none() {
+            return None;
+        }
         match zgui_scanout::egl::Egl::open(node, &described) {
             Ok(copier) => {
                 info!(
