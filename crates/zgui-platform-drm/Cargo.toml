@@ -43,6 +43,9 @@ zgui-gbm = { path = "../zgui-gbm", version = "0.1.0" }
 # Copying between the buffers a display scans out of, on the display's own device, so that a
 # rotated buffer's debt does not cross the link to the renderer a second time.
 zgui-scanout = { path = "../zgui-scanout", version = "0.1.0" }
+# The damage set a scanout buffer's debt is kept as. The same shape the renderer keeps its own
+# damage in, because it is the same question asked about a different buffer.
+zgui-bits = { path = "../zgui-bits", version = "0.1.0" }
 # The EGL display and GL context wgpu's GL backend already holds, reached through its hal so that
 # a buffer can be imported as the texture a frame is composed into. The counterpart to `ash` above,
 # for the machines that have no Vulkan — which are exactly the machines this path is for.
@@ -92,7 +95,6 @@ zgui-platform-headless = { path = "../zgui-platform-headless", version = "0.1.0"
 # display. The renderer contract, the scene it draws, the colour and the damage set are all things
 # a caller builds and states, and every one of them is at this layer or below, so the test reaches
 # across no seam the crate itself may not.
-zgui-bits = { path = "../zgui-bits", version = "0.1.0" }
 zgui-color = { path = "../zgui-color", version = "0.1.0" }
 zgui-render = { path = "../zgui-render", version = "0.1.0" }
 zgui-scene = { path = "../zgui-scene", version = "0.1.0" }

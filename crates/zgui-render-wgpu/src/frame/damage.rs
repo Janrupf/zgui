@@ -3,7 +3,7 @@
 use std::ops::Range;
 
 use zgui_bits::DamageSet;
-use zgui_geom::{Device, Rect};
+use zgui_geom::{Device, Rect, Size};
 
 /// The rectangles a frame redraws, in the composed target's device pixels.
 ///
@@ -243,4 +243,73 @@ mod tests {
         rows_of(&[Rect::new(Point::new(0, 5), Size::new(10, 0))], &mut bands);
         assert!(bands.is_empty(), "{bands:?}");
     }
+}
+
+/// How many pieces one rectangle may be cut into before the cutting is given up on.
+///
+/// A rectangle with a bite out of the middle is four pieces, and a second bite is up to sixteen. The
+/// point of the cut is to carry *less*, so a rectangle that has become a crowd of slivers is kept
+/// whole instead — the copy is then bigger and the bookkeeping is not.
+pub const PIECES: usize = 8;
+
+/// The parts of `rects` that no rectangle of `cut` covers.
+///
+/// Exact where it answers: every pixel of `rects` outside `cut` is inside some answer, which is what
+/// makes it safe to leave the rest to whoever writes `cut`. It over-answers rather than
+/// under-answers when a rectangle splinters — see [`PIECES`] — because carrying a pixel twice is
+/// waste and carrying it never is corruption.
+pub fn beyond(rects: &[Rect<i32, Device>], cut: &[Rect<i32, Device>]) -> Vec<Rect<i32, Device>> {
+    let mut answer = Vec::with_capacity(rects.len());
+    let mut pieces: Vec<Rect<i32, Device>> = Vec::with_capacity(PIECES);
+    let mut next: Vec<Rect<i32, Device>> = Vec::with_capacity(PIECES);
+    for rect in rects {
+        pieces.clear();
+        pieces.push(*rect);
+        for taken in cut {
+            if pieces.is_empty() {
+                break;
+            }
+            next.clear();
+            for piece in &pieces {
+                without(*piece, *taken, &mut next);
+            }
+            if next.len() > PIECES {
+                // Too many slivers to be worth it. The whole rectangle goes, which is what this did
+                // before any of it was cut.
+                pieces.clear();
+                pieces.push(*rect);
+                break;
+            }
+            core::mem::swap(&mut pieces, &mut next);
+        }
+        answer.extend(pieces.iter().copied());
+    }
+    answer
+}
+
+/// Appends the parts of `rect` that `cut` does not cover.
+///
+/// Up to four: above, below, and the left and right of what remains between them. A `cut` that
+/// misses appends the rectangle unchanged, and one that covers it appends nothing.
+fn without(rect: Rect<i32, Device>, cut: Rect<i32, Device>, into: &mut Vec<Rect<i32, Device>>) {
+    let Some(taken) = rect.intersection(cut) else {
+        into.push(rect);
+        return;
+    };
+    let (left, top) = (rect.origin.x, rect.origin.y);
+    let (right, bottom) = (left + rect.size.width, top + rect.size.height);
+    let (cut_left, cut_top) = (taken.origin.x, taken.origin.y);
+    let (cut_right, cut_bottom) = (cut_left + taken.size.width, cut_top + taken.size.height);
+    let mut piece = |x: i32, y: i32, width: i32, height: i32| {
+        if width > 0 && height > 0 {
+            into.push(Rect::new(
+                zgui_geom::Point::new(x, y),
+                Size::new(width, height),
+            ));
+        }
+    };
+    piece(left, top, right - left, cut_top - top);
+    piece(left, cut_bottom, right - left, bottom - cut_bottom);
+    piece(left, cut_top, cut_left - left, cut_bottom - cut_top);
+    piece(cut_right, cut_top, right - cut_right, cut_bottom - cut_top);
 }

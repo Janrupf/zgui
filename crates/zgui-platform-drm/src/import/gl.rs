@@ -622,9 +622,12 @@ fn client_wait(gpu: &Gpu) {
 
 /// Sends everything recorded so far to the kernel, and waits for none of it.
 ///
+/// `pub(crate)` because a display that composites its own frames has to flush before it asks its
+/// own device to read what this one wrote.
+///
 /// What [`Signal::Written`] needs: a buffer carries a fence for a frame the kernel has been given,
 /// and a command stream still sitting in this process reaches no buffer at all.
-fn flush(gpu: &Gpu) {
+pub(crate) fn flush(gpu: &Gpu) {
     // SAFETY: as `display_extensions`.
     let Some(adapter) = (unsafe { gpu.adapter().as_hal::<wgpu::hal::api::Gles>() }) else {
         return;

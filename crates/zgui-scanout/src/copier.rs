@@ -52,6 +52,27 @@ pub trait Copier {
     /// that from [`Copier::begin`], so there is nothing left here to refuse.
     fn finish(&mut self) -> Result<(), Error>;
 
+    /// Starts every one of `steps`, in order, as one piece of work.
+    ///
+    /// `(from, to, rects)` each, and they are ordered: a later step's pixels land on top of an
+    /// earlier step's. **This is not the same as calling [`Copier::begin`] several times** — that
+    /// waits for each before recording the next, and the wait is the caller's own thread. Building
+    /// a picture out of two copies is exactly the case that needs them issued together.
+    ///
+    /// The default asks for them one at a time, which is correct and slower. An implementation that
+    /// can record several under one take of the device should say so by overriding this.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Copier::begin`] returns, for the first step that is refused. Steps before it were
+    /// issued and steps after it were not.
+    fn begin_all(&mut self, steps: &[(usize, usize, &[Rect])]) -> Result<(), Error> {
+        for (from, to, rects) in steps {
+            self.begin(*from, *to, rects)?;
+        }
+        Ok(())
+    }
+
     /// Starts a copy and waits for it, for a caller with nothing to do in between.
     ///
     /// # Errors

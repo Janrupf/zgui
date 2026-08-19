@@ -190,6 +190,14 @@ impl DrmDisplay {
         self.scanout.borrow().textures()
     }
 
+    /// Whether this display builds its own frames out of what the renderer hands it.
+    ///
+    /// See [`Scanout::composites_its_own_frames`]: on the drawn shape what [`DrmDisplay::textures`]
+    /// answers is staging, and the display's own device puts a frame on the buffer it reads.
+    pub fn composites_its_own_frames(&self) -> bool {
+        self.scanout.borrow().composites_its_own_frames()
+    }
+
     /// Returns something that can copy between this display's buffers without the renderer.
     ///
     /// [`Scanout::peer_copy`]'s own answer, over this display's own node. Asked once, beside
@@ -269,11 +277,18 @@ impl DrmDisplay {
     /// Returns [`PlatformError::Backend`] when this display is on the copied shape, when the buffer
     /// was never taken back, when the graphics device refuses or does not finish the barrier, and
     /// when the driver refuses the mode or the flip.
-    pub fn present_drawn(&self, gpu: &Gpu) -> Result<bool, PlatformError> {
+    /// `wrote` is the rectangles the frame put in the staging buffer, which is what the display's
+    /// own device copies onto the scanout buffer. Nothing else knows them: the renderer chose them
+    /// from its damage, and a copy of what it did not write would move whatever the buffer held.
+    pub fn present_drawn(
+        &self,
+        gpu: &Gpu,
+        wrote: &[zgui_geom::Rect<i32, zgui_geom::Device>],
+    ) -> Result<bool, PlatformError> {
         let mut commit = self.commit.borrow_mut();
         self.scanout
             .borrow_mut()
-            .present_drawn(&self.device, &mut **commit, gpu)
+            .present_drawn(&self.device, &mut **commit, gpu, wrote)
     }
 }
 

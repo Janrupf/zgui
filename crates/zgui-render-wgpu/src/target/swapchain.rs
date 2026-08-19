@@ -20,6 +20,7 @@ use zgui_geom::{Device, Rect, Size};
 /// against, and a rectangle merged away wastes far more than that in pixels.
 const STALE: usize = zgui_bits::MAX_DAMAGE * 2;
 
+use crate::frame::damage::beyond;
 use crate::gpu::device::Gpu;
 use crate::gpu::formats::{self, Formats};
 use crate::gpu::surface::ConfiguredSurface;
@@ -331,75 +332,6 @@ fn area(rects: &[Rect<i32, Device>]) -> u64 {
         .sum()
 }
 
-/// How many pieces one rectangle may be cut into before the cutting is given up on.
-///
-/// A rectangle with a bite out of the middle is four pieces, and a second bite is up to sixteen. The
-/// point of the cut is to carry *less*, so a rectangle that has become a crowd of slivers is kept
-/// whole instead — the copy is then bigger and the bookkeeping is not.
-const PIECES: usize = 8;
-
-/// The parts of `rects` that no rectangle of `cut` covers.
-///
-/// Exact where it answers: every pixel of `rects` outside `cut` is inside some answer, which is what
-/// makes it safe to leave the rest to whoever writes `cut`. It over-answers rather than
-/// under-answers when a rectangle splinters — see [`PIECES`] — because carrying a pixel twice is
-/// waste and carrying it never is corruption.
-fn beyond(rects: &[Rect<i32, Device>], cut: &[Rect<i32, Device>]) -> Vec<Rect<i32, Device>> {
-    let mut answer = Vec::with_capacity(rects.len());
-    let mut pieces: Vec<Rect<i32, Device>> = Vec::with_capacity(PIECES);
-    let mut next: Vec<Rect<i32, Device>> = Vec::with_capacity(PIECES);
-    for rect in rects {
-        pieces.clear();
-        pieces.push(*rect);
-        for taken in cut {
-            if pieces.is_empty() {
-                break;
-            }
-            next.clear();
-            for piece in &pieces {
-                without(*piece, *taken, &mut next);
-            }
-            if next.len() > PIECES {
-                // Too many slivers to be worth it. The whole rectangle goes, which is what this did
-                // before any of it was cut.
-                pieces.clear();
-                pieces.push(*rect);
-                break;
-            }
-            core::mem::swap(&mut pieces, &mut next);
-        }
-        answer.extend(pieces.iter().copied());
-    }
-    answer
-}
-
-/// Appends the parts of `rect` that `cut` does not cover.
-///
-/// Up to four: above, below, and the left and right of what remains between them. A `cut` that
-/// misses appends the rectangle unchanged, and one that covers it appends nothing.
-fn without(rect: Rect<i32, Device>, cut: Rect<i32, Device>, into: &mut Vec<Rect<i32, Device>>) {
-    let Some(taken) = rect.intersection(cut) else {
-        into.push(rect);
-        return;
-    };
-    let (left, top) = (rect.origin.x, rect.origin.y);
-    let (right, bottom) = (left + rect.size.width, top + rect.size.height);
-    let (cut_left, cut_top) = (taken.origin.x, taken.origin.y);
-    let (cut_right, cut_bottom) = (cut_left + taken.size.width, cut_top + taken.size.height);
-    let mut piece = |x: i32, y: i32, width: i32, height: i32| {
-        if width > 0 && height > 0 {
-            into.push(Rect::new(
-                zgui_geom::Point::new(x, y),
-                Size::new(width, height),
-            ));
-        }
-    };
-    piece(left, top, right - left, cut_top - top);
-    piece(left, cut_bottom, right - left, bottom - cut_bottom);
-    piece(left, cut_top, cut_left - left, cut_bottom - cut_top);
-    piece(cut_right, cut_top, right - cut_right, cut_bottom - cut_top);
-}
-
 /// Textures a caller supplies and rotates between.
 ///
 /// What a display controller scans out of. The buffers belong to whatever drives the display, and
@@ -428,6 +360,13 @@ pub struct Supplied {
     /// capacity is its own: this set costs a scissor and a draw per rectangle inside one pass,
     /// where the renderer's costs a whole pass, so it can afford to be finer.
     stale: Vec<DamageSet<STALE>>,
+    /// Whether the caller reads each texture out and throws it away rather than rotating them.
+    ///
+    /// A display that composites its own frames hands out staging buffers: it copies exactly what
+    /// a frame wrote onto a buffer of its own and never reads one again. There is nothing for such
+    /// a texture to owe, and a debt would be pixels sent for nobody. Set by whoever supplied them,
+    /// because only it knows what it does with them afterwards.
+    consumed: bool,
     /// Which texture was written in full last, where one was.
     ///
     /// The donor a repair reads from. It is the freshest of the set by construction — it was
@@ -478,6 +417,10 @@ impl Supplied {
         );
         Some(Self {
             stale,
+            // Rotated until whoever supplied them says otherwise, which is the safe direction: a
+            // set wrongly called consumed shows a stale rectangle, and one wrongly called rotated
+            // sends pixels nobody needed.
+            consumed: false,
             textures,
             selected: 0,
             size,
@@ -646,6 +589,15 @@ impl Supplied {
     /// A peer that refuses leaves the whole debt to be sent, which is what happens with none
     /// attached.
     pub fn owed(&mut self, slot: usize, rects: &[Rect<i32, Device>]) -> Owed {
+        // **A set that is read out and thrown away every frame owes nothing.** Where the caller
+        // composites what it was handed onto a buffer of its own, this frame's rectangles are the
+        // whole of what it needs and a debt would be pixels sent across a link for nobody.
+        if self.consumed {
+            return Owed {
+                from_composed: rects.to_vec(),
+                repaired: 0,
+            };
+        }
         let whole = Rect::new(zgui_geom::Point::new(0, 0), self.size);
         for held in &mut self.stale {
             for rect in rects {
@@ -721,6 +673,14 @@ impl Supplied {
             from_composed: donor_owes,
             repaired: area(&carried),
         }
+    }
+
+    /// Records that the caller reads each texture out and throws it away.
+    ///
+    /// See [`Supplied::consumed`]. A caller that composites what it is handed onto a buffer of its
+    /// own says so here, and every frame then carries its own rectangles and no debt.
+    pub fn is_consumed(&mut self, consumed: bool) {
+        self.consumed = consumed;
     }
 
     /// Installs what can copy between these textures without the renderer's device.

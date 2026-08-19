@@ -80,6 +80,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
+use zgui_bits::DamageSet;
 use zgui_drm::buffer::{DumbBuffer, ImportedBuffer};
 use zgui_drm::commit::{Commit, Pipe, waits_for_a_fence};
 use zgui_drm::format::{Format, Modifier};
@@ -142,6 +143,34 @@ const IMPORTED: usize = 3;
 /// none — 619 984 against 620 920 — because the frames it adds to the union are ones an animation
 /// was going to touch anyway.
 const DRAWN: usize = 4;
+
+/// How many disjoint rectangles a scanout buffer's debt is tracked as.
+///
+/// A buffer is composited every [`DRAWN`] frames and owes what the frames in between drew, so the
+/// set has to hold that many frames' damage before it starts merging. Below that the rectangles
+/// merge, the merged ones cover the gaps between them, and the repair copies pixels no frame ever
+/// changed — which on the display's own device is bandwidth rather than correctness, but there is
+/// no reason to spend it.
+///
+/// **Not smaller as a way of making the arithmetic cheaper.** Eight was tried, and the sets then
+/// merged into a single region that the donor covered as well, so nothing was ever repaired and
+/// the picture kept pixels from four frames ago. What made the arithmetic cheap was removing it —
+/// see [`Scanout::composite`], which subtracts nothing at all.
+const STALE: usize = zgui_bits::MAX_DAMAGE * DRAWN;
+
+/// How many buffers a frame is staged through on its way to the display.
+///
+/// **The renderer draws into these and never into a scanout buffer.** With one set of buffers
+/// written by both devices, the graphics device's copy at the end of a frame waits for the display
+/// device's copy at the start of it — measured at 5 to 11 ms a frame, against a copy that costs
+/// 0.95. Splitting them means each buffer has one writer, and the only thing that waits is the
+/// display device reading what the graphics device wrote, which is a wait it can afford: it has
+/// nothing else to do until those pixels exist.
+///
+/// Two, and for the same reason there is more than one of anything else here: with one, the frame
+/// after next waits for the display device to finish reading it. Two gives a whole frame of slack,
+/// which is far more than the copy needs.
+const STAGING: usize = 2;
 
 /// How many bytes one pixel takes, in the readback and in the buffer alike.
 ///
@@ -284,6 +313,28 @@ enum Buffers {
         /// a fence, the frame goes to the driver with its own descriptor and nothing is ever
         /// outstanding.
         submitted: VecDeque<Outstanding>,
+        /// The buffers the renderer draws into, which are not the ones the display reads.
+        ///
+        /// [`STAGING`] says why they exist. A frame's damage is drawn here and the display's own
+        /// device copies it onto a scanout buffer, so each buffer has exactly one writer and the
+        /// two devices never contend for one.
+        staging: Vec<gl::Drawn>,
+        /// Which staging buffer the next frame is drawn into.
+        stage: usize,
+        /// What each scanout buffer lacks: the damage of every frame that landed elsewhere.
+        ///
+        /// The same bookkeeping the renderer used to keep about the buffers it drew into, moved to
+        /// the side that now writes them. A buffer is brought up to date from the newest one before
+        /// this frame's own damage goes on top.
+        stale: Vec<DamageSet<STALE>>,
+        /// What copies between these buffers on the display's own device, where one could be built.
+        composite: Option<zgui_scanout::egl::Egl>,
+        /// The buffer holding the newest complete picture, which every repair is copied from.
+        ///
+        /// The last one composited, and **not** whatever the rotation last put on the screen: a
+        /// frame the rotation drops was still composited, so it is still the newest picture and
+        /// still the right thing to copy from. Nothing until the first frame.
+        newest: Option<usize>,
     },
     /// Images the renderer draws into, which the display engine reads where they lie.
     Imported {
@@ -523,6 +574,15 @@ impl Scanout {
             .filter_map(|frame| Some(frame.watched.as_ref()?.descriptor()))
     }
 
+    /// Whether this display builds its own frames out of what the renderer hands it.
+    ///
+    /// True on the drawn shape, where [`Scanout::textures`] answers staging buffers and the
+    /// display's own device copies what a frame wrote onto the buffer it scans out of. False where
+    /// the renderer composes straight into the buffers the display reads, and those rotate.
+    pub fn composites_its_own_frames(&self) -> bool {
+        matches!(self.buffers, Buffers::DrawnGl { .. })
+    }
+
     /// Returns the images the renderer composes into, in the order they were made.
     ///
     /// What `SharedGraphics::renderer_supplied` is given, one texture out of each. Empty on the
@@ -544,8 +604,10 @@ impl Scanout {
     pub fn textures(&self) -> Vec<wgpu::Texture> {
         match &self.buffers {
             Buffers::Copied { .. } => Vec::new(),
-            Buffers::DrawnGl { buffers, .. } => {
-                buffers.iter().map(|held| held.texture().clone()).collect()
+            // The **staging** buffers, and not the ones the display reads. `STAGING` says why the
+            // renderer never draws into a scanout buffer.
+            Buffers::DrawnGl { staging, .. } => {
+                staging.iter().map(|held| held.texture().clone()).collect()
             }
             Buffers::Imported { buffers, .. } => {
                 buffers.iter().map(|held| held.texture().clone()).collect()
@@ -707,6 +769,17 @@ impl Scanout {
                 .acquire(slot)
                 .map_err(|refusal| PlatformError::Backend(refusal.to_string()))?;
         }
+        // **What the caller is told is not the scanout slot.** On the drawn shape the renderer
+        // composes into a staging buffer and the display's own device puts it on the scanout buffer
+        // the rotation just answered — see `STAGING`. The scanout slot stays here, where the
+        // rotation is already holding it, and what goes back is the buffer the renderer may write.
+        //
+        // They rotate for the reason the scanout buffers do: the display's device is still reading
+        // the one the last frame used, and a renderer handed it back would wait for that read.
+        if let Buffers::DrawnGl { stage, staging, .. } = &mut self.buffers {
+            *stage = (*stage + 1) % staging.len().max(1);
+            return Ok(Some(*stage));
+        }
         Ok(Some(slot))
     }
 
@@ -805,6 +878,92 @@ impl Scanout {
         Ok(true)
     }
 
+    /// Builds this frame's picture in the scanout buffer at `slot`, on the display's own device.
+    ///
+    /// Two copies. **The repair** brings the buffer up to date from the one holding the newest
+    /// picture — a buffer written every third frame lacks what the frames between drew, and that is
+    /// what it owes. **The apply** puts this frame's own damage on top, out of the staging buffer
+    /// the renderer drew into. Neither crosses the link: both buffers are the display's.
+    ///
+    /// Ordered by the kernel rather than by waiting. The staging buffer carries the graphics
+    /// device's fence, so reading it here waits for that drawing on the *display's* side, where
+    /// there is nothing else to do until those pixels exist. Nothing on this thread blocks.
+    ///
+    /// Does nothing where no device could be opened to composite with, which is a display that
+    /// never took this shape.
+    fn composite(&mut self, slot: usize, wrote: &[Rect<i32, DeviceSpace>]) {
+        let whole = Rect::new(
+            zgui_geom::Point::new(0, 0),
+            zgui_geom::Size::new(self.mode.width() as i32, self.mode.height() as i32),
+        );
+        let Buffers::DrawnGl {
+            stage,
+            stale,
+            composite,
+            newest,
+            ..
+        } = &mut self.buffers
+        else {
+            return;
+        };
+        let Some(copier) = composite.as_mut() else {
+            return;
+        };
+        let stage = *stage;
+
+        let spelled = |held: &DamageSet<STALE>| {
+            if held.is_full() {
+                vec![whole]
+            } else {
+                held.rects().to_vec()
+            }
+        };
+        // **The donor is the newest picture, so it lacks nothing.** What a buffer owes is measured
+        // against the last one composited, and that one is complete by construction: it was brought
+        // up to date and then had its own frame drawn on it. So the debt is copied whole, and there
+        // is no second set to subtract — which is what makes this arithmetic a list rather than a
+        // pass over every pair of rectangles.
+        let donor = newest.filter(|newest| *newest != slot);
+        *newest = Some(slot);
+        let debt = spelled(&stale[slot]);
+        stale[slot] = DamageSet::<STALE>::new();
+        for (index, held) in stale.iter_mut().enumerate() {
+            if index == slot {
+                continue;
+            }
+            for rect in wrote {
+                held.absorb(*rect);
+            }
+        }
+
+        // **One issue, one wait.** The repair goes first because this frame's damage lands on top
+        // of it, and both are given to the device together: asking for them one at a time would
+        // wait for the first before the second could be recorded, and that wait is on the frame
+        // loop's own thread.
+        let mut steps: Vec<(usize, usize, Vec<zgui_scanout::Rect>)> = Vec::with_capacity(2);
+        if let Some(donor) = donor
+            && !debt.is_empty()
+        {
+            steps.push((donor, slot, named(&debt)));
+        }
+        steps.push((DRAWN + stage, slot, named(wrote)));
+        let asked: Vec<(usize, usize, &[zgui_scanout::Rect])> = steps
+            .iter()
+            .map(|(from, to, rects)| (*from, *to, rects.as_slice()))
+            .collect();
+        if let Err(reason) = zgui_scanout::Copier::begin_all(copier, &asked) {
+            warn!("this frame could not be built on a scanout buffer: {reason}");
+        }
+        zgui_profile::latency::note_with("s.built", || {
+            format!(
+                "repair={} apply={} owed={}",
+                debt.len(),
+                wrote.len(),
+                stale[slot].len()
+            )
+        });
+    }
+
     /// Gives the image the renderer just drew into to the display engine, and shows it.
     ///
     /// The imported shape only. The frame is already in the buffer [`Scanout::acquire`] named, so
@@ -847,12 +1006,21 @@ impl Scanout {
         device: &Device,
         commit: &mut dyn Commit,
         gpu: &Gpu,
+        wrote: &[Rect<i32, DeviceSpace>],
     ) -> Result<bool, PlatformError> {
         if let Buffers::DrawnGl { signal, fenced, .. } = &self.buffers {
             let (signal, fenced) = (*signal, *fenced);
             let Some(slot) = self.rotation.drawn() else {
                 return Ok(false);
             };
+            // The renderer drew into a staging buffer and not into this one. Its commands have to
+            // reach the kernel before the display's own device is asked to read what it wrote, and
+            // then the picture is built here — see `Scanout::composite`. The fence taken below is
+            // the scanout buffer's own and covers both devices' writes to it, which is what makes
+            // one descriptor enough to hold the flip back.
+            zgui_profile::latency::mark("s.composite");
+            gl::flush(gpu);
+            self.composite(slot, wrote);
             // What stands in for the Vulkan barrier. The two descriptor tiers answer one here, and
             // where the commit takes a fence the frame goes to the driver at once with it.
             //
@@ -1309,6 +1477,10 @@ impl Scanout {
         let height = output.mode.height();
         let buffers =
             gl::create(gpu, &allocator, width, height, DRAWN).map_err(Copied::NoImages)?;
+        // Allocated the same way and on the same node, and registered as no framebuffer: nothing
+        // scans one out. `STAGING` says what they are for.
+        let staging =
+            gl::create(gpu, &allocator, width, height, STAGING).map_err(Copied::NoImages)?;
 
         // Whether the display takes an in-fence at all decides the top tier: a descriptor the
         // driver would export has nowhere to go on a display that cannot be handed one.
@@ -1389,6 +1561,17 @@ impl Scanout {
             "this display's frames are waited for"
         );
 
+        // The device that composites. It holds the scanout buffers first and the staging buffers
+        // after them, so a scanout slot is its own index and a staging one is `DRAWN + stage`.
+        let mut staging = staging;
+        let composite = composite_over(device, &buffers, &mut staging);
+        if composite.is_none() {
+            return Err(Copied::NoImages(Unsupported::Driver {
+                step: "opening the display's own device to composite frames onto its buffers",
+                reason: "the display's node would not give a copier".to_owned(),
+            }));
+        }
+
         Ok(Self::new(
             output,
             Buffers::DrawnGl {
@@ -1398,6 +1581,13 @@ impl Scanout {
                 signal,
                 fenced,
                 submitted: VecDeque::new(),
+                staging,
+                stage: 0,
+                // Nothing has been shown, so every buffer owes the whole picture. The first frame
+                // into each of them redraws it, which is what makes the debt true.
+                stale: vec![DamageSet::<STALE>::full(); DRAWN],
+                composite,
+                newest: None,
             },
         ))
     }
@@ -2174,4 +2364,70 @@ fn already_drawn(fence: BorrowedFd<'_>) -> bool {
         rustix::event::poll(&mut asked, Some(&rustix::event::Timespec::default())),
         Ok(0)
     )
+}
+
+/// Opens the device that composites a frame onto a scanout buffer, over the display's own node.
+///
+/// It is given the scanout buffers first and the staging buffers after them, so a scanout slot is
+/// its own index and a staging one is `DRAWN + stage`. One copier holding both is what lets a
+/// composite be two copies into the same buffer rather than two copiers arguing over a thread.
+///
+/// Answers nothing where the node gives no copier — no EGL, no import of a descriptor, no way to
+/// copy. The caller falls back to a shape that needs none.
+fn composite_over(
+    device: &Device,
+    scanout: &[gl::Drawn],
+    staging: &mut [gl::Drawn],
+) -> Option<zgui_scanout::egl::Egl> {
+    // Exported in one pass and read back in another: the export takes `&mut`, and a list of
+    // descriptors is several of those borrows at once.
+    for buffer in staging.iter_mut() {
+        if let Err(reason) = buffer.descriptor() {
+            warn!("a staging buffer would not export, so nothing can composite it: {reason}");
+            return None;
+        }
+    }
+    let mut described = Vec::with_capacity(scanout.len() + staging.len());
+    for buffer in scanout.iter().chain(staging.iter()) {
+        let modifier = buffer.modifier();
+        described.push(zgui_scanout::Buffer {
+            descriptor: buffer.exported()?,
+            width: buffer.texture().width(),
+            height: buffer.texture().height(),
+            fourcc: gl::FOURCC,
+            stride: buffer.stride(),
+            offset: buffer.offset(),
+            // Named only where the driver named one, as the allocation asked for it.
+            modifier: (modifier != gbm::IMPLICIT).then_some(modifier),
+        });
+    }
+    match zgui_scanout::egl::Egl::open(device.as_fd(), &described) {
+        Ok(copier) => {
+            info!(
+                target: "zgui::platform",
+                "this display composites its own frames: {copier:?}"
+            );
+            Some(copier)
+        }
+        Err(reason) => {
+            info!(
+                target: "zgui::platform",
+                "this display's own device cannot composite ({reason}), so it is driven another way"
+            );
+            None
+        }
+    }
+}
+
+/// The rectangles a copier is asked for, in its own shape.
+fn named(rects: &[Rect<i32, DeviceSpace>]) -> Vec<zgui_scanout::Rect> {
+    rects
+        .iter()
+        .map(|rect| zgui_scanout::Rect {
+            x: rect.origin.x,
+            y: rect.origin.y,
+            width: rect.size.width,
+            height: rect.size.height,
+        })
+        .collect()
 }

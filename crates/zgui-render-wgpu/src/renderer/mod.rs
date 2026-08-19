@@ -521,6 +521,22 @@ impl WgpuRenderer {
         }
     }
 
+    /// Records that whatever supplied the presented textures reads each one out and throws it away.
+    ///
+    /// Answers whether anything took it: only a supplied set has textures to say this about. See
+    /// [`Supplied::is_consumed`](crate::target::swapchain::Supplied::is_consumed) — a set that is
+    /// consumed carries one frame's rectangles and never a debt.
+    #[must_use = "a set that was not told is a set that keeps sending a debt nobody reads"]
+    pub fn presented_textures_are_consumed(&mut self, consumed: bool) -> bool {
+        match &mut self.presentation {
+            Presentation::Supplied(supplied) => {
+                supplied.is_consumed(consumed);
+                true
+            }
+            Presentation::Surface(_) | Presentation::Offscreen(_) => false,
+        }
+    }
+
     /// Reads back the persistent target frames are composed into.
     pub fn read_composed(&self) -> Pixels {
         readback::read(

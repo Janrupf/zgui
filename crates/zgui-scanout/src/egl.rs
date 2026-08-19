@@ -219,7 +219,7 @@ fn put_the_thread_back(egl: &Instance, mine: khronos_egl::Display, held: Held) {
     }
 }
 
-/// A graphics context on the display's own device, holding the buffers it copies between./// A graphics context on the display's own device, holding the buffers it copies between.
+/// A graphics context on the display's own device, holding the buffers it copies between.
 pub struct Egl {
     /// EGL, loaded.
     egl: Instance,
@@ -587,16 +587,38 @@ impl Egl {
 
 impl Copier for Egl {
     fn begin(&mut self, from: usize, to: usize, rects: &[Rect]) -> Result<(), Error> {
+        self.begin_all(&[(from, to, rects)])
+    }
+
+    /// Every step under one take of the device and behind one fence.
+    ///
+    /// Taking the thread's context and giving it back is the expensive part of an issue, and a
+    /// fence placed after the last step covers every step before it — the passes are recorded on
+    /// one context and run in the order they were given. So a picture built out of two copies costs
+    /// one issue rather than two, and the caller waits once or not at all.
+    fn begin_all(&mut self, steps: &[(usize, usize, &[Rect])]) -> Result<(), Error> {
         let held = self.textures.len();
-        if from >= held || to >= held {
-            return Err(Error::Driver {
-                step: "copying between two of this copier's buffers",
-                reason: format!("asked for {from} and {to} of {held}"),
-            });
+        for (from, to, _) in steps {
+            if *from >= held || *to >= held {
+                return Err(Error::Driver {
+                    step: "copying between two of this copier's buffers",
+                    reason: format!("asked for {from} and {to} of {held}"),
+                });
+            }
         }
-        // A copy left running would be waited for by the next `finish`, against a buffer the caller
-        // has since moved on from. Waiting here keeps the two in step.
-        self.finish()?;
+        // **The copy already running is let go of rather than waited for.** Waiting here would be
+        // waiting for the frame before this one — and on the arrangement this exists for, that copy
+        // is itself waiting for the graphics device to finish the frame it reads. One wait becomes
+        // two devices deep, on the frame loop's own thread.
+        //
+        // Letting go is sound because the fence placed below covers it too: the passes are recorded
+        // on one context and run in the order they were given, so a fence after the last of them
+        // has the earlier ones behind it. What a caller loses is the ability to wait for one
+        // specific copy, which no caller of this asks for.
+        self.let_go();
+        if steps.is_empty() {
+            return Ok(());
+        }
 
         // Taken for the whole of the issue and put back at the one exit below — everything between
         // runs on this copier's own context, and the *caller's* is current again by the time this
@@ -612,12 +634,18 @@ impl Copier for Egl {
                 reason: reason.to_string(),
             });
         }
-        let mut answered = self.pass(from, to, rects);
-        // The downgrade, and it happens once: see [`Ways`] for why no string could have said this
-        // in advance.
-        if answered != 0 && self.how.trust_direct && self.how.blit.is_some() {
-            self.how.trust_direct = false;
-            answered = self.pass(from, to, rects);
+        let mut answered = 0;
+        for (from, to, rects) in steps {
+            answered = self.pass(*from, *to, rects);
+            // The downgrade, and it happens once: see [`Ways`] for why no string could have said
+            // this in advance.
+            if answered != 0 && self.how.trust_direct && self.how.blit.is_some() {
+                self.how.trust_direct = false;
+                answered = self.pass(*from, *to, rects);
+            }
+            if answered != 0 {
+                break;
+            }
         }
         if answered == 0 {
             self.pending = self.started();
@@ -666,6 +694,24 @@ impl Copier for Egl {
 }
 
 impl Egl {
+    /// Gives up whatever a running copy left behind, without waiting for it.
+    ///
+    /// The sync object is destroyed and any descriptor is closed. Destroying a sync object does not
+    /// cancel the work behind it — the copy runs to its end either way — and what is given up is
+    /// only the ability to be told *when*, which the fence placed after the next issue answers for
+    /// both. See [`Copier::begin_all`](crate::Copier::begin_all) for why this is not a wait.
+    fn let_go(&mut self) {
+        match core::mem::replace(&mut self.pending, Pending::Nothing) {
+            Pending::Nothing => {}
+            Pending::Sync(sync) | Pending::Fence(sync, _) => match &self.told {
+                Told::Descriptor { destroy, .. } | Told::Fence { destroy, .. } => {
+                    let _ = destroy(self.display.as_ptr(), sync);
+                }
+                Told::Drain => {}
+            },
+        }
+    }
+
     /// Waits for one sync object and destroys it.
     fn wait_for(&self, sync: *mut c_void) {
         match &self.told {
