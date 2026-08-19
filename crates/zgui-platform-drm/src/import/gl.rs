@@ -92,10 +92,15 @@ pub const FOURCC: u32 = u32::from_le_bytes(*b"XR24");
 
 /// What this graphics device can be asked to do at the end of a frame.
 ///
-/// Three tiers, and the difference between them is **who waits**. The kernel waiting is worth more
+/// Four tiers, and the difference between them is **who waits**. The kernel waiting is worth more
 /// than the difference in code: a frame loop that blocks until the drawing is done has given up the
 /// overlap between one frame's drawing and the next frame's work, which on a machine with one
 /// processor is the whole of its slack.
+///
+/// **A wait moved to a thread is not a wait removed.** `eglClientWaitSyncKHR` holds the driver's
+/// own lock for as long as it waits, so the loop's next call into that driver blocks for the rest
+/// of it — measured at 13.42 ms against a 13.46 ms wait on the machine this was written for. That
+/// is why the two kernel tiers matter here and not only in principle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Signal {
     /// A sync object exported as a descriptor, handed to the commit as the plane's `IN_FENCE_FD`.
@@ -104,6 +109,22 @@ pub enum Signal {
     /// `EGL_ANDROID_native_fence_sync` on the graphics driver **and** a display that takes an
     /// in-fence, which means atomic KMS and a plane that publishes the property.
     Kernel,
+    /// The same descriptor, asked of the **buffer** rather than of the graphics driver.
+    ///
+    /// A dma-buf carries the fences of everything writing it, and hands them over as one sync file
+    /// — see [`zgui_drm::sync::writers_of`]. So this reaches the same place as [`Signal::Kernel`]
+    /// on a driver that exports nothing itself, which is every OpenGL driver without
+    /// `EGL_ANDROID_native_fence_sync`. It also covers a buffer more than one device writes, which
+    /// is what a display repairing its own scanout buffers has.
+    ///
+    /// **The commit need not take a fence for this to be worth having.** Where it does, the flip
+    /// carries the descriptor and the kernel waits. Where it does not, the frame loop parks on the
+    /// descriptor in its own wait, beside the card and the input devices, and learns there that the
+    /// frame is drawn. Neither blocks in the graphics driver, which is the whole point.
+    ///
+    /// Needs a kernel that serves the request, and the command stream has to be flushed before the
+    /// buffer is asked.
+    Written,
     /// A sync object waited on here, before the commit.
     ///
     /// `EGL_KHR_fence_sync`. The wait is this thread's, but it is a wait on a fence rather than a
@@ -145,6 +166,14 @@ impl Drawn {
     /// Returns a message where the driver would not export one.
     pub fn descriptor(&mut self) -> Result<BorrowedFd<'_>, String> {
         self.allocation.descriptor()
+    }
+
+    /// The descriptor this was already exported as, where it was.
+    ///
+    /// For a caller building a list out of several buffers at once — see
+    /// [`gbm::Allocation::exported`].
+    pub fn exported(&self) -> Option<BorrowedFd<'_>> {
+        self.allocation.exported()
     }
 
     /// How long a row is, in bytes.
@@ -226,21 +255,28 @@ pub fn create(
     Ok(drawn)
 }
 
-/// Which of the three ways this device can be asked to say a frame has finished.
+/// Which of the four ways this device can be asked to say a frame has finished.
 ///
 /// Asked once, when the buffers are made. The answer cannot change for the life of the device, and
 /// asking per frame would run the extension string through a string search every frame.
 ///
 /// `in_fence` is whether the display takes an in-fence descriptor at all. A driver that exports one
 /// and a display that cannot be handed one still leave this at [`Signal::Client`]: the descriptor
-/// would have nowhere to go.
-pub fn signal(gpu: &Gpu, in_fence: bool) -> Signal {
+/// would have nowhere to go. `from_buffers` is whether the kernel served
+/// [`zgui_drm::sync::writers_of`] on one of the buffers, asked once for the same reason.
+pub fn signal(gpu: &Gpu, in_fence: bool, from_buffers: bool) -> Signal {
     let Some(extensions) = display_extensions(gpu) else {
         return Signal::Finish;
     };
     let has = |name: &str| extensions.split(' ').any(|offered| offered == name);
     if in_fence && has("EGL_KHR_fence_sync") && has("EGL_ANDROID_native_fence_sync") {
         return Signal::Kernel;
+    }
+    // Before the client tier and after the driver's own, and **without asking about the in-fence**:
+    // a descriptor the commit cannot take is one the frame loop parks on instead, and either way
+    // nothing in this process waits for the card.
+    if from_buffers {
+        return Signal::Written;
     }
     if has("EGL_KHR_fence_sync") {
         return Signal::Client;
@@ -250,11 +286,19 @@ pub fn signal(gpu: &Gpu, in_fence: bool) -> Signal {
 
 /// Makes sure everything drawn so far has landed, and answers a descriptor the kernel can wait on.
 ///
-/// `Some` only under [`Signal::Kernel`]; the other two tiers have waited by the time this returns,
-/// and a caller commits without an in-fence.
-pub fn finish(gpu: &Gpu, how: Signal) -> Option<OwnedFd> {
+/// `buffer` is the descriptor of the buffer the frame was drawn into, which only [`Signal::Written`]
+/// reads. `Some` under the two kernel tiers; the other two have waited by the time this returns, and
+/// a caller commits without an in-fence.
+pub fn finish(gpu: &Gpu, how: Signal, buffer: Option<BorrowedFd<'_>>) -> Option<OwnedFd> {
     match how {
         Signal::Kernel => native_fence(gpu),
+        // The flush is what puts the frame's fence on the buffer. Asking an unflushed buffer
+        // answers a descriptor for the frame before this one, and the display would then read a
+        // half-drawn picture — so the two belong together and neither is the caller's to order.
+        Signal::Written => {
+            flush(gpu);
+            written_fence(buffer?)
+        }
         Signal::Client => {
             client_wait(gpu);
             None
@@ -266,91 +310,22 @@ pub fn finish(gpu: &Gpu, how: Signal) -> Option<OwnedFd> {
     }
 }
 
-/// A fence a frame left in the command stream, and what it takes to wait for it.
+/// The descriptor for everything still writing `buffer`, where the kernel answers one.
 ///
-/// The point of it is that it can leave this thread. An EGL sync object belongs to its **display**
-/// rather than to a context, and `EGL_KHR_fence_sync` states that any thread may wait on one — so
-/// the wait, which is the whole time the card takes to draw a frame, happens somewhere that is not
-/// the frame loop. [`crate::scanout::waiter`] is what does the waiting.
-#[derive(Debug)]
-pub struct Placed {
-    /// The display the sync object belongs to.
-    display: *mut c_void,
-    /// The sync object itself.
-    sync: *mut c_void,
-    /// `eglClientWaitSyncKHR`, read once here so the waiting thread reaches no EGL loader.
-    wait: ClientWait,
-    /// `eglDestroySyncKHR`, for the same reason.
-    destroy: DestroySync,
-}
-
-// SAFETY: an EGLDisplay is process-wide and an EGLSyncKHR belongs to that display rather than to
-// the context it was created under, so waiting on one needs no context current on the thread that
-// waits. `place` hands the only handle over and keeps no copy, so nothing else touches it. The two
-// function pointers are EGL's own and are valid for as long as the library is loaded, which is the
-// life of the process.
-unsafe impl Send for Placed {}
-
-impl Placed {
-    /// Blocks until the frame has been drawn, and releases the sync object.
-    ///
-    /// Taken by value: a fence is waited for once, and the object is gone afterwards.
-    pub fn settle(self) {
-        (self.wait)(self.display, self.sync, 0, FOREVER);
-        (self.destroy)(self.display, self.sync);
+/// A refusal is reported and the frame goes up without a fence, which is what every machine did
+/// before this tier existed. Nothing here can wait instead: the tier was chosen because the driver
+/// offers no sync object to wait on.
+fn written_fence(buffer: BorrowedFd<'_>) -> Option<OwnedFd> {
+    match zgui_drm::sync::writers_of(buffer) {
+        Ok(fence) => fence,
+        Err(refusal) => {
+            tracing::warn!(
+                "this frame's buffer would not say what is still writing it, so the display is \
+                 told to show it at once: {refusal}"
+            );
+            None
+        }
     }
-}
-
-/// Places a fence in the command stream and answers what waits for it.
-///
-/// The two tiers that wait on this side are the ones with anything to place. Under
-/// [`Signal::Kernel`] the descriptor goes to the commit and the kernel waits, and under
-/// [`Signal::Finish`] there is no sync object at all — both answer nothing, and their callers wait
-/// the way they always did.
-///
-/// The command stream is **flushed** before this returns. A fence still sitting in this thread's
-/// buffer is one nothing has begun to signal, and a thread waiting on it would wait until something
-/// else happened to flush.
-pub fn place(gpu: &Gpu, how: Signal) -> Option<Placed> {
-    if how != Signal::Client {
-        return None;
-    }
-    // SAFETY: as `display_extensions`.
-    let adapter = unsafe { gpu.adapter().as_hal::<wgpu::hal::api::Gles>() }?;
-    let context = adapter.adapter_context();
-    let egl = context.egl_instance()?;
-    let display = *context.raw_display()?;
-    // SAFETY: the three names are EGL's own and each signature is the one in `eglext.h`.
-    let (create, wait, destroy) = unsafe {
-        (
-            core::mem::transmute::<extern "system" fn(), CreateSync>(
-                egl.get_proc_address("eglCreateSyncKHR")?,
-            ),
-            core::mem::transmute::<extern "system" fn(), ClientWait>(
-                egl.get_proc_address("eglClientWaitSyncKHR")?,
-            ),
-            core::mem::transmute::<extern "system" fn(), DestroySync>(
-                egl.get_proc_address("eglDestroySyncKHR")?,
-            ),
-        )
-    };
-
-    let gl = context.lock();
-    let sync = create(display.as_ptr(), SYNC_FENCE, [khronos_egl::NONE].as_ptr());
-    if sync.is_null() {
-        return None;
-    }
-    // SAFETY: the context is current for as long as `gl` lives.
-    unsafe {
-        use glow::HasContext as _;
-        gl.flush();
-    }
-    Some(Placed {
-        display: display.as_ptr(),
-        sync,
-        wait,
-        destroy,
-    })
 }
 
 /// The extensions the graphics device's EGL display offers, where it has one.
@@ -643,6 +618,23 @@ fn client_wait(gpu: &Gpu) {
     }
     wait(display.as_ptr(), sync, 0, FOREVER);
     destroy(display.as_ptr(), sync);
+}
+
+/// Sends everything recorded so far to the kernel, and waits for none of it.
+///
+/// What [`Signal::Written`] needs: a buffer carries a fence for a frame the kernel has been given,
+/// and a command stream still sitting in this process reaches no buffer at all.
+fn flush(gpu: &Gpu) {
+    // SAFETY: as `display_extensions`.
+    let Some(adapter) = (unsafe { gpu.adapter().as_hal::<wgpu::hal::api::Gles>() }) else {
+        return;
+    };
+    let gl = adapter.adapter_context().lock();
+    // SAFETY: the context is current for as long as `gl` lives.
+    unsafe {
+        use glow::HasContext as _;
+        gl.flush();
+    }
 }
 
 /// Drains the device, which is correct everywhere and costs the most.
