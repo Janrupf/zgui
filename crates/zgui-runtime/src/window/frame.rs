@@ -983,8 +983,10 @@ impl Window {
             .broad_restyle
             .then_some(())
             .and(self.style_pool.as_deref());
+        zgui_profile::latency::mark("f.cascade");
         let pass = self.engine.restyle(&mut document, pool);
         self.broad_restyle = false;
+        zgui_profile::latency::mark("f.patch");
         let mut layout = self.layout.borrow_mut();
         if pass.styled > 0 && layout.root().is_some() {
             zgui_layout::boxtree::patch::restyle(&mut layout, &document, &pass.styled_nodes());

@@ -96,6 +96,14 @@ fn exact(name: &str) -> Option<(&'static str, Category)> {
         "f.flush" => ("Flush reactive updates", Events),
         "f.commands" => ("Carry out commands", Events),
         "f.restyle" => ("Recompute styles", Style),
+        "f.cascade" => ("Match and cascade", Style),
+        "f.patch" => ("Patch the box tree with the new styles", Style),
+        // Inside the cascade. `st.traverse` is very nearly the whole of it: the rule-set flush and
+        // the shared context together are under five microseconds.
+        "st.flush" => ("Flush the rule set", Style),
+        "st.context" => ("Build the style context", Style),
+        "st.traverse" => ("Traverse and restyle", Style),
+        "st.finish" => ("Collect what was restyled", Style),
         "f.restyled" => ("Publish running animations", Style),
         "f.brushes" => ("Update text brushes", Style),
         "f.boxes" => ("Build the box tree", Layout),
@@ -171,6 +179,7 @@ fn family(name: &str) -> Category {
     let prefix = name.split('.').next().unwrap_or(name);
     match prefix {
         "f" | "evt" | "wait" | "req" => Category::Events,
+        "st" => Category::Style,
         "why" | "b" | "t" => Category::Style,
         "d" | "w" => Category::Layout,
         "p" => Category::Paint,
