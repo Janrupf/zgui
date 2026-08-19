@@ -258,6 +258,32 @@ fn what_one_call_into_this_driver_costs(gpu: &Gpu) {
             scissor * 1e6,
         );
     }
+    what_one_system_call_costs();
+}
+
+/// What a bare system call costs here, which is what a per-draw kernel submission is measured
+/// against.
+///
+/// A draw on this machine reaches the kernel — adding draws adds system time and almost no user
+/// time — so the question is whether the cost is the crossing itself or the work the kernel does
+/// once it is there. A call that fails immediately answers the first half: whatever a draw costs
+/// beyond this is the kernel validating buffers and queueing a command stream, not the boundary.
+fn what_one_system_call_costs() {
+    use std::time::Instant;
+    const ROUNDS: u32 = 20_000;
+    // A read of nothing from a descriptor that refuses it: a full crossing into the kernel and
+    // back, with nothing done in between.
+    let Ok(node) = std::fs::File::open("/dev/null") else {
+        eprintln!("drawn_gl: no /dev/null, so no system call was timed");
+        return;
+    };
+    let mut nothing = [0_u8; 0];
+    let at = Instant::now();
+    for _ in 0..ROUNDS {
+        let _ = rustix::io::read(std::os::fd::AsFd::as_fd(&node), &mut nothing);
+    }
+    let each = at.elapsed().as_secs_f64() / f64::from(ROUNDS);
+    eprintln!("drawn_gl: one system call — {:.3} us", each * 1e6);
 }
 
 /// Composes a frame of one colour into `texture`, through the device the renderer draws on.
