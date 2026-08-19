@@ -17,7 +17,7 @@
 use std::os::fd::{AsFd, BorrowedFd};
 use std::time::Instant;
 
-use zgui_scanout::{Buffer, Copier, Rect, Signalled, egl::Egl};
+use zgui_scanout::{Buffer, Copier, Rect, egl::Egl};
 
 /// `XR24`: eight bits a channel, blue first, the fourth byte ignored.
 const FOURCC: u32 = u32::from_le_bytes(*b"XR24");
@@ -127,15 +127,10 @@ fn node() -> Option<(std::fs::File, String)> {
         .find_map(|path| std::fs::File::open(&path).ok().map(|file| (file, path)))
 }
 
-/// Waits for a copy that answered a descriptor, so a read afterwards sees finished pixels.
-fn settle(signalled: Signalled) {
-    if let Some(fence) = signalled.descriptor() {
-        let mut polled = [rustix::event::PollFd::new(
-            &fence,
-            rustix::event::PollFlags::IN,
-        )];
-        let _ = rustix::event::poll(&mut polled, None);
-    }
+/// Seconds of processor this process has spent, for telling device work from driver work.
+fn processor_time() -> f64 {
+    let held = rustix::time::clock_gettime(rustix::time::ClockId::ProcessCPUTime);
+    held.tv_sec as f64 + held.tv_nsec as f64 / 1e9
 }
 
 #[test]
@@ -232,16 +227,8 @@ fn a_copy_between_two_scanout_buffers_moves_the_pixels_and_says_what_it_cost() {
     );
 
     let rects = damage();
-    let signalled = copier.copy(0, 1, &rects).expect("the copy was refused");
-    println!(
-        "{path}: {} rectangles, {}",
-        rects.len(),
-        match &signalled {
-            Signalled::Descriptor(_) => "answered a descriptor the kernel can wait on",
-            Signalled::Waited => "waited here, because this driver exports no fence",
-        }
-    );
-    settle(signalled);
+    copier.copy(0, 1, &rects).expect("the copy was refused");
+    println!("{path}: {} rectangles, {copier:?}", rects.len());
 
     // Did they arrive? Exactly the rectangles asked for, and nothing beyond them.
     let area: usize = rects
@@ -260,15 +247,19 @@ fn a_copy_between_two_scanout_buffers_moves_the_pixels_and_says_what_it_cost() {
         area * 4,
     );
 
-    // What did it cost? The first round carries whatever the driver does once.
+    // What did it cost, and **who spent it**? Wall time beside processor time: a copy the device
+    // makes leaves the processor idle and the two diverge, and one the driver makes on the
+    // processor has them equal. On a machine with one core that is the difference between work
+    // that can overlap a frame and work that cannot.
     for round in 0..4 {
-        let started = Instant::now();
-        settle(copier.copy(0, 1, &rects).expect("the copy was refused"));
-        let took = started.elapsed();
+        let (wall, cpu) = (Instant::now(), processor_time());
+        copier.copy(0, 1, &rects).expect("the copy was refused");
+        let (took, spent) = (wall.elapsed(), processor_time() - cpu);
         let bytes = area * 4;
         println!(
-            "  round {round}: {:>6.2} ms for {:>5.2} MiB = {:>7.1} MB/s",
+            "  round {round}: {:>6.2} ms wall, {:>6.2} ms processor, {:>5.2} MiB = {:>7.1} MB/s",
             took.as_secs_f64() * 1e3,
+            spent * 1e3,
             bytes as f64 / (1024.0 * 1024.0),
             bytes as f64 / took.as_secs_f64() / 1e6,
         );

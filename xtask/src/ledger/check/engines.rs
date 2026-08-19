@@ -110,10 +110,10 @@ const LEDGER: &[(&str, &[&str])] = &[
     // eventfd its wake channel is, the `poll` its frame loop parks in, the monotonic clock an
     // input report is stamped against, and the `fstat` its tests read an exported descriptor with.
     // `zgui-platform-wayland` is on it for a clock as well: the one the compositor stamps its
-    // presentation feedback in. `zgui-scanout` names it in its tests alone: the hardware one maps a
-    // buffer through its descriptor to fill it and to count what a copy moved, because `gbm_bo_map`
-    // faults inside the driver it is written against, and it waits on the descriptor a copy answers
-    // with. A row is read by its first match, so all of them share one.
+    // presentation feedback in. `zgui-scanout` names it for the `poll` a copier's own thread waits
+    // on a fence descriptor with, and in its hardware test to map a buffer through its descriptor —
+    // `gbm_bo_map` faults inside the driver it is written against. A row is read by its first
+    // match, so all of them share one.
     (
         "rustix",
         &[

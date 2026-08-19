@@ -46,5 +46,5 @@ mod error;
 pub mod egl;
 
 pub use crate::buffer::{Buffer, Rect};
-pub use crate::copier::{Copier, Signalled};
+pub use crate::copier::Copier;
 pub use crate::error::Error;

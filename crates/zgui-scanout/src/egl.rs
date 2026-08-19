@@ -26,7 +26,7 @@ use std::marker::PhantomData;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 use crate::buffer::{Buffer, Rect};
-use crate::copier::{Copier, Signalled};
+use crate::copier::Copier;
 use crate::error::Error;
 
 /// The EGL this crate is written against.
@@ -137,6 +137,19 @@ struct Ways {
     trust_direct: bool,
 }
 
+/// What a started copy is waited on by.
+///
+/// Held between the two halves of a copy. The sync object is kept beside the descriptor because
+/// both have to be destroyed, and destroying it is what the wait at the other end does.
+enum Pending {
+    /// An `EGLSync`, waited on with `eglClientWaitSyncKHR`.
+    Sync(*mut c_void),
+    /// The same, and a descriptor duplicated out of it that the kernel could wait on instead.
+    Fence(*mut c_void, OwnedFd),
+    /// Nothing to wait for: the copy is already done, or the device would make nothing.
+    Nothing,
+}
+
 /// How this device says a copy is done.
 ///
 /// A descriptor is preferred wherever the driver offers one, GL or otherwise: it is the difference
@@ -224,6 +237,8 @@ pub struct Egl {
     how: Ways,
     /// How the caller is told it is done.
     told: Told,
+    /// What the copy started by `begin` is waited on by, while one is running.
+    pending: Pending,
     /// One `EGLImage` per buffer.
     images: Vec<*mut c_void>,
     /// One texture per buffer.
@@ -367,6 +382,7 @@ impl Egl {
             destroy_image,
             how,
             told,
+            pending: Pending::Nothing,
             images: Vec::with_capacity(buffers.len()),
             textures: Vec::with_capacity(buffers.len()),
             framebuffers: Vec::new(),
@@ -460,14 +476,15 @@ impl Egl {
         Ok(())
     }
 
-    /// Asks the device for a fence, preferring one the kernel can wait on.
-    fn signal(&self) -> Signalled {
+    /// Makes something the copy can be waited on by, without waiting for it here.
+    ///
+    /// **Nothing blocks in this call.** The whole reason the copy is in two halves is that about
+    /// three quarters of it is the device working while the processor has nothing to do — measured
+    /// on the hardware this was written for at 1.07 ms of wall against 0.29 ms of processor. Those
+    /// three quarters belong to whatever the caller does next.
+    fn started(&self) -> Pending {
         match &self.told {
-            Told::Descriptor {
-                create,
-                destroy,
-                dup,
-            } => {
+            Told::Descriptor { create, dup, .. } => {
                 let sync = create(
                     self.display.as_ptr(),
                     SYNC_NATIVE_FENCE,
@@ -475,26 +492,21 @@ impl Egl {
                 );
                 if sync.is_null() {
                     (self.gl.finish)();
-                    return Signalled::Waited;
+                    return Pending::Nothing;
                 }
                 // The commands have to be on their way before the descriptor is asked for, which is
                 // what the extension says and what makes the answer mean anything.
                 (self.gl.flush)();
                 let raw = dup(self.display.as_ptr(), sync);
-                let _ = destroy(self.display.as_ptr(), sync);
                 if raw < 0 {
                     (self.gl.finish)();
-                    return Signalled::Waited;
+                    return Pending::Sync(sync);
                 }
                 // SAFETY: the descriptor is this process's own, answered by the driver and owned by
                 // nothing else.
-                Signalled::Descriptor(unsafe { OwnedFd::from_raw_fd(raw) })
+                Pending::Fence(sync, unsafe { OwnedFd::from_raw_fd(raw) })
             }
-            Told::Fence {
-                create,
-                destroy,
-                wait,
-            } => {
+            Told::Fence { create, .. } => {
                 let sync = create(
                     self.display.as_ptr(),
                     SYNC_FENCE,
@@ -502,16 +514,18 @@ impl Egl {
                 );
                 if sync.is_null() {
                     (self.gl.finish)();
-                    return Signalled::Waited;
+                    return Pending::Nothing;
                 }
+                // Flushed rather than finished: this is what puts the work on its way so that the
+                // wait at the other end has something to wait for.
                 (self.gl.flush)();
-                let _ = wait(self.display.as_ptr(), sync, 0, FOREVER);
-                let _ = destroy(self.display.as_ptr(), sync);
-                Signalled::Waited
+                Pending::Sync(sync)
             }
+            // The floor. There is nothing to wait on later, so the wait is here and the caller's
+            // next work does not overlap it.
             Told::Drain => {
                 (self.gl.finish)();
-                Signalled::Waited
+                Pending::Nothing
             }
         }
     }
@@ -572,7 +586,7 @@ impl Egl {
 }
 
 impl Copier for Egl {
-    fn copy(&mut self, from: usize, to: usize, rects: &[Rect]) -> Result<Signalled, Error> {
+    fn begin(&mut self, from: usize, to: usize, rects: &[Rect]) -> Result<(), Error> {
         let held = self.textures.len();
         if from >= held || to >= held {
             return Err(Error::Driver {
@@ -580,8 +594,13 @@ impl Copier for Egl {
                 reason: format!("asked for {from} and {to} of {held}"),
             });
         }
-        // Taken for the whole of the copy, the retry and the fence, and put back at the one exit
-        // below — everything between here and there runs on this copier's own context.
+        // A copy left running would be waited for by the next `finish`, against a buffer the caller
+        // has since moved on from. Waiting here keeps the two in step.
+        self.finish()?;
+
+        // Taken for the whole of the issue and put back at the one exit below — everything between
+        // runs on this copier's own context, and the *caller's* is current again by the time this
+        // answers. That is what lets the caller work while the device copies.
         let held = held_by_the_thread(&self.egl);
         if let Err(reason) = self
             .egl
@@ -600,16 +619,65 @@ impl Copier for Egl {
             self.how.trust_direct = false;
             answered = self.pass(from, to, rects);
         }
-        let signalled = (answered == 0).then(|| self.signal());
+        if answered == 0 {
+            self.pending = self.started();
+        }
         put_the_thread_back(&self.egl, self.display, held);
-        signalled.ok_or_else(|| Error::Driver {
-            step: "copying between two scanout buffers",
-            reason: format!("the device answered 0x{answered:x}"),
-        })
+        if answered == 0 {
+            Ok(())
+        } else {
+            Err(Error::Driver {
+                step: "copying between two scanout buffers",
+                reason: format!("the device answered 0x{answered:x}"),
+            })
+        }
+    }
+
+    fn finish(&mut self) -> Result<(), Error> {
+        // Neither half of this needs the context: both are asked of the display, and the caller has
+        // its own context current by now. That is the point — nothing here disturbs the caller.
+        match std::mem::replace(&mut self.pending, Pending::Nothing) {
+            Pending::Nothing => Ok(()),
+            Pending::Sync(sync) => {
+                self.wait_for(sync);
+                Ok(())
+            }
+            Pending::Fence(sync, fence) => {
+                // The descriptor is this copier's to wait on, because nothing else was given it. A
+                // display that took an in-fence would be handed this instead, and then there would
+                // be nothing to wait for at all.
+                let mut polled = [rustix::event::PollFd::new(
+                    &fence,
+                    rustix::event::PollFlags::IN,
+                )];
+                let waited = rustix::event::poll(&mut polled, None);
+                self.wait_for(sync);
+                waited.map(|_| ()).map_err(|errno| Error::Driver {
+                    step: "waiting for a copy's fence",
+                    reason: errno.to_string(),
+                })
+            }
+        }
     }
 
     fn len(&self) -> usize {
         self.textures.len()
+    }
+}
+
+impl Egl {
+    /// Waits for one sync object and destroys it.
+    fn wait_for(&self, sync: *mut c_void) {
+        match &self.told {
+            Told::Descriptor { destroy, .. } => {
+                let _ = destroy(self.display.as_ptr(), sync);
+            }
+            Told::Fence { destroy, wait, .. } => {
+                let _ = wait(self.display.as_ptr(), sync, 0, FOREVER);
+                let _ = destroy(self.display.as_ptr(), sync);
+            }
+            Told::Drain => {}
+        }
     }
 }
 

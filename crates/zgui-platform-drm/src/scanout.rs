@@ -2015,10 +2015,10 @@ mod tests {
 
 /// A [`zgui_scanout`] copier, as the renderer asks for one.
 ///
-/// The wait lives here. `PeerCopy` promises the copy has finished when it answers, because the copy
-/// that follows writes over part of the same region — so a device that hands back a descriptor is
-/// waited on here rather than passed along. A driver that exports no descriptor has already waited
-/// inside the copy.
+/// The copy is made and waited for in one call, which is the measured answer rather than the
+/// obvious one. A copier on a thread of its own is *slower* here — the machine has one core and the
+/// driver composing the frame holds it — and splitting the copy so that the frame is composed inside
+/// it hides a millisecond and changes no frame rate.
 #[derive(Debug)]
 struct Peer(zgui_scanout::egl::Egl);
 
@@ -2034,19 +2034,7 @@ impl PeerCopy for Peer {
             })
             .collect();
         match zgui_scanout::Copier::copy(&mut self.0, from, to, &rects) {
-            Ok(signalled) => {
-                if let Some(fence) = signalled.descriptor() {
-                    let mut polled = [rustix::event::PollFd::new(
-                        &fence,
-                        rustix::event::PollFlags::IN,
-                    )];
-                    if let Err(errno) = rustix::event::poll(&mut polled, None) {
-                        warn!("a repair's fence could not be waited for: {errno}");
-                        return false;
-                    }
-                }
-                true
-            }
+            Ok(()) => true,
             Err(reason) => {
                 warn!("the buffers could not be repaired from each other: {reason}");
                 false

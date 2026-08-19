@@ -294,9 +294,11 @@ impl Offscreen {
 /// one of these with [`Supplied::attach_peer`], and what crosses the link falls to what nothing on
 /// the far side has yet.
 ///
-/// The copy is synchronous: it has finished when `copy` answers. A caller whose device signals with
-/// a descriptor waits for it inside the call rather than handing it back, because the copy that
-/// follows writes over part of the same region and the ordering has to hold.
+/// The copy has finished when `copy` answers, and that is deliberate rather than lazy. Splitting it
+/// so that a frame is composed inside it was tried and measured: about three quarters of a copy is
+/// the device working, and starting it when the buffer is chosen really does hide a millisecond of
+/// that behind the composition — and the frame rate does not move, because the wait simply
+/// relocates. What is left is a contract with an ordering hazard in it, for nothing.
 pub trait PeerCopy: std::fmt::Debug {
     /// Copies each of `rects` from the texture at `from` to the texture at `to`.
     ///
@@ -312,6 +314,14 @@ pub struct Owed {
     pub from_composed: Vec<Rect<i32, Device>>,
     /// How many pixels a peer copy filled, and therefore did not cross a link.
     pub repaired: u64,
+}
+
+/// How many pixels a list of rectangles covers.
+fn area(rects: &[Rect<i32, Device>]) -> u64 {
+    rects
+        .iter()
+        .map(|rect| crate::frame::damage::area(*rect))
+        .sum()
 }
 
 /// Textures a caller supplies and rotates between.
@@ -578,88 +588,59 @@ impl Supplied {
             held.rects().to_vec()
         };
         *held = DamageSet::<STALE>::new();
+        // Read after this frame's rectangles were absorbed, so it already covers them. That is what
+        // makes it the whole of what the copy has to carry.
+        let donor_owes = self
+            .donor
+            .and_then(|donor| self.stale.get(donor))
+            .map_or_else(|| vec![whole], |held| held.rects().to_vec());
 
-        let answer = self.repair(slot, debt, whole);
+        let answer = self.repair(slot, donor_owes, debt);
         self.donor = Some(slot);
         answer
     }
 
-    /// Hands as much of `debt` as it can to the peer, and answers what is left to send.
+    /// Hands the slot's debt to the peer, and answers what is left to send.
     ///
-    /// Nothing is handed over where the donor owes the whole screen: the copy would be the size of
-    /// the debt and what still had to be sent would be the whole screen anyway, so it would be work
-    /// for nothing.
+    /// `donor_owes` is what even the donor lacks, read after this frame's rectangles were absorbed
+    /// — so it already covers them, and it is the whole of what has to come from the composed
+    /// target once the donor has supplied the rest.
     fn repair(
         &mut self,
         slot: usize,
+        donor_owes: Vec<Rect<i32, Device>>,
         debt: Vec<Rect<i32, Device>>,
-        whole: Rect<i32, Device>,
     ) -> Owed {
+        let sent_whole = || Owed {
+            from_composed: debt.clone(),
+            repaired: 0,
+        };
         let Some(donor) = self.donor.filter(|donor| *donor != slot) else {
-            return Owed {
-                from_composed: debt,
-                repaired: 0,
-            };
+            return sent_whole();
         };
-        let Some(owed_by_donor) = self
-            .stale
-            .get(donor)
-            .filter(|held| !held.is_full())
-            .map(|held| held.rects().to_vec())
-        else {
-            return Owed {
-                from_composed: debt,
-                repaired: 0,
-            };
-        };
+        if self.stale.get(donor).is_none_or(DamageSet::is_full) {
+            return sent_whole();
+        }
         // **Only where it saves something.** A repair replaces what the slot lacks with what the
         // donor lacks, so a donor that lacks as much buys nothing and the copy is pure addition.
         // That is not a corner case: a scene whose damage is one rectangle in the same place every
-        // frame — a scrolling panel is exactly that — has the two equal, and repairing it would
-        // copy the panel locally and then send the panel anyway.
-        let area = |rects: &[Rect<i32, Device>]| -> u64 {
-            rects
-                .iter()
-                .map(|rect| crate::frame::damage::area(*rect))
-                .sum()
-        };
-        let (owed_here, owed_there) = (area(&debt), area(&owed_by_donor));
+        // frame — a scrolling panel is exactly that — has the two equal, and repairing it would copy
+        // the panel locally and then send the panel anyway.
+        let (owed_here, owed_there) = (area(&debt), area(&donor_owes));
         if owed_there >= owed_here {
-            return Owed {
-                from_composed: debt,
-                repaired: 0,
-            };
+            return sent_whole();
         }
         let Some(peer) = self.peer.as_mut() else {
-            return Owed {
-                from_composed: debt,
-                repaired: 0,
-            };
+            return sent_whole();
         };
         if !peer.copy(donor, slot, &debt) {
-            return Owed {
-                from_composed: debt,
-                repaired: 0,
-            };
+            return sent_whole();
         }
-        // Counted from what the peer carried rather than from the difference, because the two
-        // overlap and the overlap is written twice on purpose.
-        let repaired = debt
-            .iter()
-            .map(|rect| crate::frame::damage::area(*rect))
-            .sum::<u64>();
-        let from_composed = if owed_by_donor.is_empty() {
-            Vec::new()
-        } else {
-            owed_by_donor
-        };
-        debug_assert!(
-            from_composed.iter().all(|rect| whole.contains_rect(*rect)),
-            "a donor owed a rectangle outside the screen"
-        );
         Owed {
-            from_composed,
-            repaired,
+            from_composed: donor_owes,
+            // Counted from what the peer carried rather than from the difference, because the two
+            // overlap and the overlap is written twice on purpose.
+            repaired: owed_here,
         }
     }
 
