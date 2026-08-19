@@ -333,7 +333,16 @@ impl Renderer for WgpuRenderer {
             repaired_px = owed.repaired;
             presented_px = scissors.iter().map(|rect| damage::area(*rect)).sum();
             presented_rects = scissors.len();
-            draw_calls += self.blit(&mut encoder, view, formats.blit_undoes_srgb(), &scissors);
+            if ablated() {
+                // The copy is the largest single term in a frame wherever these textures are on
+                // the far side of a link, and what it costs can only be read off by taking it
+                // away: every other term moves when it is reordered, and this one does not move at
+                // all. What reaches the screen while it is off is nonsense, which is the price of
+                // the answer and the reason it is asked for by name.
+                zgui_profile::latency::note("r.ablated", "the copy to the presented texture");
+            } else {
+                draw_calls += self.blit(&mut encoder, view, formats.blit_undoes_srgb(), &scissors);
+            }
         }
         // Marked either side, because the two halves are different work and only one of them is
         // this crate's. `finish` walks the recorded commands and validates them into a command
@@ -497,6 +506,16 @@ impl Renderer for WgpuRenderer {
             None => own,
         }
     }
+}
+
+/// Whether the copy that ends a frame is being left out, for a measurement that needs it gone.
+///
+/// `ZGUI_ABLATE_BLIT`, read once. A frame drawn this way is not a frame anybody should look at —
+/// the presented texture keeps whatever it last held — and the number it answers is what the copy
+/// is worth: on the 32-bit target, 7.2 ms of a 22.4 ms frame.
+fn ablated() -> bool {
+    static ASKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ASKED.get_or_init(|| std::env::var_os("ZGUI_ABLATE_BLIT").is_some())
 }
 
 impl WgpuRenderer {

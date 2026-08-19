@@ -48,6 +48,10 @@ const BOXES: usize = 6;
 /// Sixteen milliseconds, which is the refresh interval of nearly every display this would run on.
 /// Asking for frames faster than the screen can show them measures the loop rather than the
 /// picture.
+///
+/// `ZGUI_TTY_MOTION_FRAME` overrides it in milliseconds. A scene that finishes inside this interval
+/// reports the interval rather than its own cost, which is what happens the moment something
+/// expensive is ablated to find out what it was worth.
 const FRAME: Duration = Duration::from_millis(16);
 
 /// How often the frame rate is written to the log.
@@ -80,7 +84,11 @@ fn Motion() -> impl IntoView {
     let mut drawn = 0_u64;
     let mut worst = Duration::ZERO;
     let mut last = started;
-    let _timer = RwSignal::new_local(set_interval(FRAME, move || {
+    let interval = std::env::var("ZGUI_TTY_MOTION_FRAME")
+        .ok()
+        .and_then(|held| held.parse::<u64>().ok())
+        .map_or(FRAME, Duration::from_millis);
+    let _timer = RwSignal::new_local(set_interval(interval, move || {
         let now = Instant::now();
         let took = now.saturating_duration_since(last);
         last = now;
