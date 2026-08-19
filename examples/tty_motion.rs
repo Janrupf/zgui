@@ -32,6 +32,12 @@
 //! It needs a free virtual terminal, for the reasons `tty.rs` sets out at length — the keyboard is
 //! grabbed and there is no `SIGINT`. `Escape` quits. `ZGUI_TTY_MOTION_BOXES` overrides how many
 //! blocks there are, for finding where a machine's ceiling is.
+//!
+//! `ZGUI_TTY_MOTION_TICK` adds a second timer, in milliseconds, that draws nothing and reports how
+//! late it ran. It is what says whether the loop answers anything besides its own frames, which the
+//! frame rate cannot. One thing it has already answered: a timer here fires **at the start of a
+//! frame** — `set_interval` says so — so it never runs more often than frames do, whatever the loop
+//! does with the rest of one.
 
 use std::time::{Duration, Instant};
 
@@ -88,6 +94,49 @@ fn Motion() -> impl IntoView {
         .ok()
         .and_then(|held| held.parse::<u64>().ok())
         .map_or(FRAME, Duration::from_millis);
+    // A second timer that draws nothing, to measure what the loop owes everything that is not the
+    // frame. `ZGUI_TTY_MOTION_TICK` sets its interval in milliseconds and nothing installs it by
+    // default, because on one processor an idle timer is not free.
+    //
+    // It is the whole point of a frame loop that blocks in one place: this fires while the card
+    // draws, or it does not fire at all until the frame is over. The frame rate says nothing about
+    // which, because a frame that is late for its own reasons is late either way.
+    if let Some(every) = std::env::var("ZGUI_TTY_MOTION_TICK")
+        .ok()
+        .and_then(|held| held.parse::<u64>().ok())
+        .map(Duration::from_millis)
+    {
+        let mut last = Instant::now();
+        let mut window = last;
+        let mut fired = 0_u64;
+        let mut late = Duration::ZERO;
+        let mut worst = Duration::ZERO;
+        let ticking = set_interval(every, move || {
+            let now = Instant::now();
+            let behind = now.saturating_duration_since(last).saturating_sub(every);
+            last = now;
+            fired += 1;
+            late += behind;
+            worst = worst.max(behind);
+            if now.saturating_duration_since(window) >= REPORT {
+                tracing::info!(
+                    fired,
+                    asked_ms = every.as_millis() as u64,
+                    mean_late_ms = format!("{:.2}", late.as_secs_f64() * 1000.0 / fired as f64),
+                    worst_late_ms = format!("{:.1}", worst.as_secs_f64() * 1000.0),
+                    "tick"
+                );
+                window = now;
+                fired = 0;
+                late = Duration::ZERO;
+                worst = Duration::ZERO;
+            }
+        });
+        // The reactive arena owns it, as it owns the frame timer below. What is bound here is a
+        // receipt for that, which is why nothing is done with it.
+        let _ticking = RwSignal::new_local(ticking);
+    }
+
     let _timer = RwSignal::new_local(set_interval(interval, move || {
         let now = Instant::now();
         let took = now.saturating_duration_since(last);
