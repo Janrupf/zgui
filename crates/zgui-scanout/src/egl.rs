@@ -164,7 +164,49 @@ enum Told {
     Drain,
 }
 
-/// A graphics context on the display's own device, holding the buffers it copies between.
+/// What had the thread's EGL context before a copy took it.
+///
+/// Its display, its context and its two surfaces. [`None`] where nothing was current.
+type Held = Option<(
+    khronos_egl::Display,
+    Option<khronos_egl::Context>,
+    Option<khronos_egl::Surface>,
+    Option<khronos_egl::Surface>,
+)>;
+
+/// Reads what currently has the thread, so that a copy can put it back.
+///
+/// **EGL binds a context to a thread, and the caller has one of its own.** A renderer on the same
+/// thread has made its context current since this copier opened, so a copy issued without taking
+/// the thread would run against *that* context: the entry points are dispatch stubs that act on
+/// whatever is current, and the texture names would name whatever the other context has under those
+/// numbers. It is silent when it happens — every call is accepted and the pixels never move.
+fn held_by_the_thread(egl: &Instance) -> Held {
+    egl.get_current_display().map(|display| {
+        (
+            display,
+            egl.get_current_context(),
+            egl.get_current_surface(khronos_egl::DRAW),
+            egl.get_current_surface(khronos_egl::READ),
+        )
+    })
+}
+
+/// Puts back what [`held_by_the_thread`] read, or releases the thread where nothing had it.
+fn put_the_thread_back(egl: &Instance, mine: khronos_egl::Display, held: Held) {
+    match held {
+        Some((display, context, draw, read)) => {
+            let _ = egl.make_current(display, draw, read, context);
+        }
+        // The thread is the caller's rather than this copier's, so it is left holding nothing
+        // rather than left holding this.
+        None => {
+            let _ = egl.make_current(mine, None, None, None);
+        }
+    }
+}
+
+/// A graphics context on the display's own device, holding the buffers it copies between./// A graphics context on the display's own device, holding the buffers it copies between.
 pub struct Egl {
     /// EGL, loaded.
     egl: Instance,
@@ -419,7 +461,7 @@ impl Egl {
     }
 
     /// Asks the device for a fence, preferring one the kernel can wait on.
-    fn signal(&mut self) -> Signalled {
+    fn signal(&self) -> Signalled {
         match &self.told {
             Told::Descriptor {
                 create,
@@ -538,6 +580,19 @@ impl Copier for Egl {
                 reason: format!("asked for {from} and {to} of {held}"),
             });
         }
+        // Taken for the whole of the copy, the retry and the fence, and put back at the one exit
+        // below — everything between here and there runs on this copier's own context.
+        let held = held_by_the_thread(&self.egl);
+        if let Err(reason) = self
+            .egl
+            .make_current(self.display, None, None, Some(self.context))
+        {
+            // Nothing was changed, so there is nothing to put back.
+            return Err(Error::Driver {
+                step: "making this copier's context current for a copy",
+                reason: reason.to_string(),
+            });
+        }
         let mut answered = self.pass(from, to, rects);
         // The downgrade, and it happens once: see [`Ways`] for why no string could have said this
         // in advance.
@@ -545,13 +600,12 @@ impl Copier for Egl {
             self.how.trust_direct = false;
             answered = self.pass(from, to, rects);
         }
-        if answered != 0 {
-            return Err(Error::Driver {
-                step: "copying between two scanout buffers",
-                reason: format!("the device answered 0x{answered:x}"),
-            });
-        }
-        Ok(self.signal())
+        let signalled = (answered == 0).then(|| self.signal());
+        put_the_thread_back(&self.egl, self.display, held);
+        signalled.ok_or_else(|| Error::Driver {
+            step: "copying between two scanout buffers",
+            reason: format!("the device answered 0x{answered:x}"),
+        })
     }
 
     fn len(&self) -> usize {

@@ -212,6 +212,25 @@ fn a_copy_between_two_scanout_buffers_moves_the_pixels_and_says_what_it_cost() {
     };
     assert_eq!(copier.len(), 2, "both buffers were taken");
 
+    // **A second copier, holding the same buffers the other way round.** EGL binds a context to a
+    // thread, and opening this one takes the thread from the copier above — which is exactly what a
+    // renderer on the same thread does, because it has a context of its own and makes it current to
+    // draw. A copier that does not take the thread back issues its copy against whatever context
+    // holds it, and every call is accepted.
+    //
+    // The reversal is what makes that visible. Two contexts share no objects, but each names its
+    // textures 1 and 2 in the order it imported them — so a copy misdirected into a context holding
+    // the *same* buffers in the same order does the right thing by luck, and the test passes with
+    // the bug in place. Reversed, the same names mean the opposite buffers, and a misdirected copy
+    // writes the wrong one.
+    let mut reversed = buffers.clone();
+    reversed.reverse();
+    let displacing = Egl::open(card.as_fd(), &reversed);
+    assert!(
+        displacing.is_ok(),
+        "a second copier over the same buffers was refused"
+    );
+
     let rects = damage();
     let signalled = copier.copy(0, 1, &rects).expect("the copy was refused");
     println!(
