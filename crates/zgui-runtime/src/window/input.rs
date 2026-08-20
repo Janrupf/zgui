@@ -166,6 +166,14 @@ impl Window {
             SurfaceEvent::Pointer { event, .. } => Some(event.id),
             _ => None,
         };
+        if let SurfaceEvent::Pointer { action, event, .. } = event {
+            zgui_profile::latency::note_with("i.pointer", || {
+                format!(
+                    "{action:?} id={:?} at=({:.1},{:.1})",
+                    event.id, event.position.x.0, event.position.y.0
+                )
+            });
+        }
         let Some((kind, payload)) = event.to_dispatch() else {
             return;
         };
