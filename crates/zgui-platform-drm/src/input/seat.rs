@@ -1741,12 +1741,22 @@ fn untaken(held: &[&Path], arrived: &[PathBuf]) -> Vec<PathBuf> {
 /// behaviour, and this tree's own answer to which device is a keyboard.
 fn chosen() -> Stream {
     match zgui_libinput::Context::open() {
-        Ok(context) => {
+        Ok(mut context) => {
             info!(
                 target: "zgui::platform",
                 "input is read through libinput, so a pointer accelerates and a touchpad behaves \
                  like one"
             );
+            // What libinput itself says, on its own log. Off by default because it is written to
+            // standard error, which on a console is the screen the frame loop is about to
+            // overwrite. `ZGUI_LIBINPUT_LOG=info` is what answers "did the kernel throw our events
+            // away" — a queue this loop overran is reported as `SYN_DROPPED` at that level and at
+            // no other, and what libinput does about one is ask the device where it is *now*.
+            match std::env::var("ZGUI_LIBINPUT_LOG").as_deref() {
+                Ok("debug") => context.loudness(zgui_libinput::Loudness::Debug),
+                Ok("info") => context.loudness(zgui_libinput::Loudness::Information),
+                _ => {}
+            }
             Stream::Libinput(Box::new(Through::new(context)))
         }
         Err(error) => {
