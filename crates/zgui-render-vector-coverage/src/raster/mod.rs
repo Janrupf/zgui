@@ -19,6 +19,47 @@ use zgui_render_wgpu::frame::vector::VectorSource;
 use zgui_scene::{PaintTable, ScenePassPlan, VectorItem};
 
 use crate::raster::geometry::Segment;
+
+/// Which of one item's two outlines a cache entry is for.
+///
+/// A path can be both filled and stroked, and the two flatten to different outlines — a stroke is
+/// expanded into the boundary of the stroked region before it is flattened at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct OutlineKey {
+    /// The item, by the identity the scene keeps stable across frames for exactly this.
+    id: zgui_scene::VectorId,
+    /// Whether this is the stroke's outline rather than the fill's.
+    stroked: bool,
+}
+
+/// One item's outline as it was last flattened, and everything that decided those numbers.
+#[derive(Debug)]
+///
+/// Held so that a frame which draws the same geometry in the same place does not flatten it again.
+/// **That is most frames on which anything vector is on the screen**: a menu opening over a drawing
+/// damages the drawing, so the drawing is emitted and collected again for every frame of the
+/// menu's animation, and every one of those flattens outlines identical to the last.
+struct Flattened {
+    /// The path it came from, compared by allocation.
+    ///
+    /// A `VectorId` is stable across frames for one item, which is what makes it a key; it says
+    /// nothing about whether the geometry under it changed. The path is behind an `Arc` and what
+    /// is behind one never changes, so two handles onto one allocation are two handles onto the
+    /// same outline.
+    path: Arc<kurbo::BezPath>,
+    /// The matrix the segments below already carry.
+    ///
+    /// Flattening subdivides in the path's own space and transforms the points it produces, so a
+    /// different placement is different numbers. Keeping the placement rather than re-transforming
+    /// cached points makes a hit exactly the bytes the old code produced.
+    placement: [f64; 6],
+    /// The stroke style it was expanded under, for the stroked outline.
+    stroke: Option<kurbo::Stroke>,
+    /// The outline itself.
+    segments: Vec<Segment>,
+    /// The frame this was last wanted on, so an item that has gone stops being held.
+    used: u64,
+}
 use crate::raster::instance::{Item, Run};
 use crate::raster::pipeline::{Pipelines, Storage};
 use crate::raster::scratch::Scratch;
@@ -56,6 +97,10 @@ pub struct CoverageRaster {
     bands: Vec<[u32; 4]>,
     /// One item's flattened outline, before it is cut into bands. Held to allocate nothing per item.
     flattened: Vec<Segment>,
+    /// What each item's outline flattened to last time it was asked for. See [`Flattened`].
+    outlines_of: rustc_hash::FxHashMap<OutlineKey, Flattened>,
+    /// Which frame this is, for deciding what in the cache above is still wanted.
+    frames: u64,
     /// How many segments each band of the item being cut holds, then where each band's start. Held
     /// for the same reason.
     tally: Vec<u32>,
@@ -140,6 +185,8 @@ impl CoverageRaster {
             outlines: Vec::new(),
             bands: Vec::new(),
             flattened: Vec::new(),
+            outlines_of: rustc_hash::FxHashMap::default(),
+            frames: 0,
             tally: Vec::new(),
             runs: Vec::new(),
             items: Vec::new(),
@@ -253,8 +300,14 @@ impl CoverageRaster {
             ];
             let mut painted = false;
             if let Some(color) = flat(item.fill, frame.paints) {
-                self.flattened.clear();
-                geometry::flatten(&item.path, placement, &mut self.flattened);
+                let _reused = Self::outline_of(
+                    &mut self.flattened,
+                    &mut self.outlines_of,
+                    item,
+                    None,
+                    placement,
+                    self.frames,
+                );
                 let band = self.band(bounds);
                 self.items.push(Item {
                     bounds,
@@ -273,8 +326,14 @@ impl CoverageRaster {
             if let Some(stroke) = item.stroke.as_ref()
                 && let Some(color) = flat(Some(stroke.paint), frame.paints)
             {
-                self.flattened.clear();
-                geometry::flatten_stroke(&item.path, &stroke.style, placement, &mut self.flattened);
+                let _reused = Self::outline_of(
+                    &mut self.flattened,
+                    &mut self.outlines_of,
+                    item,
+                    Some(&stroke.style),
+                    placement,
+                    self.frames,
+                );
                 let band = self.band(bounds);
                 self.items.push(Item {
                     bounds,
@@ -293,6 +352,80 @@ impl CoverageRaster {
             }
         }
         (first, self.items.len() as u32 - first)
+    }
+
+    /// Fills `into` with one item's outline, flattening it only where the last one still holds.
+    ///
+    /// A hit is exactly the bytes flattening would have produced, because what is held is the outline
+    /// *after* the placement was applied rather than before it — so this changes what a frame costs and
+    /// never what it draws.
+    ///
+    /// Three things have to match for the held outline to still stand: the path's allocation, the
+    /// placement it was transformed by, and, for a stroke, the style it was expanded under. Anything
+    /// else is a different outline and is flattened again.
+    fn outline_of(
+        into: &mut Vec<Segment>,
+        held: &mut rustc_hash::FxHashMap<OutlineKey, Flattened>,
+        item: &VectorItem,
+        stroke: Option<&kurbo::Stroke>,
+        placement: Affine,
+        frame: u64,
+    ) -> bool {
+        let key = OutlineKey {
+            id: item.id,
+            stroked: stroke.is_some(),
+        };
+        let placement = placement.as_coeffs();
+        into.clear();
+        if let Some(entry) = held.get_mut(&key)
+            && Arc::ptr_eq(&entry.path, &item.path)
+            && entry.placement == placement
+            && entry.stroke.as_ref() == stroke
+        {
+            entry.used = frame;
+            into.extend_from_slice(&entry.segments);
+            return true;
+        }
+        match stroke {
+            Some(style) => {
+                geometry::flatten_stroke(&item.path, style, Affine::new(placement), into);
+            }
+            None => geometry::flatten(&item.path, Affine::new(placement), into),
+        }
+        held.insert(
+            key,
+            Flattened {
+                path: Arc::clone(&item.path),
+                placement,
+                stroke: stroke.cloned(),
+                segments: into.clone(),
+                used: frame,
+            },
+        );
+        false
+    }
+
+    /// Drops the outlines nothing has asked for in a while.
+    ///
+    /// Not "anything this frame did not draw": a frame that repaints one corner collects only what
+    /// is in that corner, and evicting the rest would flatten the whole screen again on the next
+    /// frame that touches it. So an outline is held for a couple of seconds' worth of frames after
+    /// it was last wanted, which keeps a scrolled-away drawing warm and lets a closed document go.
+    ///
+    /// Swept occasionally rather than every frame, because the sweep walks the whole map and the
+    /// thing being paid for here is per-frame work.
+    fn forget_stale_outlines(&mut self) {
+        /// How many frames an outline is held after the last frame that wanted it.
+        const KEPT_FOR: u64 = 120;
+        /// How often the sweep runs.
+        const EVERY: u64 = 64;
+
+        if self.frames % EVERY != 0 {
+            return;
+        }
+        let frames = self.frames;
+        self.outlines_of
+            .retain(|_, held| frames.saturating_sub(held.used) < KEPT_FOR);
     }
 
     /// Cuts the flattened outline into horizontal bands over `bounds`.
@@ -522,6 +655,8 @@ impl VectorRaster for CoverageRaster {
     }
 
     fn prepare(&mut self, frame: &mut VectorFrame<'_>) -> Result<(), VectorError> {
+        self.frames = self.frames.wrapping_add(1);
+        self.forget_stale_outlines();
         self.last = Rasterised::default();
         self.outlines.clear();
         self.bands.clear();
@@ -704,4 +839,125 @@ fn affine_of(matrix: &Matrix4) -> Affine {
         f64::from(column[3][0]),
         f64::from(column[3][1]),
     ])
+}
+
+#[cfg(test)]
+mod outlines {
+    //! What the held outlines answer, which needs no device: flattening is arithmetic.
+
+    use std::sync::Arc;
+
+    use kurbo::{Affine, BezPath, Stroke};
+    use zgui_scene::{PaintRef, VectorId, VectorItem};
+
+    use super::{CoverageRaster, Flattened, OutlineKey, Segment};
+
+    /// A path with curves in it, so that flattening has something to do.
+    fn item(id: u32) -> VectorItem {
+        let mut path = BezPath::new();
+        path.move_to((0.0, 0.0));
+        path.curve_to((10.0, 0.0), (20.0, 10.0), (20.0, 20.0));
+        path.curve_to((20.0, 30.0), (10.0, 40.0), (0.0, 40.0));
+        path.close_path();
+        VectorItem::filled(VectorId(id), Arc::new(path), PaintRef::NONE)
+    }
+
+    /// Flattens one item and says whether the held outline was reused.
+    fn flatten(
+        into: &mut Vec<Segment>,
+        held: &mut rustc_hash::FxHashMap<OutlineKey, Flattened>,
+        item: &VectorItem,
+        stroke: Option<&Stroke>,
+        placement: Affine,
+    ) -> bool {
+        CoverageRaster::outline_of(into, held, item, stroke, placement, 1)
+    }
+
+    #[test]
+    fn the_same_geometry_in_the_same_place_is_flattened_once() {
+        let mut held = rustc_hash::FxHashMap::default();
+        let mut into = Vec::new();
+        let item = item(1);
+
+        assert!(
+            !flatten(&mut into, &mut held, &item, None, Affine::IDENTITY),
+            "nothing was held yet"
+        );
+        let first = into.clone();
+        assert!(!first.is_empty(), "the path flattened to something");
+
+        assert!(
+            flatten(&mut into, &mut held, &item, None, Affine::IDENTITY),
+            "the second ask is the same path in the same place"
+        );
+        assert_eq!(
+            into, first,
+            "a hit answers exactly what flattening answered, so a frame draws the same picture"
+        );
+    }
+
+    #[test]
+    fn a_different_placement_is_a_different_outline() {
+        let mut held = rustc_hash::FxHashMap::default();
+        let mut into = Vec::new();
+        let item = item(1);
+
+        flatten(&mut into, &mut held, &item, None, Affine::IDENTITY);
+        assert!(
+            !flatten(
+                &mut into,
+                &mut held,
+                &item,
+                None,
+                Affine::translate((3.0, 0.0))
+            ),
+            "the segments carry the placement, so moving the item is different numbers"
+        );
+    }
+
+    #[test]
+    fn a_stroke_is_held_apart_from_the_fill_and_follows_its_style() {
+        let mut held = rustc_hash::FxHashMap::default();
+        let mut into = Vec::new();
+        let item = item(1);
+        let thin = Stroke::new(1.0);
+        let thick = Stroke::new(4.0);
+
+        flatten(&mut into, &mut held, &item, None, Affine::IDENTITY);
+        assert!(
+            !flatten(&mut into, &mut held, &item, Some(&thin), Affine::IDENTITY),
+            "a stroke's outline is not the fill's, so the fill's entry does not answer for it"
+        );
+        assert!(flatten(
+            &mut into,
+            &mut held,
+            &item,
+            Some(&thin),
+            Affine::IDENTITY
+        ));
+        assert!(
+            !flatten(&mut into, &mut held, &item, Some(&thick), Affine::IDENTITY),
+            "a wider stroke expands to a different outline"
+        );
+        assert!(
+            flatten(&mut into, &mut held, &item, None, Affine::IDENTITY),
+            "and the fill it was held beside is still there"
+        );
+    }
+
+    #[test]
+    fn geometry_that_changed_under_one_identity_is_flattened_again() {
+        // A `VectorId` is stable for an item across frames and says nothing about whether what it
+        // draws changed. What is behind an `Arc` never changes, so the allocation is the answer.
+        let mut held = rustc_hash::FxHashMap::default();
+        let mut into = Vec::new();
+        let first = item(1);
+        let second = item(1);
+
+        flatten(&mut into, &mut held, &first, None, Affine::IDENTITY);
+        assert!(
+            !flatten(&mut into, &mut held, &second, None, Affine::IDENTITY),
+            "the same identity over a different path is a different outline"
+        );
+    }
 }
