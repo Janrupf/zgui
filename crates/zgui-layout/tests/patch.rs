@@ -130,9 +130,13 @@ fn writing_the_characters_a_box_already_holds_is_not_a_rewrite() {
 
 /// Text that disappears is a box that disappears, and the patch says so instead of guessing.
 ///
-/// An empty text node generates no box at all, so servicing this in place would mean creating and
-/// destroying boxes — and with them anonymous wrapping, inline splitting and paint order. The
-/// answer that keeps the tree honest is to refuse, and the caller rebuilds.
+/// An empty text node generates no box at all, so servicing this *in place* would mean creating and
+/// destroying boxes — and with them anonymous wrapping, inline splitting and paint order. So the
+/// rewrite refuses, and [`retext`] — which has nowhere to put a subtree — answers `Rebuild`.
+///
+/// A caller with somewhere to put one is answered better: see the case below, where the same change
+/// is confined to the element that holds the text, since deciding those three things is exactly
+/// what a container does.
 #[test]
 fn text_that_empties_out_is_refused_rather_than_approximated() {
     let (mut fixture, mut store) = fixture("alpha");
@@ -144,4 +148,108 @@ fn text_that_empties_out_is_refused_rather_than_approximated() {
 
     let root = fixture.document.root_index().expect("a root element");
     assert_eq!(retext(&mut store, &fixture.document, root), Retext::Rebuild);
+}
+
+/// An element whose font moved rebuilds its own subtree, and leaves the document's boxes alone.
+///
+/// A re-shape on an element changes the synthesised styles of the runs below it and the metrics
+/// every one of them is measured with — which is a change to what the boxes are made of throughout
+/// *its subtree*, and no further. Rebuilding the document for it renames every box, which makes
+/// every fragment compare as new, which repaints the whole surface: on a component gallery that was
+/// a quarter of a second of box building for one element, on a frame that owed nothing else.
+///
+/// So the walk names the element instead of refusing, and the assertion is that every box outside
+/// that subtree keeps the name it had.
+#[test]
+fn a_font_that_moved_names_its_own_subtree_rather_than_the_document() {
+    let fixture = Fixture::new(
+        Element::new("root").children(vec![
+            Element::new("head").children(vec![Element::new("title").text("alpha")]),
+            Element::new("body").children(vec![Element::new("para").text("beta")]),
+        ]),
+        "root { display: block; width: 400px }
+         head, body, title, para { display: block }
+         .bigger { font-size: 40px }",
+    );
+    let mut store = fixture.box_tree();
+    let mut content = measurer();
+    lay_out(&mut store, &mut content, 400.0, 400.0);
+
+    // Navigated rather than searched: the fixture is `root > [head, body]` and the two halves are
+    // the point of it.
+    let mut fixture = fixture;
+    let head = fixture
+        .document
+        .store()
+        .core(fixture.root)
+        .first_child()
+        .expect("the root has a first child");
+    let body = fixture
+        .document
+        .store()
+        .core(head)
+        .next_sibling()
+        .expect("the root has a second child");
+    let untouched: Vec<BoxKey> = store
+        .boxes_of(fixture.document.store().key_of(body))
+        .to_vec();
+    assert!(!untouched.is_empty(), "the half being left alone has boxes");
+
+    fixture.edit_and_restyle(|edit| {
+        edit.set_classes(head, &[zgui_interned::ClassName::new("bigger")]);
+    });
+
+    let root = fixture.document.root_index().expect("a root element");
+    let found = zgui_layout::boxtree::patch::walk(&mut store, &fixture.document, root)
+        .expect("a font that moved is nothing a rewrite cannot express");
+    assert_eq!(
+        found.confine,
+        vec![head],
+        "the element whose font moved is the one whose boxes have to be made again"
+    );
+
+    let confined = zgui_layout::boxtree::patch::subtree::confine(
+        &mut store,
+        &fixture.document,
+        &found.confine,
+    )
+    .expect("one element's subtree is confinable");
+    assert_eq!(confined.subtrees, 1);
+
+    assert_eq!(
+        store.boxes_of(fixture.document.store().key_of(body)),
+        untouched.as_slice(),
+        "the half of the document that did not change kept every box it had"
+    );
+}
+
+/// Text that disappears is confined to the element holding it, not to the document.
+///
+/// Whether a text node has a box is its container's decision: the container is what does the
+/// anonymous wrapping, the inline splitting and the paint order, so making the container's boxes
+/// again reproduces all three. Rebuilding the document for it renames every box in the document,
+/// which is what makes a label that emptied repaint a whole window.
+#[test]
+fn text_that_empties_out_is_confined_to_the_element_that_held_it() {
+    let (mut fixture, mut store) = fixture("alpha");
+    let mut content = measurer();
+    lay_out(&mut store, &mut content, 400.0, 400.0);
+
+    let para = fixture
+        .document
+        .store()
+        .core(fixture.root)
+        .first_child()
+        .expect("the fixture's paragraph");
+    let text = first_text(&fixture.document, fixture.root);
+    fixture.edit_and_restyle(|edit| edit.set_text(text, ""));
+
+    let root = fixture.document.root_index().expect("a root element");
+    let found = zgui_layout::boxtree::patch::walk(&mut store, &fixture.document, root)
+        .expect("emptied text names its container rather than refusing");
+    assert_eq!(
+        found.confine,
+        vec![para],
+        "the element that holds the text is the one whose boxes have to be made again"
+    );
 }

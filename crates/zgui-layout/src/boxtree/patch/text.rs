@@ -42,7 +42,43 @@ pub enum Retext {
     /// Carries how many boxes were rewritten, which is zero when nothing owed a re-shape at all.
     Patched(u32),
     /// Something was found that changes which boxes exist, so the tree has to be built again.
+    ///
+    /// Carries which of the refusals it was, because they are answered differently and a caller
+    /// that cannot tell them apart cannot narrow either.
     Rebuild,
+}
+
+/// What a walk of the re-shaped text found.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Retexted {
+    /// How many boxes had their characters rewritten where they stood.
+    pub rewritten: u32,
+    /// The elements whose boxes have to be made again, and nothing above them.
+    ///
+    /// An element owing a re-shape is one whose font moved, which changes the synthesised styles
+    /// of the runs below it and the metrics every one of them is measured with — a change to what
+    /// the boxes are made of **throughout its subtree**, and no further. Rebuilding the document
+    /// for it reports every fragment in the document as new, which repaints the whole surface: on
+    /// a component gallery that measured a quarter of a second of box building, for one element,
+    /// on a frame that owed nothing else at all.
+    ///
+    /// A subtree here is not descended into, because making its boxes again covers everything
+    /// below it.
+    pub confine: Vec<NodeIndex>,
+}
+
+/// Why a rewrite was refused, and at which node.
+///
+/// A refusal rebuilds the whole document's boxes, which reports every fragment as new and repaints
+/// the whole surface — so which refusal fired is worth more than the fact that one did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// An element owing a re-shape, which changes what the boxes below it are made of.
+    Reshaped(NodeIndex),
+    /// A text node whose characters appeared or disappeared, which changes whether it has a box.
+    Appeared(NodeIndex),
+    /// A text node whose box is not a run, so there is nothing to rewrite the characters of.
+    NotARun(NodeIndex),
 }
 
 /// Rewrites the characters of every box holding text that a re-shape was marked on.
@@ -56,12 +92,31 @@ pub enum Retext {
 ///
 /// Panics if `root` names no live node of `document`.
 pub fn retext(store: &mut LayoutStore, document: &Document, root: NodeIndex) -> Retext {
-    let mut rewritten = 0;
-    if visit(store, document, root, &mut rewritten) {
-        Retext::Patched(rewritten)
-    } else {
-        Retext::Rebuild
+    // The two-way answer, for a caller with nowhere to put a subtree: an element that could have
+    // been confined rebuilds the document, which is what this did before there was anywhere else
+    // to put it.
+    match walk(store, document, root) {
+        Ok(found) if found.confine.is_empty() => Retext::Patched(found.rewritten),
+        _ => Retext::Rebuild,
     }
+}
+
+/// The same walk, answering which refusal stopped it rather than only that one did.
+///
+/// Separate from [`retext`] so that the answer every caller acts on stays a two-way one, and the
+/// detail is there for whoever is measuring why a document rebuilt.
+///
+/// # Panics
+///
+/// Panics if `root` names no live node of `document`.
+pub fn walk(
+    store: &mut LayoutStore,
+    document: &Document,
+    root: NodeIndex,
+) -> Result<Retexted, Refusal> {
+    let mut found = Retexted::default();
+    visit(store, document, root, &mut found)?;
+    Ok(found)
 }
 
 /// Services one node and everything below it, and reports whether the patch is still expressible.
@@ -74,12 +129,12 @@ fn visit(
     store: &mut LayoutStore,
     document: &Document,
     index: NodeIndex,
-    rewritten: &mut u32,
-) -> bool {
+    found: &mut Retexted,
+) -> Result<(), Refusal> {
     let core = document.store().core(index);
     let (own, subtree) = core.dirty().get();
     if !(own | subtree).intersects(Dirty::RESHAPE) {
-        return true;
+        return Ok(());
     }
     if own.contains(Dirty::RESHAPE) {
         // An element owing a re-shape is one whose *font* moved, which changes the synthesised
@@ -97,10 +152,29 @@ fn visit(
         // no text was costing 1.3 megapixels to move sixty-four by thirty-two.
         if core.kind() != NodeKind::Text {
             if core.first_child().is_some() {
-                return false;
+                // Named rather than refused. What changed is what the boxes below this element are
+                // made of, so making this element's boxes again answers it — and the walk does not
+                // descend, because that rebuild covers everything under it.
+                found.confine.push(index);
+                return Ok(());
             }
-        } else if !rewrite(store, document, index, rewritten) {
-            return false;
+        } else if let Err(met) = rewrite(store, document, index, found) {
+            // Characters appearing where there were none, or going entirely, changes whether this
+            // node has a box at all — which is its *container's* decision, since that is what does
+            // the anonymous wrapping, the inline splitting and the paint order. Making the
+            // container's boxes again reproduces all three, so the change is confined to it rather
+            // than rebuilding the document.
+            let Refusal::Appeared(_) = met else {
+                return Err(met);
+            };
+            let Some(parent) = core.parent() else {
+                return Err(met);
+            };
+            if document.store().core(parent).kind() != NodeKind::Element {
+                return Err(met);
+            }
+            found.confine.push(parent);
+            return Ok(());
         }
     }
     let children: Vec<NodeIndex> = core
@@ -108,11 +182,9 @@ fn visit(
         .iter(document.store(), index)
         .collect();
     for child in children {
-        if !visit(store, document, child, rewritten) {
-            return false;
-        }
+        visit(store, document, child, found)?;
     }
-    true
+    Ok(())
 }
 
 /// Rewrites the boxes one text node generated, and reports whether that was possible.
@@ -120,23 +192,23 @@ fn rewrite(
     store: &mut LayoutStore,
     document: &Document,
     index: NodeIndex,
-    rewritten: &mut u32,
-) -> bool {
+    found: &mut Retexted,
+) -> Result<(), Refusal> {
     let text = zgui_dom::text::node::text_of(document.store(), index).unwrap_or_default();
     let source = document.store().key_of(index);
     let boxes = store.boxes_of(source).to_vec();
     // An empty string generates no box and a non-empty one generates a box, so either of these is
     // a box appearing or disappearing rather than a box changing.
     if text.is_empty() != boxes.is_empty() {
-        return false;
+        return Err(Refusal::Appeared(index));
     }
     if boxes.is_empty() {
-        return true;
+        return Ok(());
     }
     let text: Box<str> = text.into();
     for key in boxes {
         if store.node(key).kind != BoxKind::TextRun {
-            return false;
+            return Err(Refusal::NotARun(index));
         }
         if store.node(key).text.as_deref() == Some(&*text) {
             continue;
@@ -144,9 +216,9 @@ fn rewrite(
         store.get_mut(key).expect("a live box").text = Some(text.clone());
         forget_flattened(store, key);
         mark_dirty(store, key);
-        *rewritten += 1;
+        found.rewritten += 1;
     }
-    true
+    Ok(())
 }
 
 /// Drops the flattened form held by every box at or above `key`, and reports how many boxes it

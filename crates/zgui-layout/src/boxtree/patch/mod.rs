@@ -33,4 +33,4 @@ pub mod text;
 pub use crate::boxtree::patch::structure::{detach, replace};
 pub use crate::boxtree::patch::style::restyle;
 pub use crate::boxtree::patch::subtree::{Rebuilt, rebuild};
-pub use crate::boxtree::patch::text::{Retext, retext};
+pub use crate::boxtree::patch::text::{Refusal, Retext, Retexted, retext, walk};

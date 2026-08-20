@@ -89,9 +89,39 @@ pub fn rebuild(store: &mut LayoutStore, document: &Document, owed: &Owed) -> Opt
     Some(done)
 }
 
+/// Makes the boxes of each named element again, and nothing above them.
+///
+/// What a change confined to a subtree asks for — a re-shape, which changes what the boxes below
+/// one element are made of and nothing outside it. [`rebuild`] answers the invalidation walk's own
+/// set and decides for itself which containers to remake; this answers a caller that already knows
+/// which elements they are.
+///
+/// Returns nothing where any one of them cannot be confined, which leaves the caller to build the
+/// whole document's boxes. Some may already have been made again when that happens; each is correct
+/// on its own and the build that follows replaces them.
+///
+/// # Panics
+///
+/// Panics if `targets` names a node that is not live in `document`.
+pub fn confine(
+    store: &mut LayoutStore,
+    document: &Document,
+    targets: &[NodeIndex],
+) -> Option<Rebuilt> {
+    let mut done = Rebuilt::default();
+    for target in targets {
+        done.removed += one(store, document, *target)?;
+        done.subtrees += 1;
+    }
+    Some(done)
+}
+
 /// Rebuilds one element's boxes, and reports how many boxes were taken out of the tree.
 fn one(store: &mut LayoutStore, document: &Document, target: NodeIndex) -> Option<u32> {
-    let old = place::primary_box(store, document, target)?;
+    // An element that generates no box of its own — `display: contents`, and every wrapper that
+    // asks for it — has nothing for a splice to replace. What is made again is then the nearest
+    // element above it that does have one, which covers the boxless element and everything in it.
+    let (target, old) = place::nearest_with_a_box(store, document, target)?;
     let held = confine::confined(store, document, target, old)?;
     let removed = u32::try_from(held.subtree.len()).unwrap_or(u32::MAX);
     let containing_block = place::containing_block(store, held.parent);
