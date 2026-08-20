@@ -107,4 +107,16 @@ impl Window {
         let document = self.document.borrow();
         self.router.cancel_press(&document, &filter);
     }
+
+    /// Ends the press one pointer is holding, leaving every other pointer and the scrollbars alone.
+    ///
+    /// What a drag that has become a scroll asks for. See [`Router::cancel_press_of`], which is
+    /// where the difference from the whole-window cancel above is written.
+    ///
+    /// [`Router::cancel_press_of`]: zgui_input::Router::cancel_press_of
+    pub(crate) fn cancel_press_of(&mut self, pointer: zgui_vocab::PointerId) {
+        let filter = self.engine.filter();
+        let document = self.document.borrow();
+        self.router.cancel_press_of(&document, &filter, pointer);
+    }
 }

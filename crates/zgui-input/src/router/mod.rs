@@ -327,6 +327,44 @@ impl Router {
         moved
     }
 
+    /// Returns `true` where a scrollbar is holding this pointer.
+    ///
+    /// A thumb being dragged scrolls its own container by following the finger, and a gesture that
+    /// also scrolled would move it twice. So a caller reading a drag as a pan asks this first.
+    pub fn bar_holds(&self, pointer: zgui_vocab::PointerId) -> bool {
+        self.bars.of(pointer).is_some()
+    }
+
+    /// Ends the press one pointer is holding, because something else has taken the interaction.
+    ///
+    /// What a gesture recogniser calls when a drag it was watching turns out to be a scroll. The
+    /// press has to end, or the control the finger went down on stays lit for the whole drag and
+    /// still fires when the finger lifts near where it started — the fault a browser answers by
+    /// sending `pointercancel` at this moment.
+    ///
+    /// Narrower than [`Router::cancel_press`], which is for a window that has lost the interaction
+    /// altogether: the scrollbar grabs are left alone, because a thumb being dragged is a scroll
+    /// that is working rather than one being taken over.
+    ///
+    /// `:active` is not held per pointer, so ending one press clears the bit for all of them. That
+    /// is the shape of the state rather than a decision here, and on a machine with one pointer
+    /// there is no difference.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the document is poisoned by an earlier batch that unwound.
+    pub fn cancel_press_of(
+        &mut self,
+        document: &zgui_dom::Document,
+        filter: &dyn zgui_dom::StyleFilter,
+        pointer: zgui_vocab::PointerId,
+    ) -> Moved {
+        let moved = self.interaction.active.release(document, filter);
+        self.capture.release(pointer);
+        self.pressed.retain(|(id, _)| *id != pointer);
+        moved
+    }
+
     /// Forgets which element one pointer was pressed on, leaving `:active` and the capture alone.
     ///
     /// What a handler that activated its element on the press asks for. Activation is a property of
