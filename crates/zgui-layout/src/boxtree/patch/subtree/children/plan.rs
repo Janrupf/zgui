@@ -121,7 +121,7 @@ pub(super) fn of(
         // establishes that depends on whether the child is still in the document: one whose boxes are
         // merely stale still has its ancestry, and one that has left has none left to read.
         let confined = if mine {
-            confine::confined(store, document, index, key)?
+            confine::confined(store, document, index, key).ok()?
         } else {
             confine::departed(store, document, key)?
         };
