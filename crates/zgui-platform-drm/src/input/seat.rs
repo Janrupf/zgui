@@ -1020,6 +1020,11 @@ pub struct Seat {
     /// Kept because a session that comes back walks it again. See [`Seat::take_again`] for why a
     /// resume walks the directory rather than a list of the paths that were held.
     directory: PathBuf,
+    /// Whether something has moved the pointer more recently than a contact touched the glass.
+    ///
+    /// What decides whether a cursor is drawn. See [`Seat::steered`], which is also where the
+    /// reason it is a record of what happened rather than a question about the devices is written.
+    steered: bool,
 }
 
 impl Seat {
@@ -1134,6 +1139,7 @@ impl Seat {
             anchored: Stamps::anchored(clock),
             watch,
             directory: directory.to_owned(),
+            steered: false,
         };
         let announced = seat.walk(session);
         seat.pending.extend(announced);
@@ -1225,6 +1231,37 @@ impl Seat {
         match &self.source {
             Stream::Kernel(_) => None,
             Stream::Libinput(through) => through.due(),
+        }
+    }
+
+    /// Returns `true` if a cursor should be drawn.
+    ///
+    /// Nothing is drawn until something moves the pointer, and a contact takes it away again. A
+    /// machine whose only pointing device is a touchscreen therefore shows no cursor at all: a
+    /// contact is a pointer of its own and moves this one nowhere, so an arrow would sit where it
+    /// started for the whole session.
+    ///
+    /// **Asked of what the devices did rather than of what they say they are.** libinput calls this
+    /// machine's multimedia keyboard a pointer, because of the roller above its keypad, and a
+    /// cursor shown because such a device exists is a cursor nothing can move. What moved the
+    /// pointer is the only answer that cannot be wrong.
+    ///
+    /// A touchscreen read from the kernel's own stream shows the cursor and moves it. That source
+    /// has no contacts — it reads `ABS_X` and `ABS_Y` as an absolute pointing device — so there the
+    /// finger moves the one pointer and the cursor follows it.
+    pub fn steered(&self) -> bool {
+        self.steered
+    }
+
+    /// Records whether a cursor should be drawn, from what this turn's reports were made by.
+    ///
+    /// The last pointer event of the turn decides, so a mouse moved while a finger is on the glass
+    /// brings the cursor back at once.
+    fn note_steering(&mut self, reports: &[Report]) {
+        for report in reports {
+            if let SurfaceEvent::Pointer { event, .. } = &report.event {
+                self.steered = event.kind != zgui_vocab::PointerKind::Touch;
+            }
         }
     }
 
@@ -1452,6 +1489,7 @@ impl Seat {
                 // The watch is the same on both sources, and a node plugged in while this runs
                 // arrives through it.
                 reports.extend(self.arrivals(session));
+                self.note_steering(&reports);
                 return Heard { reports, terminal };
             }
         };
@@ -1541,6 +1579,7 @@ impl Seat {
         // the same name is a different device at the same path, and an arrival at a path this seat
         // still holds is refused — so a stale one left here would keep its own replacement out.
         reports.extend(self.arrivals(session));
+        self.note_steering(&reports);
         Heard { reports, terminal }
     }
 
@@ -4050,6 +4089,7 @@ mod tests {
             anchored: Stamps::from_origin(SINCE),
             watch: zgui_evdev::Watch::new_in(directory).ok(),
             directory: directory.to_owned(),
+            steered: false,
         }
     }
 
