@@ -584,20 +584,25 @@ fn drive(
                 // waits for up to two refreshes — and a loop that reads flips, deadlines and input
                 // on one thread does none of the three while it waits. One turn is one wake, so a
                 // person moving the mouse gets one move per report all the same.
+                // Nowhere at all until something moves the pointer, and nowhere again once a
+                // contact touches the glass. A machine whose only pointing device is a touchscreen
+                // would otherwise show an arrow that sits where it started for the whole session:
+                // a contact is a pointer of its own and moves this one nowhere. Asked each turn, so
+                // the first movement of a mouse brings the cursor back.
+                let steerable = seat.steered();
                 for (drawn, cursor) in surfaces[..claimed].iter().zip(&cursors) {
                     let mut cursor = cursor.borrow_mut();
                     if let Some(style) = drawn.take_cursor() {
                         cursor.set_style(style);
                     }
-                    cursor.place(
-                        pointer
-                            .on(&screens)
-                            .filter(|screen| screen.id == drawn.id())
-                            .map(|screen| {
+                    cursor.place(steerable.then(|| pointer.on(&screens)).flatten().and_then(
+                        |screen| {
+                            (screen.id == drawn.id()).then(|| {
                                 let (x, y) = pointer.union();
                                 ((x - screen.left) as i32, y as i32)
-                            }),
-                    );
+                            })
+                        },
+                    ));
                     if !cursor.changed() {
                         continue;
                     }
