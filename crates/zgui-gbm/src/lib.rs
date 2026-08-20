@@ -179,9 +179,46 @@ impl Library {
 /// through it and a read-only descriptor makes it fault rather than refuse.
 #[derive(Debug)]
 pub struct Device {
-    library: Arc<Library>,
+    /// The allocator, held by every buffer made from it as well as by this.
+    allocator: Arc<Allocator>,
+    /// The same pointer, for the calls this makes.
+    ///
+    /// A raw pointer here is also what keeps a `Device` from being shared between threads, which
+    /// gbm's own calls are not written for.
     raw: *mut c_void,
 }
+
+/// The allocator itself, alive for as long as anything made from it is.
+///
+/// **gbm dispatches `gbm_bo_destroy` through a function pointer inside the device.** A buffer that
+/// outlives its allocator therefore destroys itself through freed memory, and the call goes to
+/// whatever that memory now spells — on a 32-bit target, an address like `0x2`, which is a
+/// segmentation fault inside a destructor with nothing in the backtrace to say why. Nothing in Rust
+/// connects a buffer to the allocator that made it: gbm hands back a pointer and the relationship
+/// lives entirely inside the library. So the relationship is written down here instead, and every
+/// [`Allocation`] holds one of these.
+#[derive(Debug)]
+struct Allocator {
+    /// Kept so the call below stays mapped.
+    library: Arc<Library>,
+    /// The allocator gbm answered.
+    raw: *mut c_void,
+}
+
+impl Drop for Allocator {
+    fn drop(&mut self) {
+        // SAFETY: `raw` is an allocator this made, and this runs after the last buffer from it has
+        // been destroyed, because each of them holds a reference to this.
+        unsafe { (self.library.device_destroy)(self.raw) };
+    }
+}
+
+// SAFETY: what this holds is a pointer and the mapping the calls through it live in. It is reached
+// for `gbm_bo_create` only through a `&Device`, which is not `Sync`, and otherwise only to destroy
+// the allocator once nothing is left that was made from it.
+unsafe impl Send for Allocator {}
+// SAFETY: as above.
+unsafe impl Sync for Allocator {}
 
 impl Device {
     /// Opens an allocator over `node`, which stays open for as long as this does.
@@ -198,7 +235,10 @@ impl Device {
             return Err("gbm_create_device answered nothing".to_owned());
         }
         Ok(Self {
-            library: Arc::clone(library),
+            allocator: Arc::new(Allocator {
+                library: Arc::clone(library),
+                raw,
+            }),
             raw,
         })
     }
@@ -215,7 +255,7 @@ impl Device {
     /// The driver behind this allocator, for a log line that says which card a buffer came from.
     pub fn backend(&self) -> String {
         // SAFETY: `raw` is an allocator this made and has not destroyed.
-        let name = unsafe { (self.library.backend_name)(self.raw) };
+        let name = unsafe { (self.allocator.library.backend_name)(self.raw) };
         if name.is_null() {
             return "unnamed".to_owned();
         }
@@ -237,7 +277,13 @@ impl Device {
     pub fn create(&self, width: u32, height: u32, format: u32) -> Result<Allocation, String> {
         // SAFETY: `raw` is an allocator this made, and the arguments are plain values.
         let bo = unsafe {
-            (self.library.bo_create)(self.raw, width, height, format, USE_SCANOUT | USE_RENDERING)
+            (self.allocator.library.bo_create)(
+                self.raw,
+                width,
+                height,
+                format,
+                USE_SCANOUT | USE_RENDERING,
+            )
         };
         if bo.is_null() {
             return Err(format!(
@@ -255,14 +301,17 @@ impl Device {
         // the descriptor instead, which is what the Vulkan path does and is one call either way.
         let (planes, stride, offset, modifier) = unsafe {
             (
-                (self.library.bo_get_plane_count)(bo).max(0) as usize,
-                (self.library.bo_get_stride)(bo),
-                (self.library.bo_get_offset)(bo, 0),
-                (self.library.bo_get_modifier)(bo),
+                (self.allocator.library.bo_get_plane_count)(bo).max(0) as usize,
+                (self.allocator.library.bo_get_stride)(bo),
+                (self.allocator.library.bo_get_offset)(bo, 0),
+                (self.allocator.library.bo_get_modifier)(bo),
             )
         };
         let allocation = Allocation {
-            library: Arc::clone(&self.library),
+            library: Arc::clone(&self.allocator.library),
+            // What keeps the allocator alive until this buffer has been destroyed. See
+            // [`Allocator`], which is where the reason is written.
+            allocator: Arc::clone(&self.allocator),
             bo,
             planes,
             stride,
@@ -280,18 +329,16 @@ impl Device {
     }
 }
 
-impl Drop for Device {
-    fn drop(&mut self) {
-        // SAFETY: `raw` is an allocator this made, and every buffer from it holds an `Arc` on the
-        // library rather than on this, so destroying it here frees only the allocator.
-        unsafe { (self.library.device_destroy)(self.raw) };
-    }
-}
-
 /// One buffer, and everything the two ends have to be told about it.
 #[derive(Debug)]
 pub struct Allocation {
     library: Arc<Library>,
+    /// The allocator this came from, which has to outlive it. See [`Allocator`].
+    #[expect(
+        dead_code,
+        reason = "held so that gbm_bo_destroy reaches a device that still exists"
+    )]
+    allocator: Arc<Allocator>,
     bo: *mut c_void,
     planes: usize,
     stride: u32,
