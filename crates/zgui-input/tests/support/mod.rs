@@ -360,6 +360,32 @@ impl Session {
         read(&routed)
     }
 
+    /// Routes one action of a contact at a point, and takes what `read` wants out of the answer.
+    ///
+    /// The call [`Session::route`] makes, over a pointer that is a finger: an identifier of its own
+    /// and a kind that cannot hover.
+    pub fn touch<R>(
+        &mut self,
+        point: Point<DevicePx, Device>,
+        action: zgui_vocab::PointerAction,
+        read: impl FnOnce(&zgui_input::Routed<'_>) -> R,
+    ) -> R {
+        let mut event =
+            zgui_vocab::PointerEvent::mouse(Point::new(CssPx(point.x.0), CssPx(point.y.0)));
+        event.id = zgui_vocab::PointerId::new(1);
+        event.kind = zgui_vocab::PointerKind::Touch;
+        let filter = self.fixture.filter();
+        let world = self.fixture.world(&filter);
+        let routed = self.router.pointer(
+            &world,
+            action,
+            &event,
+            zgui_vocab::Modifiers::NONE,
+            zgui_vocab::Timestamp::ORIGIN,
+        );
+        read(&routed)
+    }
+
     /// Moves the pointer to a point, and reports the path the event travelled.
     pub fn pointer_at(
         &mut self,

@@ -873,11 +873,13 @@ impl Window {
             return;
         };
         // A synthesised activation is a pointer event at wherever the pointer is, because that is
-        // what a handler reads off it. With no pointer on the surface it is at the origin.
+        // what a handler reads off it. With no pointer on the surface it is at the origin. A finger
+        // is no answer here: it is somewhere only while it touches, and this is reached from the
+        // keyboard.
         let position = self
             .router
             .pointers()
-            .all()
+            .hovering()
             .next()
             .map(|(_, point)| {
                 zgui_geom::Point::new(

@@ -49,7 +49,8 @@ pub enum Capability {
     /// Pointer motion, buttons and scrolling. Touchpads are pointers: libinput turns contacts on
     /// the pad into motion.
     Pointer,
-    /// Contacts reported by position. This crate does not read them.
+    /// Contacts reported by position, as [`Event::TouchDown`](crate::Event::TouchDown) and the
+    /// events beside it.
     Touch,
     /// A stylus or another tool on a graphics tablet. This crate does not read them.
     TabletTool,
@@ -136,6 +137,15 @@ impl Capabilities {
     #[must_use]
     pub const fn pointer(self) -> bool {
         self.has(Capability::Pointer)
+    }
+
+    /// Returns `true` if the device reports contacts by position.
+    ///
+    /// A touchpad answers `false`: libinput turns contacts on a pad into pointer motion, so a pad
+    /// is a [`Pointer`](Capability::Pointer) and a touchscreen is this.
+    #[must_use]
+    pub const fn touch(self) -> bool {
+        self.has(Capability::Touch)
     }
 }
 

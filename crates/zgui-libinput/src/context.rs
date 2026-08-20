@@ -63,6 +63,18 @@ const POINTER_SCROLL_FINGER: u32 = 405;
 /// libinput's `LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS`.
 const POINTER_SCROLL_CONTINUOUS: u32 = 406;
 
+/// libinput's `LIBINPUT_EVENT_TOUCH_DOWN`.
+const TOUCH_DOWN: u32 = 500;
+
+/// libinput's `LIBINPUT_EVENT_TOUCH_UP`.
+const TOUCH_UP: u32 = 501;
+
+/// libinput's `LIBINPUT_EVENT_TOUCH_MOTION`.
+const TOUCH_MOTION: u32 = 502;
+
+/// libinput's `LIBINPUT_EVENT_TOUCH_CANCEL`.
+const TOUCH_CANCEL: u32 = 503;
+
 /// libinput's `LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL`.
 const VERTICAL: u32 = 0;
 
@@ -525,10 +537,15 @@ impl Context {
                 | POINTER_SCROLL_WHEEL
                 | POINTER_SCROLL_FINGER
                 | POINTER_SCROLL_CONTINUOUS => self.pointed(&symbols, event, kind),
-                // Touch, gestures, tablets, switches — and `POINTER_AXIS`, which libinput reports
-                // beside each scroll above for callers written before the three of them existed.
-                // Reading both would scroll twice as far as the wheel was turned. Destroying the
-                // event is all that is owed for any of them.
+                TOUCH_DOWN | TOUCH_UP | TOUCH_MOTION | TOUCH_CANCEL => {
+                    self.touched(&symbols, event, kind);
+                }
+                // The touch frame, gestures, tablets, switches — and `POINTER_AXIS`, which
+                // libinput reports beside each scroll above for callers written before the three
+                // of them existed. Reading both would scroll twice as far as the wheel was turned.
+                // A touch frame says that a burst of contacts was reported together, which nothing
+                // here treats as one movement. Destroying the event is all that is owed for any of
+                // them.
                 _ => {}
             }
 
@@ -689,6 +706,68 @@ impl Context {
                     source,
                     vertical: scrolled(symbols, pointer, source, VERTICAL),
                     horizontal: scrolled(symbols, pointer, source, HORIZONTAL),
+                    at,
+                }
+            }
+        };
+        self.pending.push_back(read);
+    }
+
+    /// Records what one contact did.
+    ///
+    /// A cancellation is read before the slot is asked for. It ends every contact on its device at
+    /// once and names none of them, so the number it would answer with means nothing.
+    fn touched(&mut self, symbols: &Symbols, event: NonNull<LibinputEvent>, kind: u32) {
+        let Some(device) = self.reporting(symbols, event) else {
+            return;
+        };
+        // SAFETY: the event is live and its type is one of the touch kinds, so reading it as a
+        // touch event is the right question.
+        let touch = unsafe { (symbols.event_get_touch_event)(event.as_ptr()) };
+        let Some(touch) = NonNull::new(touch) else {
+            return;
+        };
+        let raw = touch.as_ptr();
+
+        // SAFETY: `touch` is this event read as a touch event, and this reads it. Every other call
+        // below is the same.
+        let at = Duration::from_micros(unsafe { (symbols.touch_get_time_usec)(raw) });
+
+        if kind == TOUCH_CANCEL {
+            self.pending.push_back(Event::TouchCancelled { device, at });
+            return;
+        }
+
+        // SAFETY: as above.
+        let slot = unsafe { (symbols.touch_get_seat_slot)(raw) };
+        let Ok(slot) = u32::try_from(slot) else {
+            // A contact libinput would not number is one nothing can follow from its touch to its
+            // lift, so what it did is dropped whole rather than delivered under a slot invented
+            // here.
+            return;
+        };
+
+        let read = if kind == TOUCH_UP {
+            Event::TouchUp { device, slot, at }
+        } else {
+            // SAFETY: as above, and a contact that goes down or moves carries a position.
+            let x = unsafe { (symbols.touch_get_x_transformed)(raw, AS_A_FRACTION) };
+            // SAFETY: as above.
+            let y = unsafe { (symbols.touch_get_y_transformed)(raw, AS_A_FRACTION) };
+            if kind == TOUCH_DOWN {
+                Event::TouchDown {
+                    device,
+                    slot,
+                    x,
+                    y,
+                    at,
+                }
+            } else {
+                Event::TouchMotion {
+                    device,
+                    slot,
+                    x,
+                    y,
                     at,
                 }
             }

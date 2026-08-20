@@ -179,6 +179,60 @@ pub enum Event {
         /// When it happened.
         at: Duration,
     },
+    /// A contact touched the surface.
+    ///
+    /// The position is a fraction of each axis of the touch surface, as an absolute pointing
+    /// device reports one, and libinput has already put the device's calibration matrix through
+    /// it. What it means on a screen is the caller's answer.
+    TouchDown {
+        /// Which device was touched.
+        device: DeviceId,
+        /// Which contact this is. See [`Event::TouchUp`] for how long the number lasts.
+        slot: u32,
+        /// Where across, from `0.0` to `1.0`.
+        x: f64,
+        /// Where down, from `0.0` to `1.0`.
+        y: f64,
+        /// When it happened.
+        at: Duration,
+    },
+    /// A contact moved while it was down.
+    TouchMotion {
+        /// Which device it is on.
+        device: DeviceId,
+        /// Which contact moved.
+        slot: u32,
+        /// Where across, from `0.0` to `1.0`.
+        x: f64,
+        /// Where down, from `0.0` to `1.0`.
+        y: f64,
+        /// When it moved.
+        at: Duration,
+    },
+    /// A contact lifted.
+    ///
+    /// **This carries no position**, because libinput reports none: a lift happens where the
+    /// contact last was, and a caller that needs the place keeps the last one it was told.
+    ///
+    /// The slot is free from here, and the next contact anywhere on the seat may be given it.
+    TouchUp {
+        /// Which device it was on.
+        device: DeviceId,
+        /// Which contact lifted.
+        slot: u32,
+        /// When it lifted.
+        at: Duration,
+    },
+    /// Every contact on one device was taken over by something else.
+    ///
+    /// libinput sends this once for the device rather than once for each contact, so it names no
+    /// slot. Each contact that was down ends here and produces no lift.
+    TouchCancelled {
+        /// Which device the contacts were on.
+        device: DeviceId,
+        /// When they ended.
+        at: Duration,
+    },
 }
 
 impl Event {
@@ -191,7 +245,11 @@ impl Event {
             | Self::Motion { device, .. }
             | Self::MotionAbsolute { device, .. }
             | Self::Button { device, .. }
-            | Self::Scroll { device, .. } => *device,
+            | Self::Scroll { device, .. }
+            | Self::TouchDown { device, .. }
+            | Self::TouchMotion { device, .. }
+            | Self::TouchUp { device, .. }
+            | Self::TouchCancelled { device, .. } => *device,
         }
     }
 
@@ -206,7 +264,11 @@ impl Event {
             | Self::Motion { at, .. }
             | Self::MotionAbsolute { at, .. }
             | Self::Button { at, .. }
-            | Self::Scroll { at, .. } => Some(*at),
+            | Self::Scroll { at, .. }
+            | Self::TouchDown { at, .. }
+            | Self::TouchMotion { at, .. }
+            | Self::TouchUp { at, .. }
+            | Self::TouchCancelled { at, .. } => Some(*at),
         }
     }
 }
@@ -266,6 +328,26 @@ mod tests {
                 horizontal: None,
                 at,
             },
+            Event::TouchDown {
+                device,
+                slot: 0,
+                x: 0.5,
+                y: 0.5,
+                at,
+            },
+            Event::TouchMotion {
+                device,
+                slot: 0,
+                x: 0.25,
+                y: 0.75,
+                at,
+            },
+            Event::TouchUp {
+                device,
+                slot: 0,
+                at,
+            },
+            Event::TouchCancelled { device, at },
         ];
 
         for event in events {
