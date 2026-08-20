@@ -35,6 +35,31 @@ pub(super) fn primary_box(
     found
 }
 
+/// The nearest element at or above `index` that generated a box of its own.
+///
+/// An element generates no box at all when it takes no part in layout — `display: contents` is the
+/// ordinary way to ask for that, and a component library is full of wrappers that do. Such an
+/// element has nothing for a splice to replace, so what has to be made again is the nearest thing
+/// above it that does have a box: rebuilding that covers everything inside it, the boxless wrapper
+/// included.
+///
+/// `None` where the walk reaches the top without finding one, which leaves the caller to build the
+/// whole document.
+pub(super) fn nearest_with_a_box(
+    store: &LayoutStore,
+    document: &Document,
+    index: NodeIndex,
+) -> Option<(NodeIndex, BoxKey)> {
+    let mut at = Some(index);
+    while let Some(current) = at {
+        if let Some(key) = primary_box(store, document, current) {
+            return Some((current, key));
+        }
+        at = document.store().core(current).parent();
+    }
+    None
+}
+
 /// The box that positions an out-of-flow box written inside `from`.
 ///
 /// Walked over the boxes that are there rather than derived a second time from the document: the

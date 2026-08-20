@@ -1098,9 +1098,29 @@ impl Window {
         }
         // Text is rewritten even when a subtree was spliced: a frame that mounted a panel may also
         // have changed a label somewhere else, and the splice knows nothing about the label.
+        // A re-shape changes what the boxes below one element are made of and nothing outside it,
+        // so the walk names those elements rather than refusing. Making their boxes again is the
+        // whole of the answer; the document is rebuilt only where that cannot be confined, or
+        // where the walk met something a rewrite cannot express at all.
+        let mut refusal = None;
+        let mut confined = None;
         if !rebuild {
-            rebuild = zgui_layout::boxtree::patch::retext(&mut layout, &document, root)
-                == zgui_layout::boxtree::patch::Retext::Rebuild;
+            match zgui_layout::boxtree::patch::walk(&mut layout, &document, root) {
+                Ok(found) if found.confine.is_empty() => {}
+                Ok(found) => {
+                    confined =
+                        zgui_layout::boxtree::patch::subtree::confine(
+                            &mut layout,
+                            &document,
+                            &found.confine,
+                        );
+                    rebuild = confined.is_none();
+                }
+                Err(met) => {
+                    refusal = Some(met);
+                    rebuild = true;
+                }
+            }
         }
         // A custom element that asked to be measured again is measured again: its style did not
         // move, so no other pass reaches its box.
@@ -1109,7 +1129,8 @@ impl Window {
         }
         zgui_profile::latency::note_with("b.why", || {
             format!(
-                "owed={} spliced={spliced:?} noroot={} rebuild={rebuild}",
+                "owed={} spliced={spliced:?} confined={confined:?} noroot={} \
+                 rebuild={rebuild} refusal={refusal:?}",
                 owed.len(),
                 layout.root().is_none()
             )
