@@ -15,10 +15,22 @@ pub fn quad(scene: &Scene, quad: &Quad) -> String {
         paint::reference(&scene.paints, quad.fill)
     );
     if !all_zero(&quad.border) {
+        // One `stroke=` while the four sides agree, which is nearly every border there is, and the
+        // four spelled out when they do not. A border of one colour then reads as it always did.
+        let sides = quad.strokes;
+        let painted = if sides.iter().all(|side| *side == sides[0]) {
+            format!("stroke={}", paint::reference(&scene.paints, sides[0]))
+        } else {
+            let named: Vec<String> = sides
+                .iter()
+                .map(|side| paint::reference(&scene.paints, *side))
+                .collect();
+            format!("strokes=[{}]", named.join(" "))
+        };
         line.push_str(&format!(
-            " border={} stroke={} style={}",
+            " border={} {} style={}",
             list(&quad.border),
-            paint::reference(&scene.paints, quad.stroke),
+            painted,
             style::border(quad.style)
         ));
     }

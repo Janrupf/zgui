@@ -96,7 +96,7 @@ pub fn background_and_border(
     }
     let (fills, _) = fills_of(scene, style, placement);
     let borders = border_widths(placement.border);
-    let stroke = border_stroke(scene, style);
+    let strokes = border_strokes(scene, style);
     let last = fills.len().saturating_sub(1);
     let mut pushed = 0;
     for (index, fill) in fills.into_iter().enumerate() {
@@ -106,7 +106,7 @@ pub fn background_and_border(
                 placement,
                 style,
                 fill,
-                (index == last).then_some((borders, stroke, style)),
+                (index == last).then_some((borders, strokes, style)),
             )
             .is_some(),
         );
@@ -233,15 +233,15 @@ fn push(
     placement: BoxPlacement,
     style: &PaintStyle,
     fill: PaintRef,
-    border: Option<([f32; 4], PaintRef, &PaintStyle)>,
+    border: Option<([f32; 4], [PaintRef; 4], &PaintStyle)>,
 ) -> Option<zgui_scene::DrawOrder> {
     let mut quad = Quad::filled(placement.border_box, fill)
         .clipped(placement.clip)
         .transformed(placement.transform)
         .with_radii(placement.radii)
         .with_corner_shape(style.corner_shape);
-    if let Some((widths, stroke, style)) = border {
-        quad = quad.with_border(widths, stroke, style.border.style.to_scene());
+    if let Some((widths, strokes, style)) = border {
+        quad = quad.with_border_sides(widths, strokes, style.border.style.to_scene());
     }
     // Only a paint that is read at a point has an origin to be read from, and saying so is what
     // keeps every flat-filled box in the document carrying a zero it does not use.
@@ -286,23 +286,22 @@ fn border_widths(border: Edges<DevicePx>) -> [f32; 4] {
     [border.top.0, border.right.0, border.bottom.0, border.left.0]
 }
 
-/// The paint a box's border is stroked with.
+/// The paint each of a box's border sides is stroked with, in top, right, bottom, left order.
 ///
-/// One quad carries one stroke, so four differently coloured sides are drawn in the first side's
-/// colour that is not fully transparent — which is the top's in every stylesheet that sets a
-/// shorthand, and which is visibly wrong only for the deliberately multicoloured border.
-fn border_stroke(scene: &mut Scene, style: &PaintStyle) -> PaintRef {
-    let color = style
-        .border
-        .colors
-        .iter()
-        .copied()
-        .find(|color| color.alpha() != 0.0)
-        .unwrap_or(Color::TRANSPARENT);
-    if color.alpha() == 0.0 {
-        return PaintRef::NONE;
-    }
-    scene.paints.add(zgui_scene::Paint::Solid(color))
+/// A side that draws nothing is [`PaintRef::NONE`] rather than a transparent colour, so the shader
+/// can leave that side of the border undrawn instead of blending nothing over the background. That
+/// is what a spinner is made of: a ring of one colour with its top side taken away, which is
+/// invisible as a turning thing if the four sides are collapsed into one paint.
+///
+/// The sides are interned separately and the common case — four sides of one colour — resolves to
+/// four references to the same paint, so it costs one entry in the table and no extra work.
+fn border_strokes(scene: &mut Scene, style: &PaintStyle) -> [PaintRef; 4] {
+    style.border.colors.map(|color| {
+        if color.alpha() == 0.0 {
+            return PaintRef::NONE;
+        }
+        scene.paints.add(zgui_scene::Paint::Solid(color))
+    })
 }
 
 /// The eight-float form of four elliptical radii.
@@ -353,7 +352,7 @@ pub fn padding_radii(
 mod tests {
     use zgui_geom::{Corners, Device, DevicePx, Point, Rect, Size, Vec2};
 
-    use super::{BoxPlacement, grow, inset_shadows, outer_shadows};
+    use super::{BoxPlacement, background_and_border, grow, inset_shadows, outer_shadows};
     use crate::lower::PaintStyle;
     use crate::lower::shadow::ShadowSpec;
 
@@ -427,5 +426,77 @@ mod tests {
         let radii = Corners::uniform(Vec2::new(DevicePx(2.0), DevicePx(2.0)));
         let shrunk = grow(radii, -10.0);
         assert_eq!(shrunk.top_left, Vec2::new(DevicePx(0.0), DevicePx(0.0)));
+    }
+
+    /// A ring of one colour with its top side taken away is drawn with the top side taken away.
+    ///
+    /// What a spinner is: `border: 2px solid` with `border-top-color: transparent`, turned by an
+    /// animation. Collapsed into one paint it is a closed ring, and a closed ring is the same
+    /// picture at every angle — so the spinner turns and nothing on the screen moves. The gap is
+    /// the whole of what makes the rotation visible, and it lives in these four references.
+    #[test]
+    fn a_side_left_transparent_is_the_one_side_that_paints_nothing() {
+        let mut style = crate::lower::lower(&zgui_css::StyleDraft::initial().build(), 1.0);
+        style.border.colors = [
+            zgui_color::Color::TRANSPARENT,
+            zgui_color::Color::BLACK,
+            zgui_color::Color::BLACK,
+            zgui_color::Color::BLACK,
+        ];
+        style.border.invisible = false;
+        let mut placed = placement();
+        placed.border = zgui_geom::Edges {
+            top: DevicePx(2.0),
+            right: DevicePx(2.0),
+            bottom: DevicePx(2.0),
+            left: DevicePx(2.0),
+        };
+
+        let mut scene = zgui_scene::Scene::new();
+        scene.begin_frame(Size::<i32, Device>::new(256, 256));
+        assert_eq!(background_and_border(&mut scene, &style, placed), 1);
+
+        let strokes = scene.primitives.quads[0].strokes;
+        assert_eq!(
+            strokes[0],
+            zgui_scene::PaintRef::NONE,
+            "the transparent top side was given a paint, so the ring has no gap and a spinner \
+             built from it cannot be seen to turn"
+        );
+        for side in &strokes[1..] {
+            assert_ne!(
+                *side,
+                zgui_scene::PaintRef::NONE,
+                "a solid side paints nothing"
+            );
+        }
+    }
+
+    /// Four sides of one colour cost one entry in the paint table.
+    ///
+    /// The common case by far, and the reason each side is interned rather than carried as a
+    /// colour: a border that is one colour must not pay four times for saying so.
+    #[test]
+    fn four_sides_of_one_colour_share_one_paint() {
+        let mut style = crate::lower::lower(&zgui_css::StyleDraft::initial().build(), 1.0);
+        style.border.colors = [zgui_color::Color::BLACK; 4];
+        style.border.invisible = false;
+        let mut placed = placement();
+        placed.border = zgui_geom::Edges {
+            top: DevicePx(1.0),
+            right: DevicePx(1.0),
+            bottom: DevicePx(1.0),
+            left: DevicePx(1.0),
+        };
+
+        let mut scene = zgui_scene::Scene::new();
+        scene.begin_frame(Size::<i32, Device>::new(256, 256));
+        assert_eq!(background_and_border(&mut scene, &style, placed), 1);
+
+        let strokes = scene.primitives.quads[0].strokes;
+        assert!(
+            strokes.iter().all(|side| *side == strokes[0]),
+            "one colour resolved to four different paints"
+        );
     }
 }

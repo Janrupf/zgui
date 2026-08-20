@@ -132,7 +132,7 @@ pub fn structures(module: Module) -> Vec<Reflected> {
                 radii,
                 border,
                 fill,
-                stroke,
+                strokes,
                 clip,
                 transform,
                 shape,
