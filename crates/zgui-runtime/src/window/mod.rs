@@ -317,6 +317,17 @@ pub struct Window {
     /// lost. Starts as keyboard, because before anyone has interacted at all the safe reading is
     /// the one that keeps focus visible.
     focus_modality: zgui_input::FocusSource,
+    /// Which pointer's event is being dispatched, for the capture a handler asks for while it runs.
+    ///
+    /// A capture is issued as a command and carried out after the listeners have finished, by which
+    /// time the event that prompted it is gone — so the pointer it belongs to has to be remembered
+    /// here. Recording every capture against the mouse instead means a finger on a slider captures
+    /// a pointer that is not the finger: the control believes it holds the drag, nothing else
+    /// believes it, and the gesture is read as a pan that scrolls the list under it.
+    ///
+    /// `None` where no pointer event is being dispatched, which is what a capture asked for by a
+    /// script or a timer looks like; the mouse is the right answer for those.
+    dispatching: Option<zgui_vocab::PointerId>,
     /// The column a run of vertical caret motions is aiming for, in the paragraph's own pixels.
     ///
     /// Held between the arrow presses of one run and dropped by anything else that moves the
@@ -696,6 +707,7 @@ impl Window {
             editors: crate::editing::Editors::new(),
             carets: crate::caret::Carets::new(),
             focus_modality: zgui_input::FocusSource::Keyboard,
+            dispatching: None,
             vertical_goal: None,
             selecting: None,
             clipboard: Vec::new(),

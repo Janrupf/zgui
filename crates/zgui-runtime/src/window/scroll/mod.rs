@@ -146,6 +146,14 @@ impl Window {
                     if self.router.bar_holds(*pointer) {
                         continue;
                     }
+                    // A control that captured the pointer has said the drag belongs to it — a
+                    // slider being moved, a column being resized, a toast being swiped away. Taking
+                    // it away to scroll the container is the one thing it asked not to happen, and
+                    // taking it away *late* is worse than either: the control is dragged for the
+                    // first few events and the container scrolls for the rest, so both move.
+                    if self.router.control_holds(*pointer) {
+                        continue;
+                    }
                     // Decided once, where the finger went down, and held for the whole drag. A
                     // container re-derived from where the finger is *now* is a list that stops
                     // following it the moment the drag leaves the scrollport — which is most

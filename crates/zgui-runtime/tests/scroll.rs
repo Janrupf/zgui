@@ -936,3 +936,54 @@ fn a_finger_held_still_opens_a_context_menu_and_the_loop_comes_back_for_it() {
     );
     harness.assert_park_invariant();
 }
+
+/// A control that captured the pointer keeps the drag, and the list under it does not scroll.
+///
+/// Capturing is a control saying the drag is *its*: a slider being moved, a column being resized, a
+/// toast being swiped away. Every one of those lives inside something scrollable, and reading the
+/// same travel as a pan takes the drag away and scrolls the container instead — the one thing the
+/// control asked not to happen.
+///
+/// Taking it away late is worse than either answer. The control is dragged for the events before
+/// the slop is passed and the container scrolls for the ones after, so both move at once, which is
+/// what a slider dragged downwards on a touchscreen actually did.
+#[test]
+fn a_control_that_captured_the_pointer_keeps_its_drag_instead_of_scrolling_the_list() {
+    let mut harness = support::app_with_text(CSS, move |cx: &mut zgui_view::BuildCx<'_>| {
+        use zgui_view::{IntoView, View};
+        // The first row captures, the way a slider does on the press that starts its drag.
+        let grabber = zgui_elements::column().class("row").on(
+            zgui_view::events::POINTER_DOWN,
+            move |cx: &mut zgui_view::EventCx<'_, zgui_view::events::PointerDown>| {
+                cx.capture_pointer();
+            },
+        );
+        let mut port = zgui_elements::column().class("port").child(grabber);
+        for _ in 0..200 {
+            port = port.child(zgui_elements::column().class("row"));
+        }
+        Box::new(
+            zgui_elements::column()
+                .class("root")
+                .child(port)
+                .into_view()
+                .build(cx),
+        )
+    });
+    harness.settle(8);
+    let before = topmost_row_top(window(&harness), 20.0);
+
+    // Down on the capturing row, then well past the slop — the travel a pan is read from.
+    drag_finger(
+        &mut harness,
+        10.0,
+        &[(30.0, 16), (50.0, 32), (70.0, 48), (90.0, 64)],
+    );
+
+    assert_eq!(
+        topmost_row_top(window(&harness), 20.0),
+        before,
+        "the list scrolled under a control that had captured the pointer, so the drag the control \
+         asked for was taken away from it"
+    );
+}

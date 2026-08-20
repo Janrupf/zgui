@@ -1112,12 +1112,11 @@ impl Window {
             match zgui_layout::boxtree::patch::walk(&mut layout, &document, root) {
                 Ok(found) if found.confine.is_empty() => {}
                 Ok(found) => {
-                    confined =
-                        zgui_layout::boxtree::patch::subtree::confine(
-                            &mut layout,
-                            &document,
-                            &found.confine,
-                        );
+                    confined = zgui_layout::boxtree::patch::subtree::confine(
+                        &mut layout,
+                        &document,
+                        &found.confine,
+                    );
                     rebuild = confined.is_none();
                 }
                 Err(met) => {
