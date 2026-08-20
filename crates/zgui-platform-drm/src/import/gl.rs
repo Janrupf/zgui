@@ -14,6 +14,24 @@
 //! is refused several calls later. On a machine where the two are one card the question does not
 //! arise, and this allocates from the only device there is.
 //!
+//! # Which layout, and the fault an implicit one hides
+//!
+//! [`gbm::Layout::Linear`], stated. A layout the allocator picks for itself is named to nobody: it
+//! is a property of the GEM object, so it reaches the allocator's own display engine and does not
+//! reach a *second* driver importing the descriptor, which is told nothing and reads the buffer as
+//! linear. On this path the allocator is the display card and the renderer may be another card
+//! entirely, and that is exactly the arrangement where the two disagree — the display scans a
+//! tiled buffer out correctly while the renderer draws into it as though it were linear, and the
+//! screen shows a regular, patterned scramble of the frame. Nothing reports it: every call
+//! succeeds.
+//!
+//! Linear is what both ends agree on with nothing to negotiate. It gives up whatever a tiled
+//! layout is worth on hardware that scans one out faster, which is worth less than a correct
+//! picture. **The refinement is to negotiate** — `eglQueryDmaBufModifiersEXT` says which layouts
+//! the renderer will import, the plane's `IN_FORMATS` says which the display can scan out, and the
+//! intersection goes to `gbm_bo_create_with_modifiers`. That is what
+//! [`modifier`](super::modifier) does for the Vulkan path, and it is the shape this one wants.
+//!
 //! # Nothing here is guaranteed by a capability
 //!
 //! The kernel's buffer-exchange documentation is explicit that agreeing a format and a layout is
@@ -29,7 +47,7 @@
 //! and nothing here has to keep an EGL display alive to clean up after itself.
 
 use std::ffi::c_void;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 use zgui_render_wgpu::{Gpu, wgpu};
 
@@ -146,8 +164,31 @@ pub enum Signal {
 pub struct Drawn {
     /// What the renderer composes into.
     texture: wgpu::Texture,
-    /// The allocation behind it, kept because the texture names its memory and not its lifetime.
-    allocation: gbm::Allocation,
+    /// The buffer behind it, kept because the texture names its memory and not its lifetime.
+    backing: Backing,
+}
+
+/// Where a scanout buffer came from.
+///
+/// Two allocators answer the same need and differ in one thing that decides correctness: the pitch
+/// they choose. See [`create`] for why that matters and which is asked first.
+#[derive(Debug)]
+enum Backing {
+    /// gbm, which states at allocation that the buffer is both drawn into and scanned out.
+    Gbm(gbm::Allocation),
+    /// The kernel's own allocator, whose buffers are linear by the interface's own contract.
+    ///
+    /// It is released through [`Drawn::release`] rather than by dropping, because destroying a GEM
+    /// handle needs the device it was made on and a destructor takes no arguments.
+    Dumb {
+        /// The buffer, which holds the handle.
+        buffer: zgui_drm::buffer::DumbBuffer,
+        /// The descriptor it was exported as, kept for the framebuffer the caller registers.
+        descriptor: OwnedFd,
+        /// How long a row is. Read once, because the buffer answers it and this keeps the two
+        /// arms answering the same way.
+        stride: u32,
+    },
 }
 
 impl Drawn {
@@ -165,7 +206,16 @@ impl Drawn {
     ///
     /// Returns a message where the driver would not export one.
     pub fn descriptor(&mut self) -> Result<BorrowedFd<'_>, String> {
-        self.allocation.descriptor()
+        match &mut self.backing {
+            Backing::Gbm(allocation) => allocation.descriptor(),
+            // Exported once, when the buffer was made: a dumb buffer has no lazy export to do.
+            // Reborrowed as shared so the descriptor's lifetime is this buffer's rather than the
+            // match binding's.
+            Backing::Dumb { descriptor, .. } => {
+                let held: &OwnedFd = descriptor;
+                Ok(held.as_fd())
+            }
+        }
     }
 
     /// The descriptor this was already exported as, where it was.
@@ -173,22 +223,37 @@ impl Drawn {
     /// For a caller building a list out of several buffers at once — see
     /// [`gbm::Allocation::exported`].
     pub fn exported(&self) -> Option<BorrowedFd<'_>> {
-        self.allocation.exported()
+        match &self.backing {
+            Backing::Gbm(allocation) => allocation.exported(),
+            Backing::Dumb { descriptor, .. } => Some(descriptor.as_fd()),
+        }
     }
 
     /// How long a row is, in bytes.
     pub fn stride(&self) -> u32 {
-        self.allocation.stride()
+        match &self.backing {
+            Backing::Gbm(allocation) => allocation.stride(),
+            Backing::Dumb { stride, .. } => *stride,
+        }
     }
 
     /// Where the first memory plane starts.
     pub fn offset(&self) -> u32 {
-        self.allocation.offset()
+        match &self.backing {
+            Backing::Gbm(allocation) => allocation.offset(),
+            // A dumb buffer holds one plane and it starts at the beginning.
+            Backing::Dumb { .. } => 0,
+        }
     }
 
     /// The layout the driver chose, or [`gbm::IMPLICIT`] where it named none.
     pub fn modifier(&self) -> u64 {
-        self.allocation.modifier()
+        match &self.backing {
+            Backing::Gbm(allocation) => allocation.modifier(),
+            // The kernel's allocator names no layout. It does not need to: a dumb buffer is linear
+            // by the interface's own contract, which is the whole reason this arm exists.
+            Backing::Dumb { .. } => gbm::IMPLICIT,
+        }
     }
 
     /// Reads the pixel at the top-left corner out of the buffer itself.
@@ -200,8 +265,208 @@ impl Drawn {
     ///
     /// Returns a message where the driver would not map the buffer.
     pub fn peek(&self) -> Result<[u8; 4], String> {
-        self.allocation.peek()
+        self.peek_at(0, 0)
     }
+
+    /// Reads the pixel at `x`, `y` out of the buffer itself.
+    ///
+    /// See [`gbm::Allocation::peek_at`] for why a check on the corner alone proves less than it
+    /// looks like it does.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message where the driver would not map the buffer.
+    pub fn peek_at(&self, x: u32, y: u32) -> Result<[u8; 4], String> {
+        match &self.backing {
+            Backing::Gbm(allocation) => allocation.peek_at(x, y),
+            Backing::Dumb { .. } => Err(
+                "a dumb buffer is read through its own device rather than through gbm".to_owned(),
+            ),
+        }
+    }
+
+    /// Reads the pixel at `x`, `y` out of the buffer, whichever allocator made it.
+    ///
+    /// [`Drawn::peek_at`] reads a gbm allocation through gbm. This reads either kind, because a
+    /// check that can only read one of them cannot compare them — and comparing them is the whole
+    /// reason there are two.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message where the buffer would not map.
+    pub fn read_pixel(
+        &mut self,
+        device: &zgui_drm::Device,
+        x: u32,
+        y: u32,
+    ) -> Result<[u8; 4], String> {
+        match &mut self.backing {
+            Backing::Gbm(allocation) => allocation.peek_at(x, y),
+            Backing::Dumb { buffer, stride, .. } => {
+                let at = *stride as usize * y as usize + x as usize * 4;
+                let bytes = buffer.bytes(device).map_err(|error| error.to_string())?;
+                bytes
+                    .get(at..at + 4)
+                    .map(|pixel| [pixel[0], pixel[1], pixel[2], pixel[3]])
+                    .ok_or_else(|| format!("({x}, {y}) is past the end of this buffer"))
+            }
+        }
+    }
+
+    /// Gives back what a destructor cannot.
+    ///
+    /// A gbm allocation releases itself when it is dropped. A dumb buffer's handle belongs to the
+    /// device it was made on, and destroying it needs that device — so a caller holding one of
+    /// these hands it back here. A caller that drops one instead leaks a GEM handle until the
+    /// descriptor closes, which is the same shape every other DRM handle in this crate has.
+    pub fn release(self, device: &zgui_drm::Device) {
+        let Backing::Dumb { buffer, .. } = self.backing else {
+            return;
+        };
+        if let Err(error) = device.destroy_dumb_buffer(buffer) {
+            tracing::warn!(
+                target: "zgui::platform",
+                "a scanout buffer's handle could not be given back: {error}"
+            );
+        }
+    }
+}
+
+/// Creates `count` buffers whose layout the renderer and the display both agree about.
+///
+/// # Why the pitch decides which allocator is used
+///
+/// A buffer crossing a device boundary is only correct where the two ends lay its rows out the same
+/// way, and **nothing in the interfaces reports whether they do**. On the machine this was written
+/// against, gbm answers `DRM_FORMAT_MOD_INVALID` for every buffer it makes, rounds a 1280-pixel row
+/// up to a 8192-byte pitch, refuses `gbm_bo_create_with_modifiers` outright, and ignores
+/// `GBM_BO_USE_LINEAR`. The importer then lays its rows out at `width x 4` and every call along the
+/// way succeeds. What reaches the screen is a scrambled frame and no error anywhere.
+///
+/// One condition takes the question away rather than answering it:
+///
+/// > **linear, and a pitch of exactly `width x 4`.**
+///
+/// Under it, an importer that honours the pitch it is handed and one that computes `width x 4` for
+/// itself produce the same addresses, so there is nothing left for the two ends to disagree about.
+/// It is an equality on two integers rather than a measurement, and a caller either has it or does
+/// not.
+///
+/// So the allocators are asked in turn and the first whose pitch is exact is taken:
+///
+/// 1. **gbm**, which states at allocation that the buffer is both drawn into and scanned out. This
+///    is the ask a driver can satisfy best, and on hardware whose pitch needs no rounding it is
+///    also the one that gives a tiled layout where tiling is worth having.
+/// 2. **the kernel's own allocator**, whose buffers are linear by the interface's own contract.
+///    What it does not state is renderability, so an import or a first submission may be refused —
+///    which is an error a caller falls back from rather than a wrong picture.
+///
+/// A caller that gets [`Unsupported`] from both falls back to copying each frame, which is always
+/// correct.
+///
+/// **The refinement above all of this is to negotiate**: `eglQueryDmaBufModifiersEXT` says which
+/// layouts the importer accepts, the plane's `IN_FORMATS` says which the display scans out, and the
+/// intersection goes to `gbm_bo_create_with_modifiers`. That is explicit rather than merely
+/// unambiguous, and it is what hardware new enough to publish modifiers should use. This machine
+/// publishes none on either side, so there is nothing there to intersect.
+pub fn create_agreed(
+    gpu: &Gpu,
+    allocator: &gbm::Device,
+    device: &zgui_drm::Device,
+    width: u32,
+    height: u32,
+    count: usize,
+) -> Result<Vec<Drawn>, Unsupported> {
+    let exact = width * 4;
+    match create(gpu, allocator, width, height, count) {
+        Ok(buffers) if buffers.first().is_some_and(|first| first.stride() == exact) => Ok(buffers),
+        Ok(buffers) => {
+            let padded = buffers.first().map_or(0, Drawn::stride);
+            drop(buffers);
+            tracing::info!(
+                target: "zgui::platform",
+                "gbm laid a row of {width} out in {padded} bytes where it needs {exact}, so the \
+                 renderer and the display would not agree about where a row begins; the kernel's \
+                 own allocator is asked instead"
+            );
+            create_dumb(gpu, device, width, height, count)
+        }
+        Err(why) => {
+            tracing::info!(
+                target: "zgui::platform",
+                "gbm would not allocate a scanout buffer, so the kernel's own allocator is asked \
+                 instead: {why}"
+            );
+            create_dumb(gpu, device, width, height, count)
+        }
+    }
+}
+
+/// Creates `count` buffers through the kernel's own allocator, each imported into `gpu`.
+///
+/// A dumb buffer is linear by the interface's own contract and its pitch is the width rounded to a
+/// small alignment, so it is the arrangement most likely to satisfy the condition
+/// [`create_agreed`] states. It is still checked rather than assumed: a driver is free to pad one,
+/// and some do.
+///
+/// # Errors
+///
+/// Returns [`Unsupported`], which names the step that refused.
+pub fn create_dumb(
+    gpu: &Gpu,
+    device: &zgui_drm::Device,
+    width: u32,
+    height: u32,
+    count: usize,
+) -> Result<Vec<Drawn>, Unsupported> {
+    let backend = gpu.adapter().get_info().backend;
+    if backend != wgpu::Backend::Gl {
+        return Err(Unsupported::Backend(backend));
+    }
+    let mut drawn = Vec::with_capacity(count);
+    for _ in 0..count {
+        let buffer = device
+            .create_dumb_buffer(width, height, zgui_drm::format::Format(FOURCC))
+            .map_err(|error| Unsupported::Driver {
+                step: "allocating a scanout buffer through the kernel's own allocator",
+                reason: error.to_string(),
+            })?;
+        let stride = buffer.stride();
+        if stride != width * 4 {
+            return Err(Unsupported::Driver {
+                step: "allocating a scanout buffer the renderer and the display agree about",
+                reason: format!(
+                    "the kernel laid a row of {width} out in {stride} bytes where it needs {}, so \
+                     neither allocator on this machine answers a layout both ends read the same way",
+                    width * 4
+                ),
+            });
+        }
+        let descriptor = device
+            .export_buffer(&buffer)
+            .map_err(|error| Unsupported::Driver {
+                step: "exporting a scanout buffer as a descriptor",
+                reason: error.to_string(),
+            })?;
+        let texture = import(
+            gpu,
+            descriptor.as_fd(),
+            width,
+            height,
+            stride,
+            0,
+            gbm::IMPLICIT,
+        )?;
+        drawn.push(Drawn {
+            texture,
+            backing: Backing::Dumb {
+                buffer,
+                descriptor,
+                stride,
+            },
+        });
+    }
+    Ok(drawn)
 }
 
 /// Creates `count` buffers of `width` by `height` on `allocator`, each imported into `gpu`.
@@ -225,14 +490,25 @@ pub fn create(
         return Err(Unsupported::Backend(backend));
     }
     let mut drawn = Vec::with_capacity(count);
-    for _ in 0..count {
-        let mut allocation =
-            allocator
-                .create(width, height, FOURCC)
-                .map_err(|reason| Unsupported::Driver {
-                    step: "allocating a buffer that is both drawn into and scanned out",
-                    reason,
-                })?;
+    for slot in 0..count {
+        let mut allocation = allocator
+            .create(width, height, FOURCC, gbm::Layout::Linear)
+            .map_err(|reason| Unsupported::Driver {
+                step: "allocating a buffer that is both drawn into and scanned out",
+                reason,
+            })?;
+        if slot == 0 {
+            // The stride is worth as much as the layout code: a pitch wider than the row needs is
+            // a tiled buffer whatever the code says, and on this path that is the fault that shows
+            // up as a picture rather than as an error.
+            tracing::info!(
+                target: "zgui::platform",
+                "{} laid the display's buffers out {:#x}, {} bytes to a row of {width}",
+                allocator.backend(),
+                allocation.modifier(),
+                allocation.stride()
+            );
+        }
         // Read before the descriptor is borrowed: the export borrows the allocation until the
         // descriptor is done with, and these three are what the import has to be told about it.
         let (stride, offset, modifier) = (
@@ -249,7 +525,7 @@ pub fn create(
         let texture = import(gpu, descriptor, width, height, stride, offset, modifier)?;
         drawn.push(Drawn {
             texture,
-            allocation,
+            backing: Backing::Gbm(allocation),
         });
     }
     Ok(drawn)
@@ -339,6 +615,30 @@ fn display_extensions(gpu: &Gpu) -> Option<String> {
     egl.query_string(Some(display), khronos_egl::EXTENSIONS)
         .ok()
         .map(|held| held.to_string_lossy().into_owned())
+}
+
+/// Imports one descriptor as the texture a frame is composed into.
+///
+/// Public because who allocated the buffer is a separate question from how it is imported: a
+/// caller holding a descriptor from somewhere other than [`gbm`] — the kernel's own dumb buffer
+/// allocator, say — imports it through exactly this call.
+///
+/// `stride`, `offset` and `modifier` describe the buffer as its allocator reported it. A `modifier`
+/// of [`gbm::IMPLICIT`] names no layout, which is what an allocator that publishes none answers.
+///
+/// # Errors
+///
+/// Returns [`Unsupported`], which names the step that refused.
+pub fn import_descriptor(
+    gpu: &Gpu,
+    descriptor: BorrowedFd<'_>,
+    width: u32,
+    height: u32,
+    stride: u32,
+    offset: u32,
+    modifier: u64,
+) -> Result<wgpu::Texture, Unsupported> {
+    import(gpu, descriptor, width, height, stride, offset, modifier)
 }
 
 /// Imports one descriptor as the texture a frame is composed into.

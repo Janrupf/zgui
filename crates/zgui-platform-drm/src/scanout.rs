@@ -1408,9 +1408,13 @@ impl Scanout {
                         warn!("an imported scanout buffer could not be released: {error}");
                     }
                 }
-                // wgpu deletes each texture as it reaches it, and each allocation goes with the
-                // buffer that holds it.
-                drop(buffers);
+                // wgpu deletes each texture as it reaches it, and a gbm allocation goes with the
+                // buffer that holds it. A buffer the *kernel's* allocator made holds a GEM handle
+                // instead, and destroying one needs the device — which a destructor has no way to
+                // reach, so it is given back here.
+                for buffer in buffers {
+                    buffer.release(device);
+                }
             }
             Buffers::Imported {
                 handover,
@@ -1475,12 +1479,12 @@ impl Scanout {
 
         let width = output.mode.width();
         let height = output.mode.height();
-        let buffers =
-            gl::create(gpu, &allocator, width, height, DRAWN).map_err(Copied::NoImages)?;
+        let buffers = gl::create_agreed(gpu, &allocator, device, width, height, DRAWN)
+            .map_err(Copied::NoImages)?;
         // Allocated the same way and on the same node, and registered as no framebuffer: nothing
         // scans one out. `STAGING` says what they are for.
-        let staging =
-            gl::create(gpu, &allocator, width, height, STAGING).map_err(Copied::NoImages)?;
+        let staging = gl::create_agreed(gpu, &allocator, device, width, height, STAGING)
+            .map_err(Copied::NoImages)?;
 
         // Whether the display takes an in-fence at all decides the top tier: a descriptor the
         // driver would export has nowhere to go on a display that cannot be handed one.
