@@ -256,7 +256,7 @@ impl Report {
     }
 
     /// Creates an event for the display it happened on.
-    const fn on(surface: SurfaceId, event: SurfaceEvent) -> Self {
+    pub(crate) const fn on(surface: SurfaceId, event: SurfaceEvent) -> Self {
         Self {
             surface: Some(surface),
             event,
@@ -493,7 +493,7 @@ impl Stamps {
 }
 
 /// Returns what the kernel's monotonic clock reads now.
-fn monotonic() -> Duration {
+pub(crate) fn monotonic() -> Duration {
     let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
     Duration::new(
         u64::try_from(now.tv_sec).unwrap_or(0),

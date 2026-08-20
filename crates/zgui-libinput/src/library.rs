@@ -82,6 +82,15 @@ pub(crate) struct LibinputPointerEvent {
     _opaque: [u8; 0],
 }
 
+/// libinput's `struct libinput_event_touch`.
+///
+/// One event read as a touch event, with the same lifetime as [`LibinputKeyboardEvent`].
+#[repr(C)]
+pub(crate) struct LibinputTouchEvent {
+    /// Nothing. This type is only ever pointed at.
+    _opaque: [u8; 0],
+}
+
 /// libinput's `open_restricted`.
 ///
 /// The caller opens the path and answers the descriptor. A refusal is the negative `errno`, so
@@ -276,6 +285,9 @@ symbols! {
         /// The event read as a pointer event, which is only valid for a pointer event type.
         event_get_pointer_event: "libinput_event_get_pointer_event"
             => fn(*mut LibinputEvent) -> *mut LibinputPointerEvent;
+        /// The event read as a touch event, which is only valid for a touch event type.
+        event_get_touch_event: "libinput_event_get_touch_event"
+            => fn(*mut LibinputEvent) -> *mut LibinputTouchEvent;
 
         // --- one device -------------------------------------------------------------------
 
@@ -376,6 +388,32 @@ symbols! {
         /// whole detent only when it has accumulated one.
         pointer_get_scroll_value_v120: "libinput_event_pointer_get_scroll_value_v120"
             => fn(*mut LibinputPointerEvent, c_uint) -> c_double;
+
+        // --- a touch ----------------------------------------------------------------------
+
+        /// When the contact happened, in microseconds on the monotonic clock.
+        touch_get_time_usec: "libinput_event_touch_get_time_usec"
+            => fn(*mut LibinputTouchEvent) -> u64;
+        /// Which contact this is, numbered across the whole seat rather than within the device.
+        ///
+        /// The number is taken when a finger goes down and given back when it lifts, so two
+        /// devices touched at once never answer the same one. A device with no multi-touch
+        /// protocol still gets a slot, because libinput assigns it rather than reading it.
+        ///
+        /// Valid for a contact that goes down, moves or lifts. A cancellation ends every contact
+        /// on its device at once and names none of them.
+        touch_get_seat_slot: "libinput_event_touch_get_seat_slot"
+            => fn(*mut LibinputTouchEvent) -> i32;
+        /// Where the contact is across, scaled into a width the caller names, and **after** the
+        /// device's calibration matrix. A width of one answers a fraction of the touch surface.
+        ///
+        /// Only a contact that goes down or moves has a position. A lift carries none, so what a
+        /// release happened over is whatever the caller last read.
+        touch_get_x_transformed: "libinput_event_touch_get_x_transformed"
+            => fn(*mut LibinputTouchEvent, u32) -> c_double;
+        /// Where the contact is down, scaled into a height the caller names, after calibration.
+        touch_get_y_transformed: "libinput_event_touch_get_y_transformed"
+            => fn(*mut LibinputTouchEvent, u32) -> c_double;
     }
 }
 
@@ -538,7 +576,7 @@ mod tests {
     ///
     /// Written out for the same reason as the sonames: a count taken from the table agrees with
     /// the table whatever the table says, including a row that was dropped in a merge.
-    const ROWS: usize = 38;
+    const ROWS: usize = 43;
 
     #[test]
     fn a_soname_nothing_has_is_an_error_rather_than_a_panic() {
@@ -592,13 +630,13 @@ mod tests {
 
     #[test]
     fn the_whole_table_resolves_out_of_the_real_libinput() {
-        // The guard over the thirty-eight symbol names. Each is transcribed from a C header by
+        // The guard over the forty-three symbol names. Each is transcribed from a C header by
         // hand, and a misspelled one resolves nowhere, so it fails here rather than at the first
         // call.
         if !INSTALLED_AS.into_iter().any(is_on_this_machine) {
             eprintln!(
                 "the_whole_table_resolves_out_of_the_real_libinput: this machine has no libinput, \
-                 so the thirty-eight symbol names were checked against nothing. Install libinput, \
+                 so the forty-three symbol names were checked against nothing. Install libinput, \
                  or run the suite from `nix develop`, which puts `libinput.so.10` on the library \
                  path."
             );

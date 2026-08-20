@@ -14,9 +14,22 @@
 //!
 //! # The device classes
 //!
-//! Which device is a keyboard and which is a pointer is libinput's answer here, taken from the
-//! evdev bits, its own quirks database and udev's properties. `types_on` and `points_with` read the
-//! evdev bits and decide, and they belong to the other source alone.
+//! Which device is a keyboard, which is a pointer and which is a touch surface is libinput's answer
+//! here, taken from the evdev bits, its own quirks database and udev's properties. `types_on` and
+//! `points_with` read the evdev bits and decide, and they belong to the other source alone.
+//!
+//! # The contacts
+//!
+//! A touch surface is the one class this source reads and the other cannot. libinput numbers each
+//! contact, follows it from the glass to the lift, and puts the device's calibration matrix through
+//! its position — so a panel mounted upside down is corrected by a udev property rather than by
+//! code here.
+//!
+//! Each contact becomes a pointer of its own, and **the cursor is left where it is**. A finger
+//! writes no `:hover`, so a control whose only affordance appears on hover is unreachable by touch
+//! rather than permanently lit, which is what [`PointerKind::can_hover`] is for.
+//!
+//! [`PointerKind::can_hover`]: zgui_vocab::PointerKind::can_hover
 //!
 //! # The repeats
 //!
@@ -41,15 +54,18 @@ use std::os::fd::BorrowedFd;
 use std::path::Path;
 use std::time::Duration;
 
-use tracing::{info, warn};
+use tracing::{debug, info, trace, warn};
 use zgui_evdev::Key;
-use zgui_geom::Size;
+use zgui_geom::{Css, CssPx, Point, Size};
 use zgui_libinput::{Context, Device, DeviceId, Event, Press, Scrolled};
-use zgui_vocab::{PointerAction, ScrollDelta};
+use zgui_platform::{SurfaceEvent, SurfaceId};
+use zgui_vocab::{Modifiers, PointerAction, PointerButton, ScrollDelta};
 
 use crate::input::lent::{Held, Lent};
 use crate::input::pointer::{self, Motion, Pointer, Screen};
-use crate::input::seat::{Down, Keys, Opened, Report, Stamps, Transition, ask, cancelled, moved};
+use crate::input::seat::{
+    Down, Keys, Opened, Report, Stamps, Transition, ask, cancelled, monotonic, moved,
+};
 use crate::session::Session;
 use zgui_vocab::Timestamp;
 
@@ -74,11 +90,27 @@ struct Reading {
     types: bool,
     /// Whether somebody points with it.
     points: bool,
+    /// Whether somebody touches it.
+    touches: bool,
     /// How long it waits before repeating a key, and how often after that.
     ///
     /// Read once when the device arrived, because it is the device's own setting and does not move
     /// while it is open. Nothing where the device is no keyboard.
     repeat: Option<(Duration, Duration)>,
+}
+
+/// One contact that is down, and what its lift needs.
+#[derive(Debug, Clone, Copy)]
+struct Finger {
+    /// The device it is on, so that device going, or cancelling, ends it.
+    device: DeviceId,
+    /// Which display it is on and where on it, from the last report that carried a position.
+    ///
+    /// A lift carries none — libinput reports where a contact went down and where it moved, and
+    /// says of a lift only that it happened — so the release is delivered here.
+    at: (SurfaceId, Point<CssPx, Css>),
+    /// Whether it is the contact that drives compatibility behaviour.
+    primary: bool,
 }
 
 /// The key that is repeating, and when its next repeat is owed.
@@ -102,6 +134,11 @@ pub(crate) struct Through {
     held: Vec<Held>,
     /// What each device it reports needs remembered.
     devices: BTreeMap<DeviceId, Reading>,
+    /// Every contact that is down, under the slot libinput gave it.
+    ///
+    /// The slot is numbered across the whole seat, so two touchscreens never collide here, and it
+    /// is given back when the contact lifts.
+    fingers: BTreeMap<u32, Finger>,
     /// How many nodes the last add could not read yet, which the session answers.
     waiting: usize,
     /// The one key that is repeating, where one is.
@@ -115,6 +152,7 @@ impl Through {
             context,
             held: Vec::new(),
             devices: BTreeMap::new(),
+            fingers: BTreeMap::new(),
             waiting: 0,
             repeating: None,
         }
@@ -217,6 +255,7 @@ impl Through {
             context,
             held,
             devices,
+            fingers,
             waiting,
             repeating,
         } = self;
@@ -245,7 +284,9 @@ impl Through {
                 Event::DeviceRemoved(device) => {
                     // Nothing is held on a device that has gone, so a key repeating on it stops.
                     repeating.take_if(|held| held.device == device.id());
-                    reports.extend(went(devices, &device, keys, pointer, screens, stamps));
+                    reports.extend(went(
+                        devices, fingers, &device, keys, pointer, screens, stamps,
+                    ));
                 }
                 Event::Key {
                     device,
@@ -306,6 +347,30 @@ impl Through {
                         &event,
                         keys.modifiers(),
                         pointer,
+                        screens,
+                        stamps,
+                    ));
+                }
+                // A finger on the glass is the same interruption as a hand on a mouse.
+                Event::TouchDown { .. } => {
+                    *repeating = None;
+                    reports.extend(touched(
+                        devices,
+                        fingers,
+                        &event,
+                        keys.modifiers(),
+                        screens,
+                        stamps,
+                    ));
+                }
+                Event::TouchMotion { .. }
+                | Event::TouchUp { .. }
+                | Event::TouchCancelled { .. } => {
+                    reports.extend(touched(
+                        devices,
+                        fingers,
+                        &event,
+                        keys.modifiers(),
                         screens,
                         stamps,
                     ));
@@ -382,7 +447,11 @@ fn arrived(devices: &mut BTreeMap<DeviceId, Reading>, device: &Device, held: &[H
         target: "zgui::platform",
         "{} is read through libinput as {}",
         device.path().display(),
-        describe(capabilities.keyboard(), capabilities.pointer())
+        describe(
+            capabilities.keyboard(),
+            capabilities.pointer(),
+            capabilities.touch()
+        )
     );
     devices.insert(
         device.id(),
@@ -391,6 +460,7 @@ fn arrived(devices: &mut BTreeMap<DeviceId, Reading>, device: &Device, held: &[H
             buttons: BTreeSet::new(),
             types: capabilities.keyboard(),
             points: capabilities.pointer(),
+            touches: capabilities.touch(),
             // The device's own rate, read once here: libinput drops the repeats the kernel makes
             // from it, and this source makes its own at the same rate.
             repeat: held
@@ -402,23 +472,36 @@ fn arrived(devices: &mut BTreeMap<DeviceId, Reading>, device: &Device, held: &[H
 }
 
 /// Returns what a device this source took is read as.
-fn describe(types: bool, points: bool) -> &'static str {
-    match (types, points) {
-        (true, true) => "a keyboard and a pointer",
-        (true, false) => "a keyboard",
-        (false, true) => "a pointer",
-        (false, false) => "neither a keyboard nor a pointer",
+///
+/// A device can be several of them at once, and a wireless receiver commonly is.
+fn describe(types: bool, points: bool, touches: bool) -> String {
+    let mut jobs: Vec<&str> = Vec::with_capacity(3);
+    if types {
+        jobs.push("a keyboard");
+    }
+    if points {
+        jobs.push("a pointer");
+    }
+    if touches {
+        jobs.push("a touch surface");
+    }
+    match jobs.split_last() {
+        None => "none of the things this backend reads".to_owned(),
+        Some((last, [])) => (*last).to_owned(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
     }
 }
 
 /// Ends everything a device that has gone was holding open.
 ///
-/// A device holds nothing once it is gone, so its keys come off the layout and its buttons end the
-/// interactions they were holding. Without the first, a modifier held while its keyboard was
-/// unplugged stays held for the rest of the program and every later letter comes out shifted; and
-/// a terminal switch gives every device back, so this runs for all of them on the way out.
+/// A device holds nothing once it is gone, so its keys come off the layout, its buttons end the
+/// interactions they were holding, and every contact still down on it is cancelled. Without the
+/// first, a modifier held while its keyboard was unplugged stays held for the rest of the program
+/// and every later letter comes out shifted; and a terminal switch gives every device back, so this
+/// runs for all of them on the way out.
 fn went(
     devices: &mut BTreeMap<DeviceId, Reading>,
+    fingers: &mut BTreeMap<u32, Finger>,
     device: &Device,
     keys: &mut Keys,
     pointer: &Pointer,
@@ -437,6 +520,12 @@ fn went(
         pointer,
         screens,
     );
+    reports.extend(lifted_with(
+        fingers,
+        device.id(),
+        keys.modifiers(),
+        stamps.at(monotonic()),
+    ));
     reports.extend(
         keys.resynchronise(&mut reading.down, &nothing)
             .map(Report::focused),
@@ -444,11 +533,231 @@ fn went(
     reports
 }
 
+/// Cancels every contact still down on one device.
+///
+/// [`PointerAction::Cancelled`] rather than a release, for the reason
+/// [`cancelled`](crate::input::seat::cancelled) gives: nobody let go. A cancel also takes the
+/// contact off the surface, so no leave is owed after it.
+fn lifted_with(
+    fingers: &mut BTreeMap<u32, Finger>,
+    device: DeviceId,
+    modifiers: Modifiers,
+    timestamp: Timestamp,
+) -> Vec<Report> {
+    let ended: Vec<(u32, Finger)> = fingers
+        .iter()
+        .filter(|(_, finger)| finger.device == device)
+        .map(|(slot, finger)| (*slot, *finger))
+        .collect();
+    fingers.retain(|_, finger| finger.device != device);
+    ended
+        .into_iter()
+        .map(|(slot, finger)| {
+            contact_report(
+                PointerAction::Cancelled,
+                Some(PointerButton::Primary),
+                slot,
+                &finger,
+                modifiers,
+                timestamp,
+            )
+        })
+        .collect()
+}
+
+/// Writes down where one contact is, as libinput reported it and as this backend placed it.
+///
+/// The panel states its own range and libinput normalises against that, so a mapping that is
+/// mirrored, turned or off by a margin looks correct at every step and wrong only on the glass.
+/// This is the line that says which: touch the corners and read the fractions.
+fn note(slot: u32, did: &str, x: f64, y: f64, place: (SurfaceId, Point<CssPx, Css>)) {
+    let (surface, at) = place;
+    debug!(
+        target: "zgui::platform",
+        "contact {slot} {did} at {x:.4}, {y:.4} of the touch surface, which is {:.1}, {:.1} on \
+         {surface:?}",
+        at.x.0, at.y.0
+    );
+}
+
+/// The same, for a contact that is moving.
+///
+/// One level quieter, because a finger held on the glass reports about a hundred times a second and
+/// a line each is a formatted write on the frame loop's own thread. Where a contact **arrives** is
+/// what a person bringing a panel up needs, and that is the line above.
+fn note_moving(slot: u32, x: f64, y: f64, place: (SurfaceId, Point<CssPx, Css>)) {
+    let (surface, at) = place;
+    trace!(
+        target: "zgui::platform",
+        "contact {slot} moved at {x:.4}, {y:.4} of the touch surface, which is {:.1}, {:.1} on \
+         {surface:?}",
+        at.x.0, at.y.0
+    );
+}
+
+/// Returns one report about one contact.
+fn contact_report(
+    action: PointerAction,
+    button: Option<PointerButton>,
+    slot: u32,
+    finger: &Finger,
+    modifiers: Modifiers,
+    timestamp: Timestamp,
+) -> Report {
+    let (surface, at) = finger.at;
+    Report::on(
+        surface,
+        SurfaceEvent::Pointer {
+            action,
+            event: pointer::contact(at, slot, finger.primary, button),
+            modifiers,
+            timestamp,
+        },
+    )
+}
+
+/// Reads one thing a contact did.
+///
+/// **The cursor is left where it is.** A finger is a pointer of its own, so it moves nothing that
+/// a mouse moves and writes no `:hover`; what makes that true is that nothing here touches
+/// [`Pointer`]. Warping the cursor onto every touch would light up whatever was under the finger
+/// and leave it lit, because a finger that has gone reports no movement away.
+fn touched(
+    devices: &BTreeMap<DeviceId, Reading>,
+    fingers: &mut BTreeMap<u32, Finger>,
+    event: &Event,
+    modifiers: Modifiers,
+    screens: &[Screen],
+    stamps: Stamps,
+) -> Vec<Report> {
+    let Some(reading) = devices.get(&event.device()) else {
+        return Vec::new();
+    };
+    if !reading.touches {
+        return Vec::new();
+    }
+    let Some(at) = event.at() else {
+        return Vec::new();
+    };
+    let timestamp = stamps.at(at);
+
+    match event {
+        Event::TouchDown {
+            device, slot, x, y, ..
+        } => {
+            let Some(place) = pointer::landed(*x as f32, *y as f32, screens) else {
+                // The application claimed no display, so there is nowhere for this to go.
+                return Vec::new();
+            };
+            note(*slot, "went down", *x, *y, place);
+            // The first contact down is the primary one. A second finger while the first is still
+            // held is not, so a control with no multi-pointer behaviour of its own ignores it.
+            let finger = Finger {
+                device: *device,
+                at: place,
+                primary: fingers.is_empty(),
+            };
+            fingers.insert(*slot, finger);
+            vec![
+                contact_report(
+                    PointerAction::Entered,
+                    None,
+                    *slot,
+                    &finger,
+                    modifiers,
+                    timestamp,
+                ),
+                contact_report(
+                    PointerAction::Pressed,
+                    Some(PointerButton::Primary),
+                    *slot,
+                    &finger,
+                    modifiers,
+                    timestamp,
+                ),
+            ]
+        }
+        Event::TouchMotion {
+            device, slot, x, y, ..
+        } => {
+            let Some(place) = pointer::landed(*x as f32, *y as f32, screens) else {
+                return Vec::new();
+            };
+            let Some(finger) = fingers.get_mut(slot) else {
+                // A contact that moved without going down first. libinput reports the down, so
+                // this is a slot that arrived before its device did.
+                return Vec::new();
+            };
+            if finger.device != *device || finger.at == place {
+                return Vec::new();
+            }
+            note_moving(*slot, *x, *y, place);
+            let was = *finger;
+            finger.at = place;
+            let moved = *finger;
+            if was.at.0 == place.0 {
+                return vec![contact_report(
+                    PointerAction::Moved,
+                    None,
+                    *slot,
+                    &moved,
+                    modifiers,
+                    timestamp,
+                )];
+            }
+            // A contact dragged onto another display leaves the one it was on and enters the one it
+            // reached, exactly as a pointer crossing between them does.
+            vec![
+                contact_report(PointerAction::Left, None, *slot, &was, modifiers, timestamp),
+                contact_report(
+                    PointerAction::Entered,
+                    None,
+                    *slot,
+                    &moved,
+                    modifiers,
+                    timestamp,
+                ),
+            ]
+        }
+        Event::TouchUp { device, slot, .. } => {
+            let Some(finger) = fingers.get(slot).copied() else {
+                return Vec::new();
+            };
+            if finger.device != *device {
+                return Vec::new();
+            }
+            fingers.remove(slot);
+            // The release first and the leave after it: a control activates on the release, and it
+            // has to still be the thing the contact is on when that arrives.
+            vec![
+                contact_report(
+                    PointerAction::Released,
+                    Some(PointerButton::Primary),
+                    *slot,
+                    &finger,
+                    modifiers,
+                    timestamp,
+                ),
+                contact_report(
+                    PointerAction::Left,
+                    None,
+                    *slot,
+                    &finger,
+                    modifiers,
+                    timestamp,
+                ),
+            ]
+        }
+        Event::TouchCancelled { device, .. } => lifted_with(fingers, *device, modifiers, timestamp),
+        _ => Vec::new(),
+    }
+}
+
 /// Reads one thing done with a pointing device.
 fn pointed(
     devices: &mut BTreeMap<DeviceId, Reading>,
     event: &Event,
-    modifiers: zgui_vocab::Modifiers,
+    modifiers: Modifiers,
     pointer: &mut Pointer,
     screens: &[Screen],
     stamps: Stamps,
@@ -700,5 +1009,344 @@ mod tests {
             repeating.is_none(),
             "and it stops rather than being owed for ever"
         );
+    }
+}
+
+#[cfg(test)]
+mod contacts {
+    //! What a contact amounts to, and what it leaves alone.
+    //!
+    //! No libinput and no device: every event is written by hand, and what is under test is the
+    //! translation from one of them to the reports it produces.
+
+    use zgui_platform::SurfaceId;
+    use zgui_vocab::{PointerId, PointerKind};
+
+    use super::*;
+
+    /// One display, eight hundred by six hundred at a scale of one.
+    fn screens() -> Vec<Screen> {
+        vec![Screen {
+            id: SurfaceId::new(1),
+            left: 0.0,
+            width: 800.0,
+            height: 600.0,
+            scale: 1.0,
+        }]
+    }
+
+    /// One touchscreen, under the identifier every event below names.
+    fn touchscreen() -> BTreeMap<DeviceId, Reading> {
+        let mut devices = BTreeMap::new();
+        devices.insert(
+            DeviceId::new(1),
+            Reading {
+                touches: true,
+                ..Reading::default()
+            },
+        );
+        devices
+    }
+
+    /// The anchor a test reads its moments against.
+    fn stamps() -> Stamps {
+        Stamps::from_origin(Duration::ZERO)
+    }
+
+    /// What one report is, as the pieces a case asserts on.
+    fn read(
+        report: &Report,
+    ) -> (
+        Option<SurfaceId>,
+        PointerAction,
+        PointerId,
+        bool,
+        (f32, f32),
+    ) {
+        let SurfaceEvent::Pointer { action, event, .. } = report.event else {
+            panic!("a contact produced something other than a pointer event");
+        };
+        (
+            report.surface,
+            action,
+            event.id,
+            event.primary,
+            (event.position.x.0, event.position.y.0),
+        )
+    }
+
+    /// Every action one batch of reports carries, in order.
+    fn actions(reports: &[Report]) -> Vec<PointerAction> {
+        reports.iter().map(|report| read(report).1).collect()
+    }
+
+    /// One contact going down at a fraction of the touch surface.
+    fn down(slot: u32, x: f64, y: f64) -> Event {
+        Event::TouchDown {
+            device: DeviceId::new(1),
+            slot,
+            x,
+            y,
+            at: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn a_contact_arrives_and_presses_where_it_landed() {
+        let mut fingers = BTreeMap::new();
+        let reports = touched(
+            &touchscreen(),
+            &mut fingers,
+            &down(0, 0.5, 0.25),
+            Modifiers::NONE,
+            &screens(),
+            stamps(),
+        );
+
+        assert_eq!(
+            actions(&reports),
+            [PointerAction::Entered, PointerAction::Pressed]
+        );
+        for report in &reports {
+            let (surface, _, id, primary, at) = read(report);
+            assert_eq!(surface, Some(SurfaceId::new(1)));
+            assert_eq!(at, (400.0, 150.0), "a fraction of the display it landed on");
+            assert_eq!(id, PointerId::new(1), "a slot is numbered from one");
+            assert!(primary, "the first contact down drives the compatibility");
+        }
+        let SurfaceEvent::Pointer { event, .. } = reports[0].event else {
+            unreachable!("read would have panicked")
+        };
+        assert_eq!(event.kind, PointerKind::Touch);
+        assert_eq!(fingers.len(), 1, "and it is held until it lifts");
+    }
+
+    #[test]
+    fn a_contact_that_moves_reports_where_it_now_is() {
+        let devices = touchscreen();
+        let mut fingers = BTreeMap::new();
+        let _ = touched(
+            &devices,
+            &mut fingers,
+            &down(0, 0.5, 0.5),
+            Modifiers::NONE,
+            &screens(),
+            stamps(),
+        );
+
+        let reports = touched(
+            &devices,
+            &mut fingers,
+            &Event::TouchMotion {
+                device: DeviceId::new(1),
+                slot: 0,
+                x: 0.25,
+                y: 0.5,
+                at: Duration::ZERO,
+            },
+            Modifiers::NONE,
+            &screens(),
+            stamps(),
+        );
+
+        assert_eq!(actions(&reports), [PointerAction::Moved]);
+        assert_eq!(read(&reports[0]).4, (200.0, 300.0));
+    }
+
+    #[test]
+    fn a_contact_that_did_not_move_reports_nothing() {
+        // The same report twice is one place, and a movement to where a pointer already is says
+        // nothing about anything.
+        let devices = touchscreen();
+        let mut fingers = BTreeMap::new();
+        let _ = touched(
+            &devices,
+            &mut fingers,
+            &down(0, 0.5, 0.5),
+            Modifiers::NONE,
+            &screens(),
+            stamps(),
+        );
+
+        let reports = touched(
+            &devices,
+            &mut fingers,
+            &Event::TouchMotion {
+                device: DeviceId::new(1),
+                slot: 0,
+                x: 0.5,
+                y: 0.5,
+                at: Duration::ZERO,
+            },
+            Modifiers::NONE,
+            &screens(),
+            stamps(),
+        );
+
+        assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn a_lift_releases_where_the_contact_last_was() {
+        // libinput reports no position with a lift, so a release delivered at anything other than
+        // the last place it was told about would click whatever is at the origin.
+        let devices = touchscreen();
+        let mut fingers = BTreeMap::new();
+        let _ = touched(
+            &devices,
+            &mut fingers,
+            &down(0, 0.75, 0.5),
+            Modifiers::NONE,
+            &screens(),
+            stamps(),
+        );
+
+        let reports = touched(
+            &devices,
+            &mut fingers,
+            &Event::TouchUp {
+                device: DeviceId::new(1),
+                slot: 0,
+                at: Duration::ZERO,
+            },
+            Modifiers::NONE,
+            &screens(),
+            stamps(),
+        );
+
+        assert_eq!(
+            actions(&reports),
+            [PointerAction::Released, PointerAction::Left],
+            "the release first, because a control activates on it"
+        );
+        assert_eq!(read(&reports[0]).4, (600.0, 300.0));
+        assert!(fingers.is_empty(), "and the slot is given back");
+    }
+
+    #[test]
+    fn a_second_contact_is_not_the_primary_one() {
+        // A control with no multi-pointer behaviour of its own reads that field and ignores the
+        // rest, so a second finger while the first is held must not claim it.
+        let devices = touchscreen();
+        let mut fingers = BTreeMap::new();
+        let first = touched(
+            &devices,
+            &mut fingers,
+            &down(0, 0.25, 0.5),
+            Modifiers::NONE,
+            &screens(),
+            stamps(),
+        );
+        let second = touched(
+            &devices,
+            &mut fingers,
+            &down(1, 0.75, 0.5),
+            Modifiers::NONE,
+            &screens(),
+            stamps(),
+        );
+
+        assert!(read(&first[0]).3);
+        assert!(!read(&second[0]).3);
+        assert_eq!(read(&second[0]).2, PointerId::new(2), "and its own pointer");
+    }
+
+    #[test]
+    fn a_cancellation_ends_every_contact_on_its_device() {
+        // One cancellation for the device rather than one for each contact, and no lift follows it:
+        // nobody let go, so a control told about it gives up rather than firing.
+        let devices = touchscreen();
+        let mut fingers = BTreeMap::new();
+        for slot in 0..3 {
+            let _ = touched(
+                &devices,
+                &mut fingers,
+                &down(slot, 0.5, 0.5),
+                Modifiers::NONE,
+                &screens(),
+                stamps(),
+            );
+        }
+
+        let reports = touched(
+            &devices,
+            &mut fingers,
+            &Event::TouchCancelled {
+                device: DeviceId::new(1),
+                at: Duration::ZERO,
+            },
+            Modifiers::NONE,
+            &screens(),
+            stamps(),
+        );
+
+        assert_eq!(actions(&reports), [PointerAction::Cancelled; 3]);
+        assert!(fingers.is_empty());
+    }
+
+    #[test]
+    fn a_device_libinput_calls_no_touch_surface_reports_nothing() {
+        // libinput decides the classes here. A device this source was told is a pointer reports
+        // through the pointer path, and reading it both ways would deliver everything twice.
+        let mut devices = BTreeMap::new();
+        devices.insert(
+            DeviceId::new(1),
+            Reading {
+                points: true,
+                ..Reading::default()
+            },
+        );
+        let mut fingers = BTreeMap::new();
+
+        let reports = touched(
+            &devices,
+            &mut fingers,
+            &down(0, 0.5, 0.5),
+            Modifiers::NONE,
+            &screens(),
+            stamps(),
+        );
+
+        assert!(reports.is_empty());
+        assert!(fingers.is_empty());
+    }
+
+    #[test]
+    fn a_touchscreen_that_goes_cancels_what_it_was_holding() {
+        // A contact held while its device is unplugged is never lifted: libinput reports the device
+        // gone and nothing else, so a control listening for the release would stay pressed.
+        let mut devices = touchscreen();
+        let mut fingers = BTreeMap::new();
+        let _ = touched(
+            &devices,
+            &mut fingers,
+            &down(0, 0.5, 0.5),
+            Modifiers::NONE,
+            &screens(),
+            stamps(),
+        );
+
+        let device = Device::new(
+            DeviceId::new(1),
+            "/dev/input/event15",
+            "Elo Serial TouchScreen",
+            "event15",
+            0x0029,
+            0x0000,
+            zgui_libinput::Capabilities::NONE.with(zgui_libinput::Capability::Touch),
+        );
+        let mut keys = Keys::new(None);
+        let reports = went(
+            &mut devices,
+            &mut fingers,
+            &device,
+            &mut keys,
+            &Pointer::centred(&screens()),
+            &screens(),
+            stamps(),
+        );
+
+        assert_eq!(actions(&reports), [PointerAction::Cancelled]);
+        assert!(fingers.is_empty());
     }
 }

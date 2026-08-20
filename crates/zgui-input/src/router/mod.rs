@@ -127,7 +127,7 @@ impl Router {
         // State first, listeners second: a handler that reads a computed style has to see the
         // state its own event produced, and a restyle driven from a bit written afterwards would
         // land a frame late.
-        let hover = self.hover(world, action, &chain);
+        let hover = self.hover(world, action, event.kind, &chain);
         // A scrollbar answers before anything else does, and takes the event away from the rest of
         // the framework's behaviour when it answers at all. It has to: a press on a bar belongs to
         // the element that scrolls, so left to the ordinary path it would take focus off whatever
@@ -275,7 +275,10 @@ impl Router {
     ///
     /// Panics if the document is poisoned by an earlier batch that unwound.
     pub fn rehit(&mut self, world: &World<'_>) -> Moved {
-        let Some((pointer, point)) = self.pointers.all().next() else {
+        // Only a pointer that hovers. A finger on the surface is over whatever it is touching and
+        // hovers none of it, so re-testing under one would write the bit this frame that no pointer
+        // event would have written.
+        let Some((pointer, point)) = self.pointers.hovering().next() else {
             return Moved::default();
         };
         // Through the capture, exactly as an event of its own would be. A captured pointer hovers
@@ -377,7 +380,24 @@ impl Router {
     }
 
     /// Applies what this action does to `:hover`.
-    fn hover(&mut self, world: &World<'_>, action: PointerAction, chain: &HitChain) -> Moved {
+    ///
+    /// A pointer that cannot hover leaves the bit exactly as it was, in both directions. A finger
+    /// that wrote it would light up whatever it landed on and leave it lit after the finger went,
+    /// because there is no later movement over the surface to take it off again — the reason
+    /// [`PointerKind::can_hover`] exists. And a finger that cleared it would take the hover off
+    /// what the mouse is over, on a machine that has both.
+    ///
+    /// [`PointerKind::can_hover`]: zgui_vocab::PointerKind::can_hover
+    fn hover(
+        &mut self,
+        world: &World<'_>,
+        action: PointerAction,
+        kind: zgui_vocab::PointerKind,
+        chain: &HitChain,
+    ) -> Moved {
+        if !kind.can_hover() {
+            return Moved::default();
+        }
         match action {
             PointerAction::Left | PointerAction::Cancelled => {
                 self.interaction.hover.clear(world.document, world.filter)

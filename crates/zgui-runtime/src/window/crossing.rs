@@ -74,11 +74,13 @@ impl Window {
     /// Content moving under a cursor that has not moved crosses just as real a boundary as a cursor
     /// moving over stationary content, and a handler reads the same field off either. So the
     /// position is the one the router last saw, in the units a handler is given.
+    ///
+    /// Of the pointers that hover, because a crossing is a hover moving and a finger moves none.
     pub(crate) fn pointer_now(&self) -> PointerEvent {
         let position = self
             .router
             .pointers()
-            .all()
+            .hovering()
             .next()
             .map(|(_, point)| {
                 zgui_geom::Point::new(

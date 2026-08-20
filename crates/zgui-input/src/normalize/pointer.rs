@@ -7,7 +7,7 @@
 //! display whose scale is not one.
 
 use zgui_geom::{Css, Device, DevicePx, Point, Scale};
-use zgui_vocab::{PointerAction, PointerEvent, PointerId};
+use zgui_vocab::{PointerAction, PointerEvent, PointerId, PointerKind};
 
 use smallvec::SmallVec;
 
@@ -53,7 +53,18 @@ pub fn device_position(event: &PointerEvent, scale: Scale<Css, Device>) -> Point
 #[derive(Clone, Debug, Default)]
 pub struct Pointers {
     /// One entry per pointer that is on the surface.
-    seen: SmallVec<[(PointerId, Point<DevicePx, Device>); 2]>,
+    seen: SmallVec<[Seen; 2]>,
+}
+
+/// One pointer on the surface.
+#[derive(Clone, Copy, Debug)]
+struct Seen {
+    /// Which pointer it is.
+    id: PointerId,
+    /// What kind of device it is, so a caller can ask for the ones that hover.
+    kind: PointerKind,
+    /// Where it was last reported, in device pixels.
+    at: Point<DevicePx, Device>,
 }
 
 impl Pointers {
@@ -69,9 +80,16 @@ impl Pointers {
             return;
         }
         let at = device_position(event, scale);
-        match self.seen.iter_mut().find(|(id, _)| *id == event.id) {
-            Some((_, held)) => *held = at,
-            None => self.seen.push((event.id, at)),
+        match self.seen.iter_mut().find(|seen| seen.id == event.id) {
+            Some(seen) => {
+                seen.kind = event.kind;
+                seen.at = at;
+            }
+            None => self.seen.push(Seen {
+                id: event.id,
+                kind: event.kind,
+                at,
+            }),
         }
     }
 
@@ -79,18 +97,45 @@ impl Pointers {
     pub fn position_of(&self, pointer: PointerId) -> Option<Point<DevicePx, Device>> {
         self.seen
             .iter()
-            .find(|(id, _)| *id == pointer)
-            .map(|(_, at)| *at)
+            .find(|seen| seen.id == pointer)
+            .map(|seen| seen.at)
     }
 
     /// Every pointer on the surface and where it is, in the order they arrived.
     pub fn all(&self) -> impl Iterator<Item = (PointerId, Point<DevicePx, Device>)> + '_ {
-        self.seen.iter().copied()
+        self.seen.iter().map(|seen| (seen.id, seen.at))
+    }
+
+    /// The same, of the pointers that can rest over an element.
+    ///
+    /// A finger is on the surface for as long as it touches and hovers nothing while it is there,
+    /// so anything asking what "the pointer" is over asks this. Answering from every pointer would
+    /// put the hover under whichever finger touched last and leave it there.
+    ///
+    /// ```
+    /// use zgui_geom::{CssPx, Point, Scale};
+    /// use zgui_input::normalize::pointer::Pointers;
+    /// use zgui_vocab::{PointerAction, PointerEvent, PointerId, PointerKind};
+    ///
+    /// let mut pointers = Pointers::default();
+    /// let mut finger = PointerEvent::mouse(Point::new(CssPx(3.0), CssPx(3.0)));
+    /// finger.id = PointerId::new(1);
+    /// finger.kind = PointerKind::Touch;
+    /// pointers.observe(PointerAction::Pressed, &finger, Scale::new(1.0));
+    ///
+    /// assert_eq!(pointers.all().count(), 1);
+    /// assert_eq!(pointers.hovering().count(), 0, "a finger hovers nothing");
+    /// ```
+    pub fn hovering(&self) -> impl Iterator<Item = (PointerId, Point<DevicePx, Device>)> + '_ {
+        self.seen
+            .iter()
+            .filter(|seen| seen.kind.can_hover())
+            .map(|seen| (seen.id, seen.at))
     }
 
     /// Forgets one pointer.
     pub fn forget(&mut self, pointer: PointerId) {
-        self.seen.retain(|(id, _)| *id != pointer);
+        self.seen.retain(|seen| seen.id != pointer);
     }
 }
 

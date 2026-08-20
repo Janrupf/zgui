@@ -4,13 +4,20 @@
 //! far it moved, a touchscreen says where it is — and the position between those reports belongs
 //! to this backend. [`Pointer`] is that position, and [`Screen`] is the ground it moves over.
 //!
-//! # The one pointer
+//! # The one pointer, and the contacts beside it
 //!
-//! Every device this seat holds drives the same [`Pointer`], and every event carries
-//! [`PointerId::MOUSE`] and [`PointerKind::Mouse`]. There is one visible cursor here, so there is
-//! one pointer to move. The multi-touch protocol is absent: `ABS_MT_SLOT` and the contacts under
-//! it are read by nothing, so two fingers on a touchscreen are one pointer that jumps between
-//! them, and no event reports a pressure.
+//! Every pointing device this seat holds drives the same [`Pointer`], and every event [`event`]
+//! builds carries [`PointerId::MOUSE`] and [`PointerKind::Mouse`]. There is one visible cursor
+//! here, so there is one pointer to move.
+//!
+//! A contact is its own pointer. [`contact`] gives each one an identifier of its own and
+//! [`PointerKind::Touch`], and [`landed`] says where it is without moving the cursor — so a finger
+//! writes no `:hover` and leaves nothing lit behind it.
+//!
+//! **Only the libinput source reports contacts.** Reading the kernel's own stream,
+//! `ABS_MT_SLOT` and the contacts under it are read by nothing, so a touchscreen there is an
+//! absolute pointing device and two fingers on it are one pointer that jumps between them. No
+//! event reports a pressure on either source.
 //!
 //! # Which devices point
 //!
@@ -528,6 +535,63 @@ pub fn event(position: Point<CssPx, Css>, button: Option<PointerButton>) -> Poin
         // cannot tell, and the other says the pen is not touching the glass.
         pressure: None,
     }
+}
+
+/// Returns the contact in `slot` at `position`, carrying the button a contact presses.
+///
+/// A contact is a pointer of its own. It is somewhere only while it touches, and it hovers nothing
+/// while it is there, so it drives neither the cursor nor `:hover`. [`PointerId::MOUSE`] is nought,
+/// so a slot is numbered from one and the two can never name the same pointer.
+///
+/// `primary` marks the contact that drives compatibility behaviour, which is the first one down.
+/// A control with no multi-pointer behaviour of its own reads that field and ignores the rest.
+pub fn contact(
+    position: Point<CssPx, Css>,
+    slot: u32,
+    primary: bool,
+    button: Option<PointerButton>,
+) -> PointerEvent {
+    PointerEvent {
+        id: PointerId::new(u64::from(slot) + 1),
+        kind: PointerKind::Touch,
+        primary,
+        position,
+        button,
+        // libinput reports no pressure for a contact. The panels this backend has met report one
+        // that says only whether the glass is being touched, which the contact itself already says.
+        pressure: None,
+    }
+}
+
+/// Returns which display a fraction of a touch surface lands on, and where on it.
+///
+/// A touch surface names no display of its own — there is no session daemon here to bind one to an
+/// output — so it spans the whole arrangement, exactly as an absolute pointing device does. See
+/// [`Pointer::moved_to`], which is where the arrangement is applied.
+///
+/// **This moves no pointer.** The cursor stays where it was, which is what makes a touch leave
+/// nothing behind it.
+///
+/// ```
+/// use zgui_platform::SurfaceId;
+/// use zgui_platform_drm::input::pointer::{Screen, landed};
+///
+/// let screens = [Screen {
+///     id: SurfaceId::new(1),
+///     left: 0.0,
+///     width: 800.0,
+///     height: 600.0,
+///     scale: 1.0,
+/// }];
+///
+/// let (surface, at) = landed(0.5, 0.25, &screens).expect("it is on a display");
+/// assert_eq!(surface, SurfaceId::new(1));
+/// assert_eq!((at.x.0, at.y.0), (400.0, 150.0));
+/// ```
+pub fn landed(fx: f32, fy: f32, screens: &[Screen]) -> Option<(SurfaceId, Point<CssPx, Css>)> {
+    let mut place = Pointer::centred(screens);
+    place.moved_to(fx, fy, screens);
+    place.position(screens)
 }
 
 #[cfg(test)]
