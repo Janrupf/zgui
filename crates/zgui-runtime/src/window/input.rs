@@ -160,6 +160,12 @@ impl Window {
             } => self.focus_modality = zgui_input::FocusSource::Pointer,
             _ => {}
         }
+        // Which pointer a capture asked for below belongs to. Cleared for everything else, so a
+        // capture issued from a key handler or a timer still reads as the mouse's.
+        self.dispatching = match event {
+            SurfaceEvent::Pointer { event, .. } => Some(event.id),
+            _ => None,
+        };
         let Some((kind, payload)) = event.to_dispatch() else {
             return;
         };
@@ -642,7 +648,10 @@ impl Window {
             }
             Command::CapturePointer(node) => {
                 if let Some(key) = zgui_view_dom::id::to_document(node) {
-                    let pointer = zgui_vocab::PointerId::MOUSE;
+                    // The pointer whose event is being dispatched, and the mouse only where there
+                    // is none. A finger that captures has to capture *itself*, or every reader of
+                    // the capture — the pan recogniser above all — is told the contact is free.
+                    let pointer = self.dispatching.unwrap_or(zgui_vocab::PointerId::MOUSE);
                     self.router.capture_mut().set(pointer, key);
                 }
             }

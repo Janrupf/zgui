@@ -335,6 +335,21 @@ impl Router {
         self.bars.of(pointer).is_some()
     }
 
+    /// Returns `true` where an element has captured this pointer.
+    ///
+    /// Capturing is a control saying the drag is *its* — a slider being moved, a column being
+    /// resized, a toast being swiped away. The reading of the same travel as a pan would take that
+    /// drag away and scroll the container instead, which is the one thing the control asked not to
+    /// happen. So a caller reading a drag as a pan asks this first, as it asks [`bar_holds`].
+    ///
+    /// This is what a browser spells `touch-action: none` on the control, and what pointer capture
+    /// has meant since it was called `setCapture`.
+    ///
+    /// [`bar_holds`]: Router::bar_holds
+    pub fn control_holds(&self, pointer: zgui_vocab::PointerId) -> bool {
+        self.capture.of(pointer).is_some()
+    }
+
     /// Ends the press one pointer is holding, because something else has taken the interaction.
     ///
     /// What a gesture recogniser calls when a drag it was watching turns out to be a scroll. The
