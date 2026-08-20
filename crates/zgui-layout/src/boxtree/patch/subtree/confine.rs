@@ -36,10 +36,28 @@ pub(super) fn confined(
     document: &Document,
     target: NodeIndex,
     old: BoxKey,
-) -> Option<Held> {
+) -> Result<Held, Unheld> {
     proved(store, document, old, &|index| {
         target::is_at_or_below(document, index, target)
     })
+}
+
+/// Which of the three proofs a subtree failed.
+///
+/// A refusal builds every box in the document, so which question said no is worth naming: the three
+/// are refused by different things and are answered by different fixes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Unheld {
+    /// The box, its parent, or a box below it is no longer in the tree.
+    Missing,
+    /// The box hangs under one box to be laid out and another to be painted.
+    ///
+    /// Out of flow: replacing it leaves a dead key in whichever list was not looked at.
+    InTwoPlaces,
+    /// A box below the root is laid out by a box outside the subtree.
+    LaidOutFromOutside(NodeIndex),
+    /// A box inside the subtree names an element that is not below its root.
+    WrittenElsewhere(NodeIndex),
 }
 
 /// The same proof for the boxes of a subtree that has **left** the document.
@@ -56,7 +74,7 @@ pub(super) fn confined(
 /// this subtree, whose paint order is a list nothing here can repair — while admitting the subtree the
 /// caller is actually taking out.
 pub(super) fn departed(store: &LayoutStore, document: &Document, root: BoxKey) -> Option<Held> {
-    proved(store, document, root, &|index| gone(document, index))
+    proved(store, document, root, &|index| gone(document, index)).ok()
 }
 
 /// Whether `index` can no longer be reached from the document node.
@@ -65,7 +83,7 @@ pub(super) fn departed(store: &LayoutStore, document: &Document, root: BoxKey) -
 /// document node itself. So a walk that runs out of parents anywhere else is a walk over something that
 /// has been taken out — which is the state every node of a removed subtree is in, whether they were
 /// unlinked one at a time or left linked under a removed root.
-fn gone(document: &Document, index: NodeIndex) -> bool {
+pub(super) fn gone(document: &Document, index: NodeIndex) -> bool {
     let store = document.store();
     let end = document.document_index();
     let mut next = Some(index);
@@ -84,28 +102,34 @@ fn proved(
     document: &Document,
     old: BoxKey,
     written_inside: &dyn Fn(NodeIndex) -> bool,
-) -> Option<Held> {
-    let parent = store.get(old)?.parent?;
-    let above = store.get(parent)?;
+) -> Result<Held, Unheld> {
+    let parent = store
+        .get(old)
+        .and_then(|node| node.parent)
+        .ok_or(Unheld::Missing)?;
+    let above = store.get(parent).ok_or(Unheld::Missing)?;
     if !above.children.contains(&old) || !above.paint_children.contains(&old) {
-        return None;
+        return Err(Unheld::InTwoPlaces);
     }
 
     let subtree = collect(store, old);
     let inside: FxHashSet<BoxKey> = subtree.iter().copied().collect();
     for &key in &subtree {
-        let node = store.get(key)?;
+        let node = store.get(key).ok_or(Unheld::Missing)?;
+        let index = node
+            .source
+            .map(|source| document.store().index_of(source).ok_or(Unheld::Missing))
+            .transpose()?;
         if key != old && !node.parent.is_some_and(|parent| inside.contains(&parent)) {
-            return None;
+            return Err(index.map_or(Unheld::Missing, Unheld::LaidOutFromOutside));
         }
-        if let Some(source) = node.source {
-            let index = document.store().index_of(source)?;
-            if !written_inside(index) {
-                return None;
-            }
+        if let Some(index) = index
+            && !written_inside(index)
+        {
+            return Err(Unheld::WrittenElsewhere(index));
         }
     }
-    Some(Held { parent, subtree })
+    Ok(Held { parent, subtree })
 }
 
 /// Every box at or below `root`, in both child orders, each named once.

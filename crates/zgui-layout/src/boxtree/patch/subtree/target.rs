@@ -43,21 +43,59 @@ const RAW_MOST: usize = 4_096;
 /// own, which the root element is, or when there are more marks than a splice-by-splice pass is
 /// worth.
 pub(super) fn containers(document: &Document, owed: &Owed) -> Option<Vec<NodeIndex>> {
-    if owed.is_empty() || owed.len() > RAW_MOST {
-        return None;
+    match why(document, owed) {
+        Ok(containers) => Some(containers),
+        Err(refused) => {
+            // A refusal here builds every box in the document, which renames every box, which makes
+            // every fragment compare as new. Worth a line naming which of the four it was.
+            zgui_profile::latency::note_with("b.unspliced", || format!("{refused:?}"));
+            None
+        }
+    }
+}
+
+/// Why a set of obligations could not be cut into containers to splice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Unspliceable {
+    /// Nothing was owed at all.
+    Nothing,
+    /// More elements were marked than are worth splicing one at a time.
+    TooMany(usize),
+    /// An element whose boxes changed has no parent to rebuild.
+    Rootless(NodeIndex),
+    /// An element whose boxes changed hangs under something that is not an element.
+    ///
+    /// A container is what wraps, orders and blockifies its children, and only an element is one.
+    NotUnderAnElement(NodeIndex),
+    /// Something that is not an element had its child list change.
+    NotAnElement(NodeIndex),
+}
+
+/// The same question, answering which condition stopped it.
+fn why(document: &Document, owed: &Owed) -> Result<Vec<NodeIndex>, Unspliceable> {
+    if owed.is_empty() {
+        return Err(Unspliceable::Nothing);
+    }
+    // The raw marks, capped before the collapse pass runs at all: a frame that marked half the
+    // document is not a local change whatever it collapses to.
+    if owed.len() > RAW_MOST {
+        return Err(Unspliceable::TooMany(owed.len()));
     }
     let store = document.store();
     let mut set: FxHashSet<NodeIndex> = FxHashSet::default();
     for &node in &owed.rebuilt {
-        let parent = store.core(node).parent()?;
+        let parent = store
+            .core(node)
+            .parent()
+            .ok_or(Unspliceable::Rootless(node))?;
         if store.core(parent).kind() != NodeKind::Element {
-            return None;
+            return Err(Unspliceable::NotUnderAnElement(node));
         }
         set.insert(parent);
     }
     for &node in &owed.children {
         if store.core(node).kind() != NodeKind::Element {
-            return None;
+            return Err(Unspliceable::NotAnElement(node));
         }
         set.insert(node);
     }
@@ -66,10 +104,11 @@ pub(super) fn containers(document: &Document, owed: &Owed) -> Option<Vec<NodeInd
         .copied()
         .filter(|&node| !has_ancestor_in(document, node, &set))
         .collect();
+    // And the collapsed containers, which is what the splices actually scale with.
     if outermost.len() > MOST {
-        return None;
+        return Err(Unspliceable::TooMany(outermost.len()));
     }
-    Some(outermost)
+    Ok(outermost)
 }
 
 /// Whether `container`'s own child list is among what it owes.

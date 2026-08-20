@@ -82,6 +82,11 @@ pub fn rebuild(store: &mut LayoutStore, document: &Document, owed: &Owed) -> Opt
                 done.subtrees += spliced.built;
                 continue;
             }
+            // The narrower question was asked and declined, so the wider one is about to be. Which
+            // of the two refused is what says whether a fix belongs here or below.
+            zgui_profile::latency::note_with("b.unspliced", || {
+                format!("NoChildPlan({})", named(document, target))
+            });
         }
         done.removed += one(store, document, target)?;
         done.subtrees += 1;
@@ -116,13 +121,53 @@ pub fn confine(
     Some(done)
 }
 
+/// An element written the way the trace should name it: its slot number and its tag.
+///
+/// A refusal costs every box in the document, and a slot number alone says which element only to
+/// someone holding the same tree. The tag says which one it is.
+fn named(document: &Document, index: NodeIndex) -> String {
+    let core = document.store().core(index);
+    let name = core.local_name();
+    let state = if confine::gone(document, index) {
+        "gone"
+    } else {
+        "live"
+    };
+    format!("{index:?} {name:?} {state}")
+}
+
 /// Rebuilds one element's boxes, and reports how many boxes were taken out of the tree.
 fn one(store: &mut LayoutStore, document: &Document, target: NodeIndex) -> Option<u32> {
     // An element that generates no box of its own — `display: contents`, and every wrapper that
     // asks for it — has nothing for a splice to replace. What is made again is then the nearest
     // element above it that does have one, which covers the boxless element and everything in it.
-    let (target, old) = place::nearest_with_a_box(store, document, target)?;
-    let held = confine::confined(store, document, target, old)?;
+    let Some((target, old)) = place::nearest_with_a_box(store, document, target) else {
+        // This builds every box in the document, so it is worth a line saying so.
+        zgui_profile::latency::note_with("b.unspliced", || {
+            format!("NoBoxAbove({})", named(document, target))
+        });
+        return None;
+    };
+    let held = match confine::confined(store, document, target, old) {
+        Ok(held) => held,
+        Err(refused) => {
+            zgui_profile::latency::note_with("b.unspliced", || {
+                let blame = match refused {
+                    confine::Unheld::LaidOutFromOutside(index)
+                    | confine::Unheld::WrittenElsewhere(index) => named(document, index),
+                    confine::Unheld::Missing | confine::Unheld::InTwoPlaces => String::new(),
+                };
+                let kind = match refused {
+                    confine::Unheld::Missing => "Missing",
+                    confine::Unheld::InTwoPlaces => "InTwoPlaces",
+                    confine::Unheld::LaidOutFromOutside(_) => "LaidOutFromOutside",
+                    confine::Unheld::WrittenElsewhere(_) => "WrittenElsewhere",
+                };
+                format!("Unconfinable({} {kind} {blame})", named(document, target))
+            });
+            return None;
+        }
+    };
     let removed = u32::try_from(held.subtree.len()).unwrap_or(u32::MAX);
     let containing_block = place::containing_block(store, held.parent);
     let parent_style = document
@@ -141,6 +186,9 @@ fn one(store: &mut LayoutStore, document: &Document, target: NodeIndex) -> Optio
         // The element generates no box at all any more, so the splice is a removal — and a removal
         // is only local in a container whose remaining children cannot be re-wrapped by it.
         if !confine::removable(store, held.parent) {
+            zgui_profile::latency::note_with("b.unspliced", || {
+                format!("Unremovable({})", named(document, target))
+            });
             return None;
         }
         return Some(structure::detach(store, old));
