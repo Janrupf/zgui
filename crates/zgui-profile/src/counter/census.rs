@@ -14,7 +14,7 @@
 
 use std::cell::RefCell;
 
-use crate::counter::{Counter, Counters};
+use crate::counter::Counters;
 
 thread_local! {
     /// What the counters read at the previous census on this thread.
