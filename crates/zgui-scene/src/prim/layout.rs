@@ -79,7 +79,7 @@ assert_instance_layout!(
 
 assert_instance_layout!(
     Quad,
-    size = 108,
+    size = 132,
     align = 4,
     fields = [
         order @ 0, 4;
@@ -88,11 +88,11 @@ assert_instance_layout!(
         radii @ 24, 32;
         border @ 56, 16;
         fill @ 72, 8;
-        stroke @ 80, 8;
-        clip @ 88, 4;
-        transform @ 92, 4;
-        shape @ 96, 4;
-        paint_origin @ 100, 8;
+        strokes @ 80, 32;
+        clip @ 112, 4;
+        transform @ 116, 4;
+        shape @ 120, 4;
+        paint_origin @ 124, 8;
     ],
 );
 
@@ -217,7 +217,7 @@ mod tests {
     /// The table above is compile-time; this is the runtime half, so a failure names the type.
     #[test]
     fn the_table_matches_what_the_compiler_chose() {
-        assert_eq!(size_of::<Quad>(), 108);
+        assert_eq!(size_of::<Quad>(), 132);
         assert_eq!(size_of::<ShadedQuad>(), 112);
         assert_eq!(size_of::<Shadow>(), 136);
         assert_eq!(size_of::<Decoration>(), 56);

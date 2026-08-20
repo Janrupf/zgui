@@ -9,6 +9,14 @@
 // chain evaluated by a shared coverage function rather than four interpolated distances, and dotted
 // borders are a second style rather than an unimplemented one.
 
+// One paint per border side, in the order the widths are given.
+struct Strokes {
+    top: PaintRef,
+    right: PaintRef,
+    bottom: PaintRef,
+    left: PaintRef,
+}
+
 struct Quad {
     order: u32,
     style: u32,
@@ -16,7 +24,7 @@ struct Quad {
     radii: Radii,
     border: Edges,
     fill: PaintRef,
-    stroke: PaintRef,
+    strokes: Strokes,
     clip: u32,
     transform: u32,
     // The superellipse exponent the corners are cut with; two is the ellipse a corner radius has
@@ -31,7 +39,7 @@ struct Quad {
 
 /// One quad, which spans 7 texels of the arena.
 fn load_quad(slot: u32) -> Quad {
-    let base = slot * 7u;
+    let base = slot * 9u;
     let t0 = textureLoad(quads, table_texel(base + 0u), 0);
     let t1 = textureLoad(quads, table_texel(base + 1u), 0);
     let t2 = textureLoad(quads, table_texel(base + 2u), 0);
@@ -39,6 +47,8 @@ fn load_quad(slot: u32) -> Quad {
     let t4 = textureLoad(quads, table_texel(base + 4u), 0);
     let t5 = textureLoad(quads, table_texel(base + 5u), 0);
     let t6 = textureLoad(quads, table_texel(base + 6u), 0);
+    let t7 = textureLoad(quads, table_texel(base + 7u), 0);
+    let t8 = textureLoad(quads, table_texel(base + 8u), 0);
     return Quad(
         t0.x,
         t0.y,
@@ -46,12 +56,66 @@ fn load_quad(slot: u32) -> Quad {
         Radii(bitcast<f32>(t1.z), bitcast<f32>(t1.w), bitcast<f32>(t2.x), bitcast<f32>(t2.y), bitcast<f32>(t2.z), bitcast<f32>(t2.w), bitcast<f32>(t3.x), bitcast<f32>(t3.y)),
         Edges(bitcast<f32>(t3.z), bitcast<f32>(t3.w), bitcast<f32>(t4.x), bitcast<f32>(t4.y)),
         PaintRef(t4.z, t4.w),
-        PaintRef(t5.x, t5.y),
-        t5.z,
-        t5.w,
-        bitcast<f32>(t6.x),
-        Vector2(bitcast<f32>(t6.y), bitcast<f32>(t6.z)),
+        Strokes(
+            PaintRef(t5.x, t5.y),
+            PaintRef(t5.z, t5.w),
+            PaintRef(t6.x, t6.y),
+            PaintRef(t6.z, t6.w),
+        ),
+        t7.x,
+        t7.y,
+        bitcast<f32>(t7.z),
+        Vector2(bitcast<f32>(t7.w), bitcast<f32>(t8.x)),
     );
+}
+
+
+// Which side owns the pixel at `corner_to_point`, as an index into `Strokes`.
+//
+// Where two sides meet they are divided by the diagonal running from the outer corner to the inner
+// one, which is the join CSS specifies and the one every engine draws. The test is which side's
+// edge is nearest *in units of that side's own width*: halfway along the diagonal the two distances
+// are equal fractions, and either answer paints the same colour when the two sides share one.
+//
+// On a box rounded to a full circle the four diagonals fall on 45 degrees, so each side owns a
+// quarter of the ring — which is exactly the arc a spinner leaves out.
+fn owning_side(center_to_point: vec2<f32>, half: vec2<f32>, border: Edges) -> u32 {
+    // Distance inwards from each outer edge.
+    let from_top = center_to_point.y + half.y;
+    let from_bottom = half.y - center_to_point.y;
+    let from_left = center_to_point.x + half.x;
+    let from_right = half.x - center_to_point.x;
+    // In units of the side's own width. A side of no width can never be nearest.
+    let vertical = select(
+        from_top / border.top,
+        from_bottom / border.bottom,
+        center_to_point.y > 0.0,
+    );
+    let horizontal = select(
+        from_left / border.left,
+        from_right / border.right,
+        center_to_point.x > 0.0,
+    );
+    let width_vertical = select(border.top, border.bottom, center_to_point.y > 0.0);
+    let width_horizontal = select(border.left, border.right, center_to_point.x > 0.0);
+    if width_horizontal <= 0.0 || (width_vertical > 0.0 && vertical <= horizontal) {
+        return select(0u, 2u, center_to_point.y > 0.0);
+    }
+    return select(3u, 1u, center_to_point.x > 0.0);
+}
+
+// The paint the owning side is drawn with.
+fn stroke_of(strokes: Strokes, side: u32) -> PaintRef {
+    if side == 0u {
+        return strokes.top;
+    }
+    if side == 1u {
+        return strokes.right;
+    }
+    if side == 2u {
+        return strokes.bottom;
+    }
+    return strokes.left;
 }
 
 const BORDER_SOLID: u32 = 0u;
@@ -77,6 +141,11 @@ struct QuadVarying {
     // numbers, so they travel as such.
     @location(6) @interpolate(flat) style_clip: vec4<u32>,
     @location(7) @interpolate(flat) paints: vec4<u32>,
+    // The four border paints, two to a slot, in top, right, bottom, left order. Carried for the
+    // same reason the fill is: they belong to the primitive, and the fragment stage would otherwise
+    // read the quad's own texels again to reach whichever side owns the pixel.
+    @location(12) @interpolate(flat) strokes_near: vec4<u32>,
+    @location(13) @interpolate(flat) strokes_far: vec4<u32>,
     // The clip's own box, and the fill's colour where the fill is one colour. Both are properties
     // of the primitive rather than of the pixel, and both were being fetched per fragment: the box
     // to reject a fragment outside the clip, the colour to shade every fragment inside it. Carrying
@@ -110,7 +179,15 @@ fn vs_quad(
     );
     out.paint_origin = vec2<f32>(quad.paint_origin.x, quad.paint_origin.y);
     out.paints = vec4<u32>(
-        quad.fill.kind, quad.fill.index, quad.stroke.kind, quad.stroke.index,
+        quad.fill.kind, quad.fill.index, quad.strokes.top.kind, quad.strokes.top.index,
+    );
+    out.strokes_near = vec4<u32>(
+        quad.strokes.top.kind, quad.strokes.top.index,
+        quad.strokes.right.kind, quad.strokes.right.index,
+    );
+    out.strokes_far = vec4<u32>(
+        quad.strokes.bottom.kind, quad.strokes.bottom.index,
+        quad.strokes.left.kind, quad.strokes.left.index,
     );
     let box = bitcast<vec4<f32>>(textureLoad(clips, table_texel(quad.clip * 11u + 0u), 0));
     let rounded = textureLoad(clips, table_texel(quad.clip * 11u + 9u), 0).x;
@@ -139,7 +216,12 @@ fn fs_quad(in: QuadVarying) -> @location(0) vec4<f32> {
         ),
         Edges(in.border.x, in.border.y, in.border.z, in.border.w),
         PaintRef(in.paints.x, in.paints.y),
-        PaintRef(in.paints.z, in.paints.w),
+        Strokes(
+            PaintRef(in.strokes_near.x, in.strokes_near.y),
+            PaintRef(in.strokes_near.z, in.strokes_near.w),
+            PaintRef(in.strokes_far.x, in.strokes_far.y),
+            PaintRef(in.strokes_far.z, in.strokes_far.w),
+        ),
         in.style_clip.y,
         0u,
         in.shape,
@@ -239,7 +321,16 @@ fn fs_quad(in: QuadVarying) -> @location(0) vec4<f32> {
 
     var color = background;
     if border_sdf < antialias_threshold {
-        var border_color = paint_color(quad.stroke, point, paint_origin);
+        // Which side's colour this pixel takes. A side left unpainted — `border-top-color:
+        // transparent`, which is how a spinner is written — draws nothing at all here rather than
+        // blending a transparent colour, so the background shows through the gap and the ring can
+        // be seen to turn.
+        let side = owning_side(center_to_point, half_size, quad.border);
+        let stroke = stroke_of(quad.strokes, side);
+        if stroke.kind == PAINT_NONE {
+            return color * saturate(antialias_threshold - outer_sdf) * clip;
+        }
+        var border_color = paint_color(stroke, point, paint_origin);
         let style = quad.style & 0xffu;
         if style != BORDER_SOLID {
             border_color *= dash_coverage(

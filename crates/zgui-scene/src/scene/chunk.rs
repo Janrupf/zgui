@@ -248,7 +248,9 @@ impl ChunkPrims {
         for quad in &self.quads {
             holds.clip(quad.clip);
             holds.paint(quad.fill);
-            holds.paint(quad.stroke);
+            for stroke in quad.strokes {
+                holds.paint(stroke);
+            }
         }
         // A shaded rectangle names everything a quad names and one thing more: the block its
         // effect is drawn with. Leaving that unheld is a replayed effect drawn with whatever

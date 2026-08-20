@@ -39,8 +39,14 @@ pub struct Quad {
     pub border: [f32; 4],
     /// What fills the rectangle.
     pub fill: PaintRef,
-    /// What draws its border.
-    pub stroke: PaintRef,
+    /// What draws each border side, as `[top, right, bottom, left]`.
+    ///
+    /// One per side rather than one for the border, because CSS gives every side its own colour and
+    /// the ones that differ are the ones a person notices: a spinner is a ring with one side made
+    /// transparent, and drawn in a single colour it is a ring that cannot be seen to turn. Which
+    /// side owns a pixel is settled where the sides meet, along the diagonal from the outer corner
+    /// to the inner one.
+    pub strokes: [PaintRef; 4],
     /// The [`ClipId`] this draws through.
     pub clip: u32,
     /// The slot of the [`SpatialId`] this draws under.
@@ -77,10 +83,10 @@ impl Quad {
             radii: [0.0; 8],
             border: [0.0; 4],
             fill,
-            stroke: PaintRef::NONE,
-            shape: crate::prim::CornerShape::ROUND.get(),
+            strokes: [PaintRef::NONE; 4],
             clip: ClipId::ROOT.0,
             transform: SpatialId::VIEWPORT.index(),
+            shape: crate::prim::CornerShape::ROUND.get(),
             paint_origin: [0.0, 0.0],
         }
     }
@@ -108,7 +114,7 @@ impl Quad {
     /// a sampled image are both read at a point, so both stop agreeing with their rectangle the
     /// moment it moves without them.
     pub fn samples_its_paint(&self) -> bool {
-        [self.fill, self.stroke].into_iter().any(|paint| {
+        [self.fill].into_iter().chain(self.strokes).any(|paint| {
             paint.kind == PaintKind::Gradient as u32 || paint.kind == PaintKind::Image as u32
         })
     }
@@ -146,9 +152,23 @@ impl Quad {
     }
 
     /// The same quad with a border of the given widths, paint and style.
-    pub fn with_border(mut self, widths: [f32; 4], stroke: PaintRef, style: BorderStyle) -> Self {
+    ///
+    /// One paint for every side, which is what a border of a single colour is.
+    pub fn with_border(self, widths: [f32; 4], stroke: PaintRef, style: BorderStyle) -> Self {
+        self.with_border_sides(widths, [stroke; 4], style)
+    }
+
+    /// The same quad with a border whose sides are painted separately.
+    ///
+    /// `strokes` is `[top, right, bottom, left]`, in step with `widths`.
+    pub fn with_border_sides(
+        mut self,
+        widths: [f32; 4],
+        strokes: [PaintRef; 4],
+        style: BorderStyle,
+    ) -> Self {
         self.border = widths;
-        self.stroke = stroke;
+        self.strokes = strokes;
         self.style = (self.style & !0xff) | style as u32;
         self
     }
