@@ -13,14 +13,21 @@
 //! `gbm_bo_create` states both requirements where the driver can act on them, which is at
 //! allocation. It is what every Wayland compositor allocates scanout buffers with.
 //!
-//! # Implicit layouts only
+//! # Which layout, and why one card is different from two
 //!
 //! There are two ways to allocate: naming the layouts that are acceptable, or letting the driver
 //! choose. The kernel's buffer-exchange documentation is firm that a chain must not mix them —
 //! *"the complete chain of operations formed by the producer and all the consumers must be either
-//! fully implicit or fully explicit"* — so this takes the implicit form throughout and never sends
-//! a modifier to the framebuffer either. Drivers that publish no explicit layout at all, which
-//! includes the one this was written against, refuse the other form outright.
+//! fully implicit or fully explicit"* — and [`Layout`] is which form one buffer takes. Every
+//! consumer of a buffer is told what [`Allocation::modifier`] answers, so the chain stays whole
+//! whichever form it is in.
+//!
+//! **An implicit layout is a layout only one driver knows.** It travels with the GEM object rather
+//! than with the descriptor, so the allocator's own display engine scans the buffer out correctly
+//! while a *second* driver that imports the descriptor is told nothing and reads it as linear. On
+//! one card that is invisible, because there is no second driver. On two it puts a tiled buffer
+//! under a linear renderer, and the picture comes out as a regular, patterned scramble of itself.
+//! [`Layout::Linear`] is what a caller drawing across a device boundary asks for.
 //!
 //! # Loaded, never linked
 //!
@@ -35,7 +42,7 @@
 // scanout path exists to answer.
 #![allow(unsafe_code)]
 
-use std::ffi::{CStr, c_char, c_int, c_void};
+use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 
@@ -43,6 +50,55 @@ use std::sync::Arc;
 const USE_RENDERING: u32 = 4;
 /// The buffer is scanned out by a display engine.
 const USE_SCANOUT: u32 = 1;
+/// The buffer is laid out row after row, with no tiling.
+const USE_LINEAR: u32 = 16;
+
+/// The layout one buffer is allocated in.
+///
+/// See the head of this crate for why the answer is not the same on a machine with one graphics
+/// card as on a machine with two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    /// Whatever the driver prefers, which it names to nobody.
+    ///
+    /// The fastest layout the allocator's own hardware has, and the right ask where the device
+    /// that allocates is the device that draws. What it costs is that the layout reaches no other
+    /// driver: it is a property of the GEM object rather than of the descriptor exported from it.
+    Driver,
+    /// Linear, asked for.
+    ///
+    /// The one layout every driver agrees on, and what a buffer allocated on one card and drawn
+    /// into by another has to be in. It is slower to scan out than a tiled layout on hardware that
+    /// has one, and a picture that is correct is worth more than that.
+    Linear,
+}
+
+impl Layout {
+    /// The `gbm_bo_create` flag this layout adds.
+    ///
+    /// Advice rather than a requirement — see [`Device::allocate`], which is why the list below
+    /// exists as well.
+    const fn flag(self) -> u32 {
+        match self {
+            Self::Driver => 0,
+            Self::Linear => USE_LINEAR,
+        }
+    }
+
+    /// The layouts this asks for by name, where it names any.
+    ///
+    /// Nothing for [`Layout::Driver`]: naming every layout a driver has and naming none are
+    /// different asks, and the second is the one that means "whatever suits you".
+    const fn modifiers(self) -> Option<&'static [u64]> {
+        match self {
+            Self::Driver => None,
+            Self::Linear => Some(&[LINEAR]),
+        }
+    }
+}
+
+/// `DRM_FORMAT_MOD_LINEAR`, the layout with no tiling in it.
+pub const LINEAR: u64 = 0;
 
 /// The code a driver answers when a buffer is in no layout it has a name for.
 ///
@@ -67,6 +123,20 @@ pub struct Library {
     device_destroy: unsafe extern "C" fn(*mut c_void),
     backend_name: unsafe extern "C" fn(*mut c_void) -> *const c_char,
     bo_create: unsafe extern "C" fn(*mut c_void, u32, u32, u32, u32) -> *mut c_void,
+    /// `gbm_bo_create_with_modifiers2`, where this libgbm has it.
+    ///
+    /// Nothing before Mesa 21.1 does, and the form without the uses is all that older ones offer.
+    /// A missing one is the ordinary answer rather than a failure to load, because the flagless
+    /// form below and then [`Library::bo_create`] answer the same question less exactly.
+    bo_create_with_modifiers2: Option<
+        unsafe extern "C" fn(*mut c_void, u32, u32, u32, *const u64, c_uint, u32) -> *mut c_void,
+    >,
+    /// `gbm_bo_create_with_modifiers`, where this libgbm has it.
+    ///
+    /// It states no uses. gbm reads the layout list as the whole of the requirement and allocates
+    /// something both scanned out of and drawn into anyway, which is what every caller of it wants.
+    bo_create_with_modifiers:
+        Option<unsafe extern "C" fn(*mut c_void, u32, u32, u32, *const u64, c_uint) -> *mut c_void>,
     bo_destroy: unsafe extern "C" fn(*mut c_void),
     bo_get_fd: unsafe extern "C" fn(*mut c_void) -> c_int,
     bo_get_stride: unsafe extern "C" fn(*mut c_void) -> u32,
@@ -90,6 +160,16 @@ pub struct Library {
 const TRANSFER_READ: u32 = 1;
 
 impl Library {
+    /// Returns whether this libgbm can be asked for a buffer by naming the layouts.
+    ///
+    /// A libgbm that cannot leaves every buffer implicit, whatever a caller asks for: the flags
+    /// are the only lever left and `GBM_BO_USE_LINEAR` is advice a driver may ignore. Worth
+    /// reporting rather than inferring, because a refusal and an absent entry point produce the
+    /// same buffer and want different answers.
+    pub const fn names_layouts(&self) -> bool {
+        self.bo_create_with_modifiers2.is_some() || self.bo_create_with_modifiers.is_some()
+    }
+
     /// Loads it, or says why it could not.
     ///
     /// # Errors
@@ -115,6 +195,13 @@ impl Library {
                     *found
                 }};
             }
+            /// The same, for a name a libgbm is allowed not to have.
+            macro_rules! optional {
+                ($name:literal, $kind:ty) => {{
+                    let found: Option<libloading::Symbol<'_, $kind>> = library.get($name).ok();
+                    found.map(|found| *found)
+                }};
+            }
             Ok(Arc::new(Self {
                 create_device: symbol!(
                     b"gbm_create_device\0",
@@ -128,6 +215,29 @@ impl Library {
                 bo_create: symbol!(
                     b"gbm_bo_create\0",
                     unsafe extern "C" fn(*mut c_void, u32, u32, u32, u32) -> *mut c_void
+                ),
+                bo_create_with_modifiers2: optional!(
+                    b"gbm_bo_create_with_modifiers2\0",
+                    unsafe extern "C" fn(
+                        *mut c_void,
+                        u32,
+                        u32,
+                        u32,
+                        *const u64,
+                        c_uint,
+                        u32,
+                    ) -> *mut c_void
+                ),
+                bo_create_with_modifiers: optional!(
+                    b"gbm_bo_create_with_modifiers\0",
+                    unsafe extern "C" fn(
+                        *mut c_void,
+                        u32,
+                        u32,
+                        u32,
+                        *const u64,
+                        c_uint,
+                    ) -> *mut c_void
                 ),
                 bo_destroy: symbol!(b"gbm_bo_destroy\0", unsafe extern "C" fn(*mut c_void)),
                 bo_get_fd: symbol!(
@@ -192,11 +302,11 @@ pub struct Device {
 ///
 /// **gbm dispatches `gbm_bo_destroy` through a function pointer inside the device.** A buffer that
 /// outlives its allocator therefore destroys itself through freed memory, and the call goes to
-/// whatever that memory now spells — on a 32-bit target, an address like `0x2`, which is a
-/// segmentation fault inside a destructor with nothing in the backtrace to say why. Nothing in Rust
-/// connects a buffer to the allocator that made it: gbm hands back a pointer and the relationship
-/// lives entirely inside the library. So the relationship is written down here instead, and every
-/// [`Allocation`] holds one of these.
+/// whatever that memory now spells — on this target, an address like `0x2`, which is a segmentation
+/// fault inside a destructor with nothing in the backtrace to say why. Nothing in Rust connects a
+/// buffer to the allocator that made it: gbm hands back a pointer and the relationship is entirely
+/// inside the library. So the relationship is written down here instead, and every [`Allocation`]
+/// holds one of these.
 #[derive(Debug)]
 struct Allocator {
     /// Kept so the call below stays mapped.
@@ -267,28 +377,27 @@ impl Device {
 
     /// Allocates one buffer a display can scan out of and a graphics device can draw into.
     ///
-    /// `format` is a fourcc, the same code a framebuffer is registered under.
+    /// `format` is a fourcc, the same code a framebuffer is registered under. `layout` is which
+    /// form the chain takes — see [`Layout`], which is also where the reason a caller drawing
+    /// across a device boundary has to state one is written.
     ///
     /// # Errors
     ///
-    /// Returns a message where the driver refused, which it does for a size, a format or a pair of
-    /// uses it cannot satisfy at once. Nothing here can say which of the three it was: gbm answers
-    /// a null pointer and no reason.
-    pub fn create(&self, width: u32, height: u32, format: u32) -> Result<Allocation, String> {
-        // SAFETY: `raw` is an allocator this made, and the arguments are plain values.
-        let bo = unsafe {
-            (self.allocator.library.bo_create)(
-                self.raw,
-                width,
-                height,
-                format,
-                USE_SCANOUT | USE_RENDERING,
-            )
-        };
+    /// Returns a message where the driver refused, which it does for a size, a format or a set of
+    /// uses it cannot satisfy at once. Nothing here can say which of them it was: gbm answers a
+    /// null pointer and no reason.
+    pub fn create(
+        &self,
+        width: u32,
+        height: u32,
+        format: u32,
+        layout: Layout,
+    ) -> Result<Allocation, String> {
+        let bo = self.allocate(width, height, format, layout);
         if bo.is_null() {
             return Err(format!(
-                "gbm_bo_create refused a {width}x{height} buffer that is both drawn into and \
-                 scanned out"
+                "gbm refused a {width}x{height} buffer that is both drawn into and scanned out, \
+                 in {layout:?} layout"
             ));
         }
         // SAFETY: every one of these reads a buffer this call just made and has not destroyed, and
@@ -321,11 +430,56 @@ impl Device {
         };
         if allocation.planes != 1 {
             return Err(format!(
-                "gbm_bo_create answered a buffer in {} memory planes, and this carries one",
+                "gbm answered a buffer in {} memory planes, and this carries one",
                 allocation.planes
             ));
         }
         Ok(allocation)
+    }
+
+    /// Asks gbm for the buffer, by the most exact call this libgbm has.
+    ///
+    /// **`GBM_BO_USE_LINEAR` is advice and a modifier list is a requirement.** i915 answers the
+    /// flag with an X-tiled buffer whose pitch is rounded up to a power of two — 8192 bytes for a
+    /// 1280-pixel row that needs 5120 — and reports `DRM_FORMAT_MOD_INVALID` for it, so nothing
+    /// downstream can even see that it is tiled. Naming [`LINEAR`] in a list is the form a driver
+    /// has to honour or refuse.
+    ///
+    /// Three calls, most exact first, because a libgbm may have any of them: the list with the
+    /// uses beside it, the list alone, and the flags alone. The last is where a driver that
+    /// publishes no explicit layout at all ends up, and it is the behaviour this had before.
+    fn allocate(&self, width: u32, height: u32, format: u32, layout: Layout) -> *mut c_void {
+        let uses = USE_SCANOUT | USE_RENDERING | layout.flag();
+        if let Some(modifiers) = layout.modifiers() {
+            let count = modifiers.len() as c_uint;
+            if let Some(create) = self.allocator.library.bo_create_with_modifiers2 {
+                // SAFETY: `raw` is an allocator this made, and `modifiers` outlives the call.
+                let bo = unsafe {
+                    create(
+                        self.raw,
+                        width,
+                        height,
+                        format,
+                        modifiers.as_ptr(),
+                        count,
+                        uses,
+                    )
+                };
+                if !bo.is_null() {
+                    return bo;
+                }
+            }
+            if let Some(create) = self.allocator.library.bo_create_with_modifiers {
+                // SAFETY: as above.
+                let bo =
+                    unsafe { create(self.raw, width, height, format, modifiers.as_ptr(), count) };
+                if !bo.is_null() {
+                    return bo;
+                }
+            }
+        }
+        // SAFETY: as above, and the arguments are plain values.
+        unsafe { (self.allocator.library.bo_create)(self.raw, width, height, format, uses) }
     }
 }
 
@@ -413,14 +567,84 @@ impl Allocation {
     /// Returns a message where the driver would not map it, which a buffer in device-private
     /// memory answers.
     pub fn peek(&self) -> Result<[u8; 4], String> {
+        self.peek_at(0, 0)
+    }
+
+    /// Maps the whole buffer once and reads several pixels out of it.
+    ///
+    /// [`Allocation::peek_at`] maps a one-pixel region per call and leaves gbm to work out where
+    /// that pixel is. This maps the whole surface, takes **the stride the mapping reports**, and
+    /// does the arithmetic here — so a driver that computes a per-region address differently from
+    /// the pitch of its own mapping cannot make a reader disagree with itself.
+    ///
+    /// The two exist together because a check that reads one way and writes another cannot tell a
+    /// misplaced write from a misplaced read.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message where the driver would not map the buffer.
+    pub fn read_pixels(
+        &self,
+        width: u32,
+        height: u32,
+        points: &[(u32, u32)],
+    ) -> Result<(u32, Vec<[u8; 4]>), String> {
         let mut stride = 0_u32;
         let mut token: *mut c_void = core::ptr::null_mut();
-        // SAFETY: `bo` is a buffer this holds, and one pixel is inside every allocation it makes.
+        // SAFETY: `bo` is a buffer this holds, and the region asked for is the whole of it.
         let address = unsafe {
             (self.library.bo_map)(
                 self.bo,
                 0,
                 0,
+                width,
+                height,
+                TRANSFER_READ,
+                &raw mut stride,
+                &raw mut token,
+            )
+        };
+        if address.is_null() {
+            return Err("gbm_bo_map would not map this buffer".to_owned());
+        }
+        let length = stride as usize * height as usize;
+        // SAFETY: the mapping covers `height` rows of `stride` bytes, which is what was asked for.
+        let bytes = unsafe { core::slice::from_raw_parts(address.cast::<u8>(), length) };
+        let read = points
+            .iter()
+            .map(|(x, y)| {
+                let at = *y as usize * stride as usize + *x as usize * 4;
+                match bytes.get(at..at + 4) {
+                    Some(pixel) => [pixel[0], pixel[1], pixel[2], pixel[3]],
+                    None => [0; 4],
+                }
+            })
+            .collect();
+        // SAFETY: the token is the one the mapping answered with.
+        unsafe { (self.library.bo_unmap)(self.bo, token) };
+        Ok((stride, read))
+    }
+
+    /// Reads one pixel out of the buffer itself, at a place the caller names.
+    ///
+    /// The corner is not enough to know a frame arrived **whole**. A renderer laying its rows out
+    /// at `width x 4` while the buffer's rows are further apart writes a picture that is right at
+    /// the origin and sheared everywhere below it, and a check on the first pixel passes. So a
+    /// check that means anything reads a pixel whose address depends on the stride.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message where the driver would not map the buffer.
+    pub fn peek_at(&self, x: u32, y: u32) -> Result<[u8; 4], String> {
+        let mut stride = 0_u32;
+        let mut token: *mut c_void = core::ptr::null_mut();
+        // SAFETY: `bo` is a buffer this holds. gbm maps the region that is asked for and answers
+        // its own address, so the one pixel named here is what the mapping covers.
+        let address = unsafe {
+            (self.library.bo_map)(
+                self.bo,
+                x,
+                y,
                 1,
                 1,
                 TRANSFER_READ,

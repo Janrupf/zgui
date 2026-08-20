@@ -188,7 +188,7 @@ fn a_copy_between_two_scanout_buffers_moves_the_pixels_and_says_what_it_cost() {
     };
     let mut allocations = Vec::new();
     for _ in 0..2 {
-        match allocator.create(WIDTH, HEIGHT, FOURCC) {
+        match allocator.create(WIDTH, HEIGHT, FOURCC, zgui_gbm::Layout::Driver) {
             Ok(allocation) => allocations.push(allocation),
             Err(reason) => {
                 eprintln!("{path}: no scanout buffer of that size ({reason}); nothing checked");
