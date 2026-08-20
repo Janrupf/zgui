@@ -29,8 +29,15 @@ pub(super) struct Held {
 /// parent inside the subtree, or something out there is holding a name that is about to be removed.
 ///
 /// **Nothing outside is written inside.** Every box in the subtree that names an element must name
-/// `target` or an element below it, or an absolutely positioned box written somewhere else has been
-/// positioned into this subtree and is about to be destroyed with it.
+/// `target`, an element below it, or an element that has left the document — or an absolutely
+/// positioned box written somewhere else has been positioned into this subtree and is about to be
+/// destroyed with it.
+///
+/// A departed element is admitted for the reason [`departed`] gives at length: a view unmounts from
+/// the inside out, so a node that has gone has no ancestry left to read and every box naming it
+/// reads as written elsewhere. Dropping those boxes is what the removal asked for. Refusing them
+/// instead rebuilds every box in the document each time a popup closes, which is what a container
+/// that holds portalled content does on every dismissal.
 pub(super) fn confined(
     store: &LayoutStore,
     document: &Document,
@@ -38,7 +45,7 @@ pub(super) fn confined(
     old: BoxKey,
 ) -> Result<Held, Unheld> {
     proved(store, document, old, &|index| {
-        target::is_at_or_below(document, index, target)
+        target::is_at_or_below(document, index, target) || gone(document, index)
     })
 }
 
