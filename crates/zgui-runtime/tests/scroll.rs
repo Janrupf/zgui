@@ -641,6 +641,84 @@ fn drag_finger(
     harness.settle(8);
 }
 
+/// Whether any element carrying `class` is being pressed.
+fn pressed(harness: &zgui_platform_headless::Harness<zgui_runtime::Runtime>, class: &str) -> bool {
+    let window = window(harness);
+    let document = window.document().borrow();
+    (0..document.store().slot_count()).any(|index| {
+        let index = zgui_dom::NodeIndex::new(index as u32);
+        let Some(core) = document.store().try_core(index) else {
+            return false;
+        };
+        document
+            .store()
+            .classes_of(index)
+            .iter()
+            .any(|held| &**held == class)
+            && core.ui_state().contains(zgui_vocab::UiState::ACTIVE)
+    })
+}
+
+/// Puts a finger down and drags it without lifting, so the press is still open at the end.
+fn drag_finger_holding(
+    harness: &mut zgui_platform_headless::Harness<zgui_runtime::Runtime>,
+    from: f32,
+    steps: &[(f32, u64)],
+) {
+    let contact = |y: f32| zgui_vocab::PointerEvent {
+        id: zgui_vocab::PointerId::new(1),
+        kind: zgui_vocab::PointerKind::Touch,
+        primary: true,
+        position: Point::<CssPx, Css>::new(CssPx(200.0), CssPx(y)),
+        button: Some(zgui_vocab::PointerButton::Primary),
+        pressure: None,
+    };
+    let stamp = |millis: u64| Timestamp::from_origin(std::time::Duration::from_millis(millis));
+
+    harness.deliver_to_first(SurfaceEvent::Pointer {
+        action: zgui_vocab::PointerAction::Pressed,
+        event: contact(from),
+        modifiers: Modifiers::NONE,
+        timestamp: stamp(0),
+    });
+    for (y, at) in steps {
+        harness.deliver_to_first(SurfaceEvent::Pointer {
+            action: zgui_vocab::PointerAction::Moved,
+            event: contact(*y),
+            modifiers: Modifiers::NONE,
+            timestamp: stamp(*at),
+        });
+    }
+    harness.settle(8);
+}
+
+/// A drag that becomes a scroll has to let go of whatever it started on.
+///
+/// A finger goes down on a row before it is known whether the gesture is a tap or a scroll, so the
+/// row is pressed either way — that is what makes a control light up the moment it is touched. The
+/// moment the travel passes the slop the reading changes to a pan, and the press has to end with
+/// it. Without that the row stays lit for the whole drag and still fires when the finger lifts near
+/// where it went down, which is the fault every touch interface answers by cancelling the press.
+#[test]
+fn a_drag_that_turns_into_a_scroll_lets_go_of_the_row_it_started_on() {
+    let mut harness = listing(200);
+    harness.settle(8);
+
+    // Down, and not yet travelled: the row is pressed, which is the state being taken away below.
+    drag_finger_holding(&mut harness, 90.0, &[(88.0, 8)]);
+    assert!(
+        pressed(&harness, "row"),
+        "a finger that has hardly moved is still a press, so there would be nothing to cancel"
+    );
+
+    // Past the slop, so the reading is now a pan.
+    drag_finger_holding(&mut harness, 90.0, &[(70.0, 16), (50.0, 32), (30.0, 48)]);
+    assert!(
+        !pressed(&harness, "row"),
+        "the drag became a scroll, so the row it started on is no longer being pressed"
+    );
+}
+
 #[test]
 fn a_finger_dragged_up_the_list_scrolls_it_and_a_flick_keeps_it_going() {
     let mut harness = listing(200);

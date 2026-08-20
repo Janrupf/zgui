@@ -140,7 +140,12 @@ impl Window {
     pub(crate) fn carry_out_gestures(&mut self, read: &[zgui_input::Gesture]) {
         for gesture in read {
             match gesture {
-                zgui_input::Gesture::PanStart { from, .. } => {
+                zgui_input::Gesture::PanStart { pointer, from } => {
+                    // A thumb being dragged already scrolls its container by following the finger.
+                    // Panning as well would move it twice, so the bar keeps the drag it has.
+                    if self.router.bar_holds(*pointer) {
+                        continue;
+                    }
                     // Decided once, where the finger went down, and held for the whole drag. A
                     // container re-derived from where the finger is *now* is a list that stops
                     // following it the moment the drag leaves the scrollport — which is most
@@ -150,6 +155,13 @@ impl Window {
                         Some(node) => self.scroll_chain(node),
                         None => Vec::new(),
                     };
+                    // The drag has become a scroll, so whatever it went down on stops being
+                    // pressed. Without this a finger that begins a scroll on a button leaves that
+                    // button lit for the whole drag and still activates it on a lift near where it
+                    // started — which is what a browser answers by sending `pointercancel` here.
+                    if !self.panning.is_empty() {
+                        self.cancel_press_of(*pointer);
+                    }
                 }
                 zgui_input::Gesture::PanMove { by, .. } => {
                     if self.panning.is_empty() {
