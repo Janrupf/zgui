@@ -250,4 +250,38 @@ mod tests {
         style.group.filters.push(zgui_scene::Filter::Blur(2.0));
         assert_eq!(isolation(&style, &fragment(true, false)), Isolation::Target);
     }
+
+    #[test]
+    fn a_backdrop_filter_alone_takes_no_target() {
+        // What it filters is beneath the box and is drawn before the box paints anything, so a
+        // target here would never hold it. A modal scrim is one flat quad, and giving it a
+        // full-window half-float target cost 189 ms a damage rectangle on the slow machine.
+        let mut style = translucent(1.0);
+        style.group.backdrop.push(zgui_scene::Filter::Blur(3.0));
+        assert_eq!(isolation(&style, &fragment(true, false)), Isolation::None);
+    }
+
+    #[test]
+    fn a_backdrop_filter_still_takes_one_when_its_own_painting_needs_it() {
+        // The clause that went is only about the backdrop. Everything else that ever forced a
+        // target still does, and a translucent box with an overlapping subtree is the case where
+        // drawing it straight onto what is beneath would darken the overlap twice.
+        let mut style = translucent(0.5);
+        style.group.backdrop.push(zgui_scene::Filter::Blur(3.0));
+        assert_eq!(
+            isolation(&style, &fragment(false, false)),
+            Isolation::Target
+        );
+
+        let mut blended = translucent(1.0);
+        blended.group.backdrop.push(zgui_scene::Filter::Blur(3.0));
+        blended.group.blend = zgui_scene::peniko::BlendMode::new(
+            zgui_scene::peniko::Mix::Multiply,
+            zgui_scene::peniko::Compose::SrcOver,
+        );
+        assert_eq!(
+            isolation(&blended, &fragment(true, false)),
+            Isolation::Target
+        );
+    }
 }

@@ -362,3 +362,61 @@ fn source_rect(backdrop: &BackdropFilter) -> Rect<i32, Device> {
         ),
     )
 }
+
+/// A frosted panel over a hard edge, with the panel's own tint drawn `isolated` or straight on.
+///
+/// The two are the same picture, and that is the claim the paint stage now leans on: what a
+/// backdrop filters is beneath the box and is drawn before the box paints anything of its own, so
+/// isolating that painting changes nothing about it.
+fn frosted_panel(isolated: bool) -> Scene {
+    let panel = (32.0, 32.0, 64.0, 64.0);
+    let mut scene = Scene::new();
+    scene.begin_frame(Size::new(SIDE, SIDE));
+    quad(&mut scene, (0.0, 0.0, SIDE as f32, SIDE as f32), [255; 3]);
+    quad(&mut scene, (0.0, 0.0, 64.0, SIDE as f32), [0, 0, 0]);
+    scene.push_backdrop(BackdropFilter::new(
+        rect(panel.0, panel.1, panel.2, panel.3),
+        [Filter::Blur(6.0)].into_iter().collect(),
+    ));
+    let boundary = isolated.then(|| {
+        let boundary = GroupBoundary::start(
+            rect(panel.0, panel.1, panel.2, panel.3),
+            1.0,
+            zgui_scene::peniko::BlendMode::default(),
+            Default::default(),
+        );
+        scene.push_group(boundary.clone());
+        boundary
+    });
+    // The panel's own painting: a border, which is the shape a scrim's tint has.
+    quad(&mut scene, (panel.0, panel.1, panel.2, 4.0), [200, 40, 40]);
+    if let Some(boundary) = boundary {
+        scene.push_group(boundary.end());
+    }
+    scene.finish(&DamageSet::full());
+    scene
+}
+
+#[test]
+fn isolating_a_backdrop_filters_own_painting_draws_the_same_picture() {
+    // Why the paint stage stopped giving one a target of its own. A `backdrop-filter` used to force
+    // an isolated target however plain the box was, and on the 32-bit target that target cost 189
+    // ms per damage rectangle — a full-window half-float allocation for a scrim that paints one
+    // flat quad. It is only legitimate to drop because of this: the two are the same pixels.
+    let Some((mut with, mut without)) = support::renderer_pair() else {
+        return;
+    };
+    let isolated = present(&mut with, &frosted_panel(true));
+    let direct = present(&mut without, &frosted_panel(false));
+    assert_eq!(
+        isolated.max_difference(&direct),
+        0,
+        "isolating the panel's own painting changed the picture"
+    );
+    // And the fixture has to be one where there is something to change.
+    assert_eq!(direct.rgba(34, 34)[0], 200, "the panel's own tint is drawn");
+    assert!(
+        (direct.rgba(64, 64)[0] as i32 - 128).abs() <= 12,
+        "and the backdrop under it is still frosted"
+    );
+}
