@@ -41,11 +41,19 @@ impl GroupPaint {
     /// The fold is decided elsewhere and needs the subtree, so it is deliberately not part of this:
     /// a blend mode, a filter or an explicit isolation needs a boundary whatever the geometry says,
     /// and opacity is the one that sometimes does not.
+    ///
+    /// # A `backdrop-filter` is not one of them
+    ///
+    /// It reads what is *beneath* the box and draws the result inside it, and both of those happen
+    /// before the box paints anything of its own — the primitive is pushed ahead of the boundary,
+    /// so a target here would never have held it anyway. What is left to isolate is the box's
+    /// ordinary painting, which needs a target for the ordinary reasons or for none.
+    ///
+    /// Counting it cost a full-window half-float target on every damage rectangle, for a scrim
+    /// whose own painting is one flat quad: **189 ms a rectangle** on the 32-bit target, which is
+    /// what "the modals bring it to its knees" turned out to be.
     pub fn needs_isolation(&self) -> bool {
-        !self.filters.is_empty()
-            || !self.backdrop.is_empty()
-            || self.isolated
-            || self.blend != peniko::BlendMode::default()
+        !self.filters.is_empty() || self.isolated || self.blend != peniko::BlendMode::default()
     }
 }
 
