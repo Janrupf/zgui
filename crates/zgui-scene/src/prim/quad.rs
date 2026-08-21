@@ -154,7 +154,7 @@ impl Quad {
     /// The same quad with a border of the given widths, paint and style.
     ///
     /// One paint for every side, which is what a border of a single colour is.
-    pub fn with_border(mut self, widths: [f32; 4], stroke: PaintRef, style: BorderStyle) -> Self {
+    pub fn with_border(self, widths: [f32; 4], stroke: PaintRef, style: BorderStyle) -> Self {
         self.with_border_sides(widths, [stroke; 4], style)
     }
 

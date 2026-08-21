@@ -6,7 +6,6 @@
 //! run below.
 
 use smallvec::SmallVec;
-use zgui_color::Color;
 use zgui_geom::{Corners, Device, DevicePx, Edges, Point, Rect, Size, Vec2};
 use zgui_scene::{ClipId, PaintRef, Quad, Scene, Shadow, SpatialId};
 
