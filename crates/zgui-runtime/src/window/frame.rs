@@ -1367,7 +1367,13 @@ impl Window {
                 )
             });
             mark("p.expand");
-            zgui_paint::expand(&layout, &mut self.damage, viewport, self.scale);
+            let expansion = zgui_paint::expand(
+                &layout,
+                &mut self.damage,
+                viewport,
+                self.scale,
+                &mut self.backdrops,
+            );
             self.scene.begin_frame(viewport);
             // What this frame's application effects are told about it. Nothing the framework draws
             // reads any of it, so a document with no effect in it pays three floats.
@@ -1445,6 +1451,7 @@ impl Window {
                 scrollbars: zgui_paint::emit::scrollbar::paint_for(
                     self.scheme == zgui_style::ColorScheme::Dark,
                 ),
+                keeping: expansion.keeping,
                 ..PaintInput::new(&layout, &self.damage)
             };
             zgui_profile::latency::note_with("d.postexpand", || {
@@ -1459,6 +1466,10 @@ impl Window {
             mark("p.emit");
             let before = glyph_counts();
             let report = self.painter.emit(&input, &mut self.scene);
+            // What this frame drew is what decides whether the next one may keep the copy it left,
+            // and the walk is the only thing that knows either number.
+            self.backdrops
+                .emitted(report.backdrops, report.backdrop_nested);
             vector_report = report.vector_routes;
             let after = glyph_counts();
             zgui_profile::latency::note_with("p.finish", || {

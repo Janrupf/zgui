@@ -303,6 +303,24 @@ fn border_strokes(scene: &mut Scene, style: &PaintStyle) -> [PaintRef; 4] {
     })
 }
 
+/// One border colour for a box whose shape a shader decides.
+///
+/// A [`ShadedQuad`](zgui_scene::ShadedQuad) carries a single stroke rather than four, because an
+/// effect that reshapes a box is not a spinner: the first side that paints something is the box's
+/// border, and the per-side ring the ordinary path draws is not what a coverage effect wants.
+fn border_stroke(scene: &mut Scene, style: &PaintStyle) -> PaintRef {
+    let Some(color) = style
+        .border
+        .colors
+        .iter()
+        .copied()
+        .find(|color| color.alpha() != 0.0)
+    else {
+        return PaintRef::NONE;
+    };
+    scene.paints.add(zgui_scene::Paint::Solid(color))
+}
+
 /// The eight-float form of four elliptical radii.
 pub fn flatten(radii: Corners<Vec2<DevicePx>>) -> [f32; 8] {
     [
@@ -453,7 +471,16 @@ mod tests {
 
         let mut scene = zgui_scene::Scene::new();
         scene.begin_frame(Size::<i32, Device>::new(256, 256));
-        assert_eq!(background_and_border(&mut scene, &style, placed), 1);
+        assert_eq!(
+            background_and_border(
+                &mut scene,
+                &style,
+                placed,
+                &crate::content::shader::NoShaders,
+                None,
+            ),
+            1,
+        );
 
         let strokes = scene.primitives.quads[0].strokes;
         assert_eq!(
@@ -490,7 +517,16 @@ mod tests {
 
         let mut scene = zgui_scene::Scene::new();
         scene.begin_frame(Size::<i32, Device>::new(256, 256));
-        assert_eq!(background_and_border(&mut scene, &style, placed), 1);
+        assert_eq!(
+            background_and_border(
+                &mut scene,
+                &style,
+                placed,
+                &crate::content::shader::NoShaders,
+                None,
+            ),
+            1,
+        );
 
         let strokes = scene.primitives.quads[0].strokes;
         assert!(

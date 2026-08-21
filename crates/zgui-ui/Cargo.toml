@@ -61,3 +61,8 @@ workspace = true
 name = "gallery_tty"
 path = "examples/gallery_tty.rs"
 required-features = ["drm"]
+
+[[example]]
+name = "tty_scrim"
+path = "examples/tty_scrim.rs"
+required-features = ["drm"]

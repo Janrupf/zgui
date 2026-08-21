@@ -14,6 +14,21 @@ use zgui_layout::fragment::filter;
 use zgui_layout::{FragKey, Fragment, LayoutStore};
 use zgui_scene::read_extent;
 
+/// Which target a composite reads outside what it writes.
+///
+/// The distinction decides how far the damage has to grow for it. A content filter reads the
+/// composite's *own* target, which the pool lends fresh every frame — so every pixel it reads has
+/// to be painted this frame, and the damage grows to the whole read region. A backdrop reads what
+/// is beneath it, which is kept between frames, so the damage only has to cover where its answer
+/// *changed*.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reads {
+    /// Its own isolated target, populated by this frame alone.
+    OwnTarget,
+    /// The composite beneath it, which outlives the frame.
+    WhatIsBeneath,
+}
+
 /// What one composite writes, and what it reads to do it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ReadExtent {
@@ -21,6 +36,8 @@ pub struct ReadExtent {
     pub bounds: Rect<DevicePx, Device>,
     /// The pixels it reads, which is [`ReadExtent::bounds`] inflated by the filter chain's reach.
     pub source: Rect<DevicePx, Device>,
+    /// Where those pixels come from.
+    pub reads: Reads,
 }
 
 impl ReadExtent {
@@ -51,7 +68,16 @@ impl ReadExtent {
 pub fn read_extent_of(store: &LayoutStore, frag: FragKey, scale: f32) -> Option<ReadExtent> {
     let fragment = store.fragment(frag)?;
     let node = store.get(fragment.box_)?;
-    let mut chain = filter::own(&node.style, scale);
+    let own = filter::own(&node.style, scale);
+    // A fragment carrying both is read as the stricter of the two: the content filter's own target
+    // still has to be painted whole, and there is nothing to be gained by treating half a chain
+    // one way and half the other.
+    let reads = if own.is_empty() {
+        Reads::WhatIsBeneath
+    } else {
+        Reads::OwnTarget
+    };
+    let mut chain = own;
     chain.extend(filter::backdrop(&node.style, scale));
     if chain.is_empty() {
         return None;
@@ -60,7 +86,11 @@ pub fn read_extent_of(store: &LayoutStore, frag: FragKey, scale: f32) -> Option<
     // what a fragment carrying both writes, and it is what the subtree ink already is.
     let bounds = fragment.subtree_ink;
     let source = read_extent(bounds, &chain);
-    let extent = ReadExtent { bounds, source };
+    let extent = ReadExtent {
+        bounds,
+        source,
+        reads,
+    };
     (!extent.is_degenerate()).then_some(extent)
 }
 
@@ -81,7 +111,7 @@ pub fn cull_rect(store: &LayoutStore, fragment: &Fragment, scale: f32) -> Rect<D
 mod tests {
     use zgui_geom::{Device, DevicePx, Point, Rect, Size};
 
-    use super::ReadExtent;
+    use super::{ReadExtent, Reads};
 
     /// A rectangle at the origin.
     fn rect(width: f32, height: f32) -> Rect<DevicePx, Device> {
@@ -97,14 +127,16 @@ mod tests {
         assert!(
             ReadExtent {
                 bounds,
-                source: bounds
+                source: bounds,
+                reads: Reads::OwnTarget,
             }
             .is_degenerate()
         );
         assert!(
             !ReadExtent {
                 bounds,
-                source: rect(20.0, 20.0)
+                source: rect(20.0, 20.0),
+                reads: Reads::OwnTarget,
             }
             .is_degenerate()
         );

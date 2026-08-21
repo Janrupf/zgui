@@ -136,6 +136,7 @@ pub fn backdrop(
     clip: ClipId,
     shaders: &dyn crate::content::shader::ShaderSource,
     scale: f32,
+    keeping: bool,
 ) -> usize {
     let mut filters = style.group.backdrop.clone();
     // After the chain the `backdrop-filter` property wrote, for the reason a filter effect goes
@@ -154,7 +155,12 @@ pub fn backdrop(
     if filters.is_empty() {
         return 0;
     }
-    let filter = BackdropFilter::new(fragment.border_box, filters).clipped(clip);
+    let mut filter = BackdropFilter::new(fragment.border_box, filters).clipped(clip);
+    // A backdrop the expansion chose may read the copy kept from the last frame; the rest renew
+    // it. See [`BackdropFilter::keeping_its_capture`].
+    if keeping {
+        filter = filter.keeping_its_capture();
+    }
     usize::from(scene.push_backdrop(filter).is_some())
 }
 
