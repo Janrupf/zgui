@@ -27,6 +27,12 @@ pub struct FramePlan {
     pub unsupported_blends: u32,
     /// How many groups could not be isolated because the target pool was exhausted.
     pub unisolated: u32,
+    /// How many backdrops were told to read a kept copy and could not.
+    ///
+    /// Non-zero means this frame's damage was grown for one arrangement and drawn under another,
+    /// so the frame after it has to redraw everything. See
+    /// [`keepable`](crate::filter::backdrop::keepable).
+    pub capture_refused: u32,
 }
 
 impl FramePlan {
@@ -142,7 +148,9 @@ impl<'gpu> PlanBuilder<'gpu> {
     /// The texel extent of whatever `target` is.
     pub fn extent_of(&self, target: TargetRef) -> Size<i32, Device> {
         match target {
-            TargetRef::Composed => self.composed_extent,
+            // The kept copy is allocated exactly as the composed target is, because it holds a
+            // copy of it and a copy between two textures needs them to agree.
+            TargetRef::Composed | TargetRef::Kept => self.composed_extent,
             TargetRef::Pool(slot) => self.pool.allocated_extent(slot.scale()),
         }
     }
@@ -335,6 +343,11 @@ impl<'gpu> PlanBuilder<'gpu> {
     /// Notes a group the pool could not lend a target for.
     pub fn note_unisolated(&mut self) {
         self.plan.unisolated += 1;
+    }
+
+    /// Notes a backdrop that was told to keep its copy and could not.
+    pub fn note_capture_refused(&mut self) {
+        self.plan.capture_refused += 1;
     }
 
     /// Finishes the plan, returning every lent target to the pool.

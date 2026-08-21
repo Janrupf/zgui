@@ -104,6 +104,10 @@ pub(crate) struct Harness {
     pub(crate) painter: Painter,
     /// What the last fragment pass said must be redrawn.
     pub(crate) damage: DamageSet,
+    /// What a kept backdrop copy holds between frames.
+    pub(crate) backdrops: zgui_paint::BackdropMemory,
+    /// The box the last expansion said may keep it.
+    pub(crate) keeping: Option<zgui_layout::BoxKey>,
     /// The surface extent.
     pub(crate) viewport: Size<i32, Device>,
     /// How many device pixels one CSS pixel is.
@@ -155,6 +159,8 @@ impl Harness {
             scene: Scene::new(),
             painter: Painter::new(),
             damage: DamageSet::new(),
+            backdrops: zgui_paint::BackdropMemory::default(),
+            keeping: None,
             viewport: Size::new(width as i32, height as i32),
             scale: 1.0,
             scroll: zgui_layout::scroll_region::ScrollOffsets::new(),
@@ -252,7 +258,15 @@ impl Harness {
 
     /// Grows the damage over the read-extent registry, exactly as a frame does before emitting.
     pub(crate) fn expand(&mut self) -> zgui_paint::Expansion {
-        zgui_paint::expand(&self.store, &mut self.damage, self.viewport, self.scale)
+        let expansion = zgui_paint::expand(
+            &self.store,
+            &mut self.damage,
+            self.viewport,
+            self.scale,
+            &mut self.backdrops,
+        );
+        self.keeping = expansion.keeping;
+        expansion
     }
 
     /// Emits a frame against the damage the fragment pass accumulated.
@@ -263,7 +277,13 @@ impl Harness {
         // asserting nothing at all.
         let mut input = PaintInput::new(&self.store, &self.damage);
         input.record_emitted = true;
+        input.keeping = self.keeping;
         let report = self.painter.emit(&input, &mut self.scene);
+        // The other half of what a frame does with a kept backdrop copy, and a harness that
+        // expanded without it would never reach the second frame — which is the only kind that
+        // keeps anything.
+        self.backdrops
+            .emitted(report.backdrops, report.backdrop_nested);
         self.scene.finish(&self.damage);
         report
     }

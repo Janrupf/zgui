@@ -48,6 +48,11 @@ pub struct Recorder<'frame> {
     pub pool: &'frame GroupPool,
     /// The persistent target the frame composes into.
     pub composed: &'frame SceneTexture,
+    /// The persistent copy a backdrop filter reads what lies beneath from.
+    ///
+    /// Absent until a frame holds a backdrop that keeps its capture, which is most frames of most
+    /// documents: nothing allocates it and no pass names it.
+    pub kept: Option<&'frame SceneTexture>,
     /// The sampler every magnifying read goes through.
     pub sampler: &'frame wgpu::Sampler,
     /// Textures the renderer did not draw.
@@ -565,6 +570,7 @@ impl Recorder<'_> {
     fn view(&self, target: TargetRef) -> Option<&wgpu::TextureView> {
         match target {
             TargetRef::Composed => Some(self.composed.view()),
+            TargetRef::Kept => Some(self.kept?.view()),
             TargetRef::Pool(slot) => Some(self.pool.view(slot)),
         }
     }
@@ -573,6 +579,7 @@ impl Recorder<'_> {
     fn texture(&self, target: TargetRef) -> Option<&wgpu::Texture> {
         match target {
             TargetRef::Composed => Some(self.composed.texture()),
+            TargetRef::Kept => Some(self.kept?.texture()),
             TargetRef::Pool(slot) => Some(self.pool.texture(slot)),
         }
     }
@@ -581,6 +588,7 @@ impl Recorder<'_> {
     fn format(&self, target: TargetRef) -> Option<wgpu::TextureFormat> {
         match target {
             TargetRef::Composed => Some(self.composed.format()),
+            TargetRef::Kept => Some(self.kept?.format()),
             TargetRef::Pool(slot) => Some(slot.format()),
         }
     }
@@ -588,7 +596,7 @@ impl Recorder<'_> {
     /// A target's extent in texels.
     fn extent(&self, target: TargetRef) -> zgui_geom::Size<i32, Device> {
         match target {
-            TargetRef::Composed => self.composed.used().size,
+            TargetRef::Composed | TargetRef::Kept => self.composed.used().size,
             TargetRef::Pool(slot) => slot.scale().extent(self.pool.region()),
         }
     }

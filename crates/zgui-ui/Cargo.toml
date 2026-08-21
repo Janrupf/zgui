@@ -16,7 +16,17 @@ zgui-ui-icons = { path = "../zgui-ui-icons", version = "0.1.0" }
 zgui-ui-primitives = { path = "../zgui-ui-primitives", version = "0.1.0" }
 zgui-ui-tokens = { path = "../zgui-ui-tokens", version = "0.1.0" }
 
+[features]
+# What the console example needs. The component library itself asks the framework for nothing
+# platform-specific; this passes the request through so that an example can name `run_drm`.
+drm = ["zgui/drm"]
+
 [dev-dependencies]
+# Temporary, and only for the console example: the console takes the display over, so a message
+# written to standard error lands on pixels the frame loop is about to overwrite and a log has to
+# reach a file before anything can be read at all. The same concession the clock example makes.
+tracing.workspace = true
+tracing-subscriber.workspace = true
 # Encoding the fixture pictures the scrolled-images fixture feeds through the real loader; the
 # framework decodes them back through `zgui-image`, which is the path under test.
 image.workspace = true
@@ -43,3 +53,11 @@ accesskit_consumer.workspace = true
 
 [lints]
 workspace = true
+
+# A modal dialog over turning spinners, on the kernel's display interface. It names `run_drm`, so it
+# does not compile without the backend that defines it, and `required-features` leaves it out of
+# `cargo build --examples` on a machine that never asked for the feature.
+[[example]]
+name = "tty_scrim"
+path = "examples/tty_scrim.rs"
+required-features = ["drm"]
