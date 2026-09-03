@@ -142,7 +142,10 @@ const LEDGER: &[(&str, &[&str])] = &[
     // for keeps the copied scanout path, which is a slower picture rather than none, so a machine
     // without the library has to start and say so. Two crates allocate through it — the DRM
     // platform and `zgui-scanout` — and neither opens it, which is the whole point of the rule.
-    ("libloading", &["zgui-xkb", "zgui-seat", "zgui-libinput", "zgui-gbm"]),
+    (
+        "libloading",
+        &["zgui-xkb", "zgui-seat", "zgui-libinput", "zgui-gbm"],
+    ),
     (
         "accesskit",
         &[

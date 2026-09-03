@@ -968,10 +968,7 @@ impl<D: FrameDirty> Pass<'_, '_, D> {
                         .is_some_and(|previous| repositioned_within(previous, next));
                 if !repositioned {
                     if let Some(previous) = &previous {
-                        self.damage_beyond_a_move(
-                            previous.ink,
-                            was_admitted(previous, admits_now),
-                        );
+                        self.damage_beyond_a_move(previous.ink, was_admitted(previous, admits_now));
                     }
                     self.damage_beyond_a_move(next.ink, admitted);
                 }

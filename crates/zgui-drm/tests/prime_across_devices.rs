@@ -112,7 +112,9 @@ fn cross(from: &Device, to: &Device) -> Crossing {
 
     let imported = match to.import_buffer(descriptor.as_fd()) {
         Ok(imported) => imported,
-        Err(error) => return Crossing::Refused(format!("the descriptor was not imported: {error}")),
+        Err(error) => {
+            return Crossing::Refused(format!("the descriptor was not imported: {error}"));
+        }
     };
 
     // The layout a dumb buffer has. Where the importing driver takes no modifiers the request
@@ -364,7 +366,10 @@ fn a_frame_allocated_on_one_card_is_scanned_out_by_another() {
     commit
         .modeset(display, pipe, &mode, shown, None)
         .expect("the display card takes the mode with a buffer another card allocated");
-    println!("{test}: the mode is set on a buffer {} allocated", render_path.display());
+    println!(
+        "{test}: the mode is set on a buffer {} allocated",
+        render_path.display()
+    );
     thread::sleep(HOLD);
 
     commit

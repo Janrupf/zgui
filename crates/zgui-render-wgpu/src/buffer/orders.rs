@@ -1,10 +1,10 @@
 //! The draw-order entries every instanced batch of a frame is drawn from.
 
 use crate::buffer::instances::StorageBuffer;
+use crate::buffer::persist::LANES;
 use crate::buffer::persist::OrderEntry;
 use crate::buffer::upload::UploadBelt;
 use crate::gpu::device::Gpu;
-use crate::buffer::persist::LANES;
 
 /// One frame's draw-order entries, staged while the frame is planned and uploaded once.
 ///
