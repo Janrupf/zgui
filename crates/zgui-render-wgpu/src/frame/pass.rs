@@ -22,6 +22,13 @@ use crate::target::scene_texture::SceneTexture;
 pub struct Recorded {
     /// How many draw calls were issued.
     pub draw_calls: u32,
+    /// How many of those cleared a damage rectangle before it was redrawn.
+    ///
+    /// One a rectangle, because a render pass clears all of its attachment or none of it and a
+    /// scissored clear is a draw. Counted apart because it is the one term that grows with the
+    /// number of rectangles and with nothing else, and a frame's submit is very nearly a constant
+    /// times its draw count.
+    pub clears: u32,
     /// How many planned draws could not be issued, for want of a pipeline or a texture.
     pub dropped: u32,
 }
@@ -253,7 +260,12 @@ impl Recorder<'_> {
                         continue;
                     }
                     match self.issue(&mut pass, passes[0], tables.as_ref(), shape, format, &run) {
-                        Some(issued) => recorded.draw_calls += issued,
+                        Some(issued) => {
+                            recorded.draw_calls += issued;
+                            if matches!(shape, PlannedDraw::Clear) {
+                                recorded.clears += issued;
+                            }
+                        }
                         None => recorded.dropped += 1,
                     }
                 }
@@ -264,12 +276,32 @@ impl Recorder<'_> {
                         run.clear();
                         run.push((*scissor, draw));
                         match self.issue(&mut pass, planned, tables.as_ref(), draw, format, &run) {
-                            Some(issued) => recorded.draw_calls += issued,
+                            Some(issued) => {
+                                recorded.draw_calls += issued;
+                                if matches!(draw, PlannedDraw::Clear) {
+                                    recorded.clears += issued;
+                                }
+                            }
                             None => recorded.dropped += 1,
                         }
                     }
                 }
             }
+        }
+        // What one more draw costs, asked of a real frame rather than of a loop.
+        //
+        // The state is whatever the last draw left, and the scissor is one pixel, so each of these
+        // adds a draw and very nearly no fragments. The slope of a frame's submit against this
+        // number is the marginal cost of a draw where it is actually paid — including whatever
+        // back-pressure the card applies — which is what says whether collapsing the per-rectangle
+        // draws is worth what it costs to do.
+        let extra = probe_draws();
+        if extra > 0 {
+            pass.set_scissor_rect(0, 0, 1, 1);
+            for _ in 0..extra {
+                pass.draw(0..4, 0..1);
+            }
+            recorded.draw_calls += extra;
         }
     }
 
@@ -607,6 +639,25 @@ impl Recorder<'_> {
 /// Every entry of a run is the same kind of draw drawn by the same pipeline. What differs is which
 /// instances of the display list reach that rectangle, which is what the culling worked out when
 /// the frame was planned.
+/// How many extra draws every pass issues, from `ZGUI_PROBE_DRAWS`, read once.
+///
+/// A measurement aid and nothing else: a build with this set draws a one-pixel scissor that many
+/// more times per pass, which is the only way to read the cost of a draw at the point a frame
+/// actually pays it.
+///
+/// Swept 0, 40, 80 and 160 on the 32-bit target, with the scene's own pixel count identical in
+/// every arm: the submit grew 778, 1368 and 2826 microseconds, which is **17.7 microseconds a
+/// draw** and straight over the whole range.
+fn probe_draws() -> u32 {
+    static ASKED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ASKED.get_or_init(|| {
+        std::env::var("ZGUI_PROBE_DRAWS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 type Swept<'plan> = (Rect<i32, Device>, &'plan PlannedDraw);
 
 /// Draws a unit quad under each rectangle of `run`, taking each one's instances from `of`.

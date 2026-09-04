@@ -230,6 +230,9 @@ impl Renderer for WgpuRenderer {
         }
         zgui_profile::latency::mark("r.buffers");
         let uploaded = self.buffers.upload_frame(&self.gpu, &mut encoder, scene);
+        // Split from the flush that follows it, because the two wait for different things: writing
+        // the frame's own bytes, and giving the belt back to the device.
+        zgui_profile::latency::mark("r.uploaded");
         let upload_allocations = self.buffers.upload_allocations();
         self.buffers.finish_uploads();
         if upload_allocations == 0 {
@@ -319,6 +322,19 @@ impl Renderer for WgpuRenderer {
             );
         }
         let mut draw_calls = recorded.draw_calls;
+        // Read before `recorded` is shadowed by the command buffer below.
+        let clears = recorded.clears;
+        // What the copy to the surface covers, which is not what this frame drew: a supplied
+        // texture is owed every rectangle drawn while it was not the one being written. On an
+        // arrangement where those pixels cross a bus it is the largest thing a frame spends, and
+        // this is the only place it can be counted.
+        let mut presented_px = 0;
+        // How many rectangles that area is spread over, which is what says whether the stale set is
+        // merging because it ran out of room or because they touched.
+        let mut presented_rects = 0;
+        // What a peer filled between the caller's own textures instead, which is what the copy
+        // above did *not* have to carry. Zero everywhere nothing can copy on the far side.
+        let mut repaired_px = 0;
         if let Some(view) = &presented.view {
             // What the copy has to cover. A supplied set is rotated through and its textures
             // persist, so a frame copies the rectangles it drew plus the ones drawn while this
@@ -338,16 +354,38 @@ impl Renderer for WgpuRenderer {
                     }
                 }
             };
+            zgui_profile::latency::mark("r.repaired");
             let scissors = owed.from_composed;
-            self.blit(&mut encoder, view, formats.blit_undoes_srgb(), &scissors);
-            draw_calls += 1;
+            repaired_px = owed.repaired;
+            presented_px = scissors.iter().map(|rect| damage::area(*rect)).sum();
+            presented_rects = scissors.len();
+            draw_calls += self.blit(&mut encoder, view, formats.blit_undoes_srgb(), &scissors);
         }
-        self.gpu.queue().submit([encoder.finish()]);
+        // Marked either side, because the two halves are different work and only one of them is
+        // this crate's. `finish` walks the recorded commands and validates them into a command
+        // buffer; `submit` is where a backend that defers its calls actually makes them. On the
+        // 32-bit target the split is about one millisecond against five, so the draws themselves
+        // are the cost and the validation is not.
+        zgui_profile::latency::mark("r.finish");
+        let recorded = encoder.finish();
+        zgui_profile::latency::mark("r.finished");
+        self.gpu.queue().submit([recorded]);
         // Ties the frame's retired arena ranges to the submission just made, so they come back
         // only once nothing in flight can read them.
         self.buffers.chunks.submitted(&self.gpu);
         self.buffers.recall_uploads();
-        zgui_profile::latency::mark("sub.out");
+        // What the submission cost is read against: on a driver that validates its state per draw,
+        // a frame's submit is very nearly a constant times this number.
+        zgui_profile::latency::note_with("sub.out", || {
+            format!(
+                "draws={draw_calls} clears={} rects={} drawn_px={redrawn} \
+                 presented_px={presented_px} presented_rects={presented_rects} \
+                 repaired_px={repaired_px} uploaded={}",
+                clears,
+                self.composed_rects.len(),
+                zgui_profile::counter::get(zgui_profile::Counter::BytesUploaded)
+            )
+        });
 
         let response = presented.acquisition.response();
         // Composition succeeded whichever answer acquisition gave, but only a presenting answer
@@ -596,7 +634,7 @@ impl WgpuRenderer {
         view: &wgpu::TextureView,
         undo: bool,
         scissors: &[Rect<i32, Device>],
-    ) {
+    ) -> u32 {
         let kind = if undo {
             PipelineKind::BlitUndoSrgb
         } else {
@@ -605,7 +643,7 @@ impl WgpuRenderer {
         let format = self.presentation.formats().present_attachment();
         let mut pipelines = self.pipelines.borrow_mut();
         let Some(pipeline) = pipelines.get(&self.gpu, kind, format) else {
-            return;
+            return 0;
         };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("zgui.present"),
@@ -625,6 +663,7 @@ impl WgpuRenderer {
         });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.composed_binding, &[]);
+        let mut drawn = 0;
         for rect in scissors {
             let (width, height) = (
                 rect.size.width.max(0) as u32,
@@ -640,6 +679,8 @@ impl WgpuRenderer {
                 height,
             );
             pass.draw(0..4, 0..1);
+            drawn += 1;
         }
+        drawn
     }
 }
