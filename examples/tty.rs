@@ -396,6 +396,12 @@ fn log() {
         .with_writer(std::sync::Mutex::new(file))
         .with_ansi(false)
         .with_max_level(tracing::Level::TRACE)
+        // A closing span carries how long it was open, and `Phase::Render` is the one this
+        // backend's frames are drawn inside, so this is what says how long a frame took on the
+        // machine it ran on. Nothing else records a duration: the counters answer how much work a
+        // frame did, which is a property of the design, and this answers how long the work took,
+        // which is a property of the hardware.
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
         .finish();
     drop(tracing::subscriber::set_global_default(subscriber));
 }

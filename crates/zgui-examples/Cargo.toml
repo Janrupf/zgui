@@ -96,5 +96,24 @@ name = "tty"
 path = "../../examples/tty.rs"
 required-features = ["drm"]
 
+# Several things moving at once, which is what says how many frames a second a console reaches. The
+# clock next door changes once a second and measures the hardware rather than the loop.
+[[example]]
+name = "tty_motion"
+path = "../../examples/tty_motion.rs"
+required-features = ["drm"]
+
 [lints]
 workspace = true
+
+# A page of text redrawn every frame, which is the glyph cost `tty_motion` cannot show: its blocks
+# are shadowed, and the shadow is most of its frame.
+[[example]]
+name = "tty_text"
+path = "../../examples/tty_text.rs"
+required-features = ["drm"]
+
+[[example]]
+name = "tty_scroll"
+path = "../../examples/tty_scroll.rs"
+required-features = ["drm"]
