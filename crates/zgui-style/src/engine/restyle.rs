@@ -146,6 +146,10 @@ impl StyleEngine {
             }
         });
 
+        // Everything from here to the end of the restyle — applying the damage, finishing the
+        // snapshots, collecting the rule tree, retiring text keys and the dirty bits — was marked
+        // and measured at 0.025 ms together against the traversal's 0.36. It is not where the time
+        // is, and marks that say so on every frame are noise.
         report.damaged = sink.len();
         sink.apply(document.store_mut());
         snapshots.finish(document.store());

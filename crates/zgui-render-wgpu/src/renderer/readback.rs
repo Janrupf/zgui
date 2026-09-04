@@ -275,6 +275,7 @@ pub fn read_bands(
     let slice = buffer.slice(..used);
     slice.map_async(wgpu::MapMode::Read, |_| {});
     gpu.wait();
+    zgui_profile::latency::mark("rb.mapped");
 
     let view = slice.get_mapped_range();
     let row = (width * 4) as usize;

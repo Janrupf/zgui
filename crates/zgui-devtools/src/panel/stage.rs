@@ -157,6 +157,16 @@ fn exact(name: &str) -> Option<(&'static str, Category)> {
         "wait.in" => ("Wait for events", Events),
         "cfg.in" | "cfg.same" => ("Configure the surface", Render),
         "req.redraw" => ("Ask for a redraw", Events),
+        "f.cascade" => ("Match and cascade", Style),
+        "f.patch" => ("Patch the box tree with the new styles", Style),
+        // Inside the cascade. `st.traverse` is very nearly the whole of it: the rule-set flush and
+        // the shared context together are under five microseconds.
+        "st.flush" => ("Flush the rule set", Style),
+        "st.context" => ("Build the style context", Style),
+        "st.traverse" => ("Traverse and restyle", Style),
+        "st.finish" => ("Collect what was restyled", Style),
+        "p.flushed" => ("Finish the texture uploads", Paint),
+        "r.prepared" => ("Open the staging belt", Render),
         _ => return None,
     })
 }
@@ -169,7 +179,7 @@ fn family(name: &str) -> Category {
     let prefix = name.split('.').next().unwrap_or(name);
     match prefix {
         "f" | "evt" | "wait" | "req" => Category::Events,
-        "why" | "b" | "t" => Category::Style,
+        "why" | "b" | "t" | "st" => Category::Style,
         "d" | "w" => Category::Layout,
         "p" => Category::Paint,
         "r" | "draw" | "cfg" => Category::Render,

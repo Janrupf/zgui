@@ -259,6 +259,11 @@ pub fn run(
     displays: &Displays,
     gpu: Option<&Gpu>,
 ) -> Result<(), PlatformError> {
+    // Before the card, so that the trace covers taking it. A console is where this matters most:
+    // standard error is the screen the frame loop is about to overwrite, so a file is the only
+    // place a measurement can go. Nothing is recorded unless `ZGUI_LATENCY` names one.
+    zgui_profile::latency::start_epoch();
+
     // The session is what took the card, so it is what gives back everything the card cost: the
     // console's screen, the master a direct run took, and every device the seat opened. That
     // happens whatever the loop below did, including an error return and a panic.

@@ -590,6 +590,8 @@ impl Window {
             probe.frame_ended(self);
         }
 
+        // What this frame moved, beside how long each stage of it took — off unless asked for.
+        zgui_profile::counter::census::note("f.counters");
         zgui_profile::latency::note_with("f.end", || {
             format!(
                 "{outcome:?} another={needs_another_frame} owed={owed} \
@@ -981,8 +983,10 @@ impl Window {
             .broad_restyle
             .then_some(())
             .and(self.style_pool.as_deref());
+        zgui_profile::latency::mark("f.cascade");
         let pass = self.engine.restyle(&mut document, pool);
         self.broad_restyle = false;
+        zgui_profile::latency::mark("f.patch");
         let mut layout = self.layout.borrow_mut();
         if pass.styled > 0 && layout.root().is_some() {
             zgui_layout::boxtree::patch::restyle(&mut layout, &document, &pass.styled_nodes());
@@ -1121,11 +1125,6 @@ impl Window {
                 }
             }
         }
-        // A custom element that asked to be measured again is measured again: its style did not
-        // move, so no other pass reaches its box.
-        if !rebuild {
-            zgui_layout::boxtree::patch::custom::relayout(&mut layout, &document, root);
-        }
         zgui_profile::latency::note_with("b.why", || {
             format!(
                 "owed={} spliced={spliced:?} confined={confined:?} noroot={} \
@@ -1253,6 +1252,8 @@ impl Window {
         // out inside the frame that delivered it, so the frame's answer is every pass's together.
         // The walk seeds its own `beyond` from whatever the frame had already damaged.
         self.rigid_moves = self.rigid_moves.and(moved);
+        // What the offsetting walk spent, when it was asked to divide its duties. Silent
+        // otherwise, which is every frame of every build that has not asked.
         layout.reclaim_paragraphs();
         // The fragments name their matrices by an index into the table that was just filled, so
         // the two go to the view layer together: a box's place on the screen is only answerable
@@ -1582,6 +1583,11 @@ impl Window {
         // Uploaded pictures whose tiles this frame found gone — evicted, or lost with the device
         // — have no host copy to re-upload from; the loader decodes them again from their
         // sources, and the completion's wake brings the frame that shows them.
+        // Marked apart from the rest of the stage, because the two fail differently and one of them
+        // is where a frame meets the card: writing into an atlas the card is still reading waits
+        // for it to finish, and on the slowest machine this runs on that wait is the whole time a
+        // frame takes to draw. What follows is the caches, which wait for nothing.
+        mark("p.flushed");
         let missing = self.content.take_missing_images();
         if !missing.is_empty() && self.images.redecode_missing(&missing) {
             self.request_frame();

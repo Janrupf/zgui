@@ -144,10 +144,12 @@ pub(crate) fn run_pass(
     // The rule set is flushed first, and what it reports is the set of elements the sheet changes
     // themselves invalidate — which is how a sheet that was added, replaced or re-matched against
     // a new device reaches a document in which nothing else changed.
+    zgui_profile::latency::mark("st.flush");
     guards::with_guards(lock, |guards| {
         stylist.flush(guards).process_style(root, Some(snapshots));
     });
 
+    zgui_profile::latency::mark("st.context");
     let read = lock.read();
     let context = context::build(
         stylist,
@@ -163,6 +165,7 @@ pub(crate) fn run_pass(
         return (Vec::new(), 0, false, start.elapsed());
     }
 
+    zgui_profile::latency::mark("st.traverse");
     let traverser = RecalcStyle::new(context);
     // A worker that panics leaves per-element bookkeeping in a state no later traversal can
     // interpret, and the worker that panicked holds nothing anyone can inspect, so the document is
@@ -170,6 +173,7 @@ pub(crate) fn run_pass(
     document
         .guarded(|| style::driver::traverse_dom(&traverser, token, pool))
         .expect("the document is not poisoned");
+    zgui_profile::latency::mark("st.finish");
     let (records, workers) = traverser.finish();
     drop(read);
     (records, workers, true, start.elapsed())
