@@ -449,16 +449,27 @@ fn offer(
     };
     let threaded =
         cfg!(target_os = "linux") && gpu.adapter().get_info().backend == wgpu::Backend::Vulkan;
-    let validation = if threaded {
-        let configured = std::thread::scope(|threads| {
-            let configuring = threads.spawn(|| configure(&mut presentation));
+    // Only a surface has anything to configure, and only a surface may cross to the other thread:
+    // a supplied presentation can hold a peer copier, whose EGL context belongs to the thread that
+    // made it. Narrowing what is sent says that, and it is the only thing the closure needed.
+    let validation = match (threaded, &mut presentation) {
+        (true, Presentation::Surface(surface)) => {
+            let configure = |surface: &mut ConfiguredSurface| {
+                let scope = gpu.device().push_error_scope(wgpu::ErrorFilter::Validation);
+                surface.apply(gpu);
+                futures::executor::block_on(scope.pop())
+            };
+            let configured = std::thread::scope(|threads| {
+                let configuring = threads.spawn(|| configure(surface));
+                state.prepare(formats);
+                configuring.join()
+            });
+            configured.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        }
+        (_, presentation) => {
             state.prepare(formats);
-            configuring.join()
-        });
-        configured.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-    } else {
-        state.prepare(formats);
-        configure(&mut presentation)
+            configure(presentation)
+        }
     };
     match validation {
         None => Ok((state, presentation)),

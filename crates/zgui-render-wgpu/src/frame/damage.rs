@@ -1,7 +1,9 @@
 //! Which rectangles a frame redraws.
 
+use std::ops::Range;
+
 use zgui_bits::DamageSet;
-use zgui_geom::{Device, Rect};
+use zgui_geom::{Device, Rect, Size};
 
 /// The rectangles a frame redraws, in the composed target's device pixels.
 ///
@@ -71,9 +73,82 @@ pub fn area(rect: Rect<i32, Device>) -> u64 {
     rect.size.width.max(0) as u64 * rect.size.height.max(0) as u64
 }
 
+/// The one band covering `height` rows: every row of a frame.
+///
+/// The named form of "all of it", for a caller that has nothing to keep and has to read or copy the
+/// whole frame. An empty list of bands means the opposite, so there is no writing this by leaving
+/// one out.
+#[expect(
+    clippy::single_range_in_vec_init,
+    reason = "one band covering every row, which is what this is named for"
+)]
+pub fn every_row(height: u32) -> Vec<Range<u32>> {
+    vec![0..height]
+}
+
+/// The bands of `held` and `adding` together, merged, in order and cut to `height`.
+///
+/// Answers the whole of it where the two make more bands than are worth tracking: many scattered
+/// copies cost more in calls than one copy of everything saves in bytes.
+pub fn merge(held: &[Range<u32>], adding: &[Range<u32>], height: u32) -> Vec<Range<u32>> {
+    let mut bands: Vec<Range<u32>> = held
+        .iter()
+        .chain(adding)
+        .map(|band| band.start.min(height)..band.end.min(height))
+        .filter(|band| band.start < band.end)
+        .collect();
+    bands.sort_unstable_by_key(|band| band.start);
+    let mut kept: Vec<Range<u32>> = Vec::with_capacity(bands.len());
+    for band in bands {
+        match kept.last_mut() {
+            // Touching counts as overlapping: two bands that meet exactly are one copy.
+            Some(last) if band.start <= last.end => last.end = last.end.max(band.end),
+            _ => kept.push(band),
+        }
+    }
+    if kept.len() > MOST_BANDS {
+        return every_row(height);
+    }
+    kept
+}
+
+/// The most bands a copy is cut into before it becomes the whole frame.
+///
+/// A frame changing scattered rows for many frames running would otherwise grow a list nothing
+/// bounds. Copying everything is always right; this is only about which is cheaper.
+const MOST_BANDS: usize = 16;
+
+/// The rows `rects` touch, merged into disjoint bands in order, written into `into`.
+///
+/// Rows rather than rectangles because whatever copies a frame out of the renderer copies rows: a
+/// buffer's stride is a row, a texture-to-buffer copy names a row count, and a partial row is
+/// several copies where a whole one is a single memcpy. Two rectangles side by side are one band,
+/// which is what makes this worth merging rather than reading each rectangle on its own.
+pub fn rows_of(rects: &[Rect<i32, Device>], into: &mut Vec<Range<u32>>) {
+    into.clear();
+    into.extend(rects.iter().filter_map(|rect| {
+        let top = rect.origin.y.max(0) as u32;
+        let bottom = rect.origin.y.saturating_add(rect.size.height).max(0) as u32;
+        (top < bottom).then_some(top..bottom)
+    }));
+    into.sort_unstable_by_key(|band| band.start);
+    // Merged in place, keeping the run of bands that survive at the front. Touching counts as
+    // overlapping: two bands that meet exactly are one copy rather than two.
+    let mut kept = 0;
+    for index in 0..into.len() {
+        if kept > 0 && into[index].start <= into[kept - 1].end {
+            into[kept - 1].end = into[kept - 1].end.max(into[index].end);
+        } else {
+            into[kept] = into[index].clone();
+            kept += 1;
+        }
+    }
+    into.truncate(kept);
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{area, rects, rects_covering_backdrops};
+    use super::{area, every_row, rects, rects_covering_backdrops, rows_of};
     use zgui_bits::DamageSet;
     use zgui_geom::{Device, Point, Rect, Size};
 
@@ -146,4 +221,95 @@ mod tests {
             30 * 30 + 10 * 10
         );
     }
+
+    #[test]
+    fn rows_that_meet_or_overlap_become_one_band() {
+        let mut bands = Vec::new();
+        rows_of(
+            &[
+                Rect::new(Point::new(0, 40), Size::new(10, 10)),
+                Rect::new(Point::new(80, 10), Size::new(10, 10)),
+                // Starts exactly where the first one ends, so the two are one copy.
+                Rect::new(Point::new(40, 50), Size::new(10, 6)),
+            ],
+            &mut bands,
+        );
+        assert_eq!(bands, vec![10..20, 40..56]);
+    }
+
+    #[test]
+    fn a_rectangle_of_no_height_names_no_rows() {
+        let mut bands = every_row(1);
+        rows_of(&[Rect::new(Point::new(0, 5), Size::new(10, 0))], &mut bands);
+        assert!(bands.is_empty(), "{bands:?}");
+    }
+}
+
+/// How many pieces one rectangle may be cut into before the cutting is given up on.
+///
+/// A rectangle with a bite out of the middle is four pieces, and a second bite is up to sixteen. The
+/// point of the cut is to carry *less*, so a rectangle that has become a crowd of slivers is kept
+/// whole instead — the copy is then bigger and the bookkeeping is not.
+pub const PIECES: usize = 8;
+
+/// The parts of `rects` that no rectangle of `cut` covers.
+///
+/// Exact where it answers: every pixel of `rects` outside `cut` is inside some answer, which is what
+/// makes it safe to leave the rest to whoever writes `cut`. It over-answers rather than
+/// under-answers when a rectangle splinters — see [`PIECES`] — because carrying a pixel twice is
+/// waste and carrying it never is corruption.
+pub fn beyond(rects: &[Rect<i32, Device>], cut: &[Rect<i32, Device>]) -> Vec<Rect<i32, Device>> {
+    let mut answer = Vec::with_capacity(rects.len());
+    let mut pieces: Vec<Rect<i32, Device>> = Vec::with_capacity(PIECES);
+    let mut next: Vec<Rect<i32, Device>> = Vec::with_capacity(PIECES);
+    for rect in rects {
+        pieces.clear();
+        pieces.push(*rect);
+        for taken in cut {
+            if pieces.is_empty() {
+                break;
+            }
+            next.clear();
+            for piece in &pieces {
+                without(*piece, *taken, &mut next);
+            }
+            if next.len() > PIECES {
+                // Too many slivers to be worth it. The whole rectangle goes, which is what this did
+                // before any of it was cut.
+                pieces.clear();
+                pieces.push(*rect);
+                break;
+            }
+            core::mem::swap(&mut pieces, &mut next);
+        }
+        answer.extend(pieces.iter().copied());
+    }
+    answer
+}
+
+/// Appends the parts of `rect` that `cut` does not cover.
+///
+/// Up to four: above, below, and the left and right of what remains between them. A `cut` that
+/// misses appends the rectangle unchanged, and one that covers it appends nothing.
+fn without(rect: Rect<i32, Device>, cut: Rect<i32, Device>, into: &mut Vec<Rect<i32, Device>>) {
+    let Some(taken) = rect.intersection(cut) else {
+        into.push(rect);
+        return;
+    };
+    let (left, top) = (rect.origin.x, rect.origin.y);
+    let (right, bottom) = (left + rect.size.width, top + rect.size.height);
+    let (cut_left, cut_top) = (taken.origin.x, taken.origin.y);
+    let (cut_right, cut_bottom) = (cut_left + taken.size.width, cut_top + taken.size.height);
+    let mut piece = |x: i32, y: i32, width: i32, height: i32| {
+        if width > 0 && height > 0 {
+            into.push(Rect::new(
+                zgui_geom::Point::new(x, y),
+                Size::new(width, height),
+            ));
+        }
+    };
+    piece(left, top, right - left, cut_top - top);
+    piece(left, cut_bottom, right - left, bottom - cut_bottom);
+    piece(left, cut_top, cut_left - left, cut_bottom - cut_top);
+    piece(cut_right, cut_top, right - cut_right, cut_bottom - cut_top);
 }
