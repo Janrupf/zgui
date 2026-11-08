@@ -1059,9 +1059,57 @@ mod tests {
     };
 
     use super::{
-        GpuClip, GpuRounded, GpuSpatial, NO_SPACE, PreparedTables, clips, freed_clip, gpu_clip,
-        kind, paints,
+        GpuClip, GpuPaint, GpuRounded, GpuSpatial, NO_SPACE, PreparedTables, clips, freed_clip,
+        gpu_clip, kind, paints,
     };
+
+    /// The shader reads this table by texel, so the record's size and the place of its colour
+    /// belong to `load_paint` in `common.wgsl` as much as to this module. It strides by four and
+    /// takes the colour from texel two.
+    #[test]
+    fn the_paint_record_is_laid_out_the_way_the_shader_reads_it() {
+        const TEXEL: usize = 16;
+        assert_eq!(size_of::<GpuPaint>(), 4 * TEXEL, "four texels a record");
+        assert_eq!(
+            core::mem::offset_of!(GpuPaint, color),
+            2 * TEXEL,
+            "the colour is texel two"
+        );
+    }
+
+    /// The same agreement for a clip, against `CLIP_TEXELS` and the four readers beside it: the box
+    /// at texel zero, the two rounded tests at one and five, the kept box at nine, the scalars at
+    /// ten. A record that moved under them is a frame drawn from the wrong texels.
+    #[test]
+    fn the_clip_record_is_laid_out_the_way_the_shader_reads_it() {
+        const TEXEL: usize = 16;
+        assert_eq!(size_of::<GpuClip>(), 11 * TEXEL, "eleven texels a record");
+        assert_eq!(
+            core::mem::offset_of!(GpuClip, aabb),
+            0,
+            "the box is texel zero"
+        );
+        assert_eq!(
+            core::mem::offset_of!(GpuClip, first),
+            TEXEL,
+            "the outer rounded test starts at texel one"
+        );
+        assert_eq!(
+            core::mem::offset_of!(GpuClip, second),
+            5 * TEXEL,
+            "the inner one at texel five"
+        );
+        assert_eq!(
+            core::mem::offset_of!(GpuClip, kept_aabb),
+            9 * TEXEL,
+            "the kept box at texel nine"
+        );
+        assert_eq!(
+            core::mem::offset_of!(GpuClip, count),
+            10 * TEXEL,
+            "and the scalars at texel ten, the count its first component"
+        );
+    }
 
     /// The shader's `rect_coverage` for round corners, in Rust.
     fn rect_coverage(point: (f32, f32), test: &GpuRounded) -> f32 {
