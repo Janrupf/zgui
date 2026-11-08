@@ -10,6 +10,18 @@ counters! {
     /// Elements whose cascade ran again while their selector matches were kept.
     ElementsRecascaded => elements_recascaded, Group::BackendNeutral;
 
+    /// Elements the style traversal entered, styled or merely looked at.
+    ElementsTraversed => elements_traversed, Group::BackendNeutral;
+
+    /// Accessibility nodes projected whole: role, name, relations, children and geometry.
+    A11yProjected => a11y_projected, Group::BackendNeutral;
+
+    /// Accessibility nodes answered with their geometry alone.
+    A11yRemeasured => a11y_remeasured, Group::BackendNeutral;
+
+    /// Subtrees a custom-property change skipped because nothing in them reads what changed.
+    CustomSubtreesSkipped => custom_subtrees_skipped, Group::BackendNeutral;
+
     /// Individual selector-against-element tests performed.
     SelectorMatches => selector_matches, Group::BackendNeutral;
 
@@ -32,13 +44,21 @@ counters! {
     /// per mark from one that walks the child list on every mark. The second is invisible to every
     /// other counter here: the same children are marked, the same nodes are visited, and the same
     /// work comes out.
-    DirtyChildSteps => dirty_child_steps, Group::BackendNeutral;
 
     /// Boxes rebuilt from their element.
     BoxesRebuilt => boxes_rebuilt, Group::BackendNeutral;
 
+    /// Times the whole document's box tree was built, the first build included.
+    ///
+    /// A whole build gives every box a new name, so every fragment, recorded painting and hit
+    /// entry of the window is made again. A frame that changed one region and counts one here paid
+    /// for the whole window.
+    BoxTreeBuilds => box_tree_builds, Group::BackendNeutral;
+
     /// Nodes whose size or position was computed again.
     NodesRelaidOut => nodes_relaid_out, Group::BackendNeutral;
+    /// Boxes whose unrounded layout result moved in the last pass.
+    NodesChanged => nodes_changed, Group::BackendNeutral;
 
     /// Boxes the `overflow: auto` fixpoint examined for a gutter decision.
     ///
@@ -49,6 +69,14 @@ counters! {
 
     /// Times a layout pass had to start from the document root instead of a subtree.
     LayoutReachedRoot => layout_reached_root, Group::BackendNeutral;
+
+    /// Layout passes a window ran. Each composes the fragments again; a pass that is not held also
+    /// measures what is owed.
+    ///
+    /// A frame runs one, and one more after each delivery that leaves work owed: a scroll
+    /// handler's, and each geometry observation's. A held pass counts too, so read
+    /// [`Counter::LayoutsHeld`] beside it.
+    LayoutPasses => layout_passes, Group::BackendNeutral;
 
     /// Batches of child layouts that ran across the layout pool's workers.
     ///
@@ -78,11 +106,51 @@ counters! {
     /// Paragraphs broken into lines again while reusing the shaping they already had.
     TextRebroken => text_rebroken, Group::BackendNeutral;
 
+    /// Breaking passes that produced the lines of the pass before them, so the reported lines and
+    /// inline-box placements were kept and not read again.
+    TextLinesKept => text_lines_kept, Group::Skip { done: Counter::TextRebroken };
+
+    /// Breaking passes answered without breaking, because the width kept each comparison the
+    /// engine's breaker made in the pass before.
+    TextBreaksSkipped => text_breaks_skipped, Group::Skip { done: Counter::TextRebroken };
+
+    /// Shaped paragraphs held in the frozen form: the glyphs and clusters of their one break,
+    /// without the engine's layout.
+    TextFrozen => text_frozen, Group::BackendNeutral;
+
+    /// Frozen paragraphs shaped again into the engine's layout, because a breaking request asked
+    /// for more than the frozen form holds.
+    TextThawed => text_thawed, Group::BackendNeutral;
+
+    /// Shaped paragraphs broken back to their kept lines after a size probe moved them.
+    TextFormsRestored => text_forms_restored, Group::BackendNeutral;
+
+    /// Contexts moved to a shaped paragraph of their own, because another context with equal
+    /// content keeps other lines.
+    TextFormsSeparated => text_forms_separated, Group::BackendNeutral;
+
     /// Fragments compared against their previous geometry.
     FragmentsDiffed => fragments_diffed, Group::BackendNeutral;
 
     /// Fragments whose geometry was recomputed rather than carried over.
     FragmentsRebuilt => fragments_rebuilt, Group::BackendNeutral;
+
+    /// Boxes that moved and were carried with their subtrees instead of composed.
+    BoxesShifted => boxes_shifted, Group::BackendNeutral;
+
+    /// Boxes the fragment pass reached: composed, carried by a move or carried onto a new matrix.
+    ///
+    /// The fragment pass's own share of [`NodesVisited`](Counter::NodesVisited), which the paint
+    /// walk and the invalidation walk also count. A scroll that moves a content space reaches the
+    /// path down to its container. A scroll of a container that keeps its children in its own
+    /// space reaches every box in it.
+    FragmentBoxesVisited => fragment_boxes_visited, Group::BackendNeutral;
+
+    /// Elements that took a moved custom property map into their style without a cascade.
+    CustomMapsRefreshed => custom_maps_refreshed, Group::BackendNeutral;
+
+    /// Elements whose animations took new keyframe values because a custom property they read moved.
+    KeyframesRefreshed => keyframes_refreshed, Group::BackendNeutral;
 
     /// Fragments whose paint operations were emitted afresh instead of replayed from cache.
     Repaints => repaints, Group::BackendNeutral;
@@ -193,6 +261,12 @@ counters! {
     /// makes a scene rebuild that has quietly become the dominant cost visible at all.
     BoundsTreeInserts => bounds_tree_inserts, Group::BackendNeutral;
 
+    /// Rounded clip tests that change pixels and could not be applied.
+    ///
+    /// One draw call applies two rounded tests. A clip chain with three or more that each cut a
+    /// corner inside the clipped area keeps the two innermost and draws the rest square.
+    ClipRoundedTestsDropped => clip_rounded_tests_dropped, Group::BackendNeutral;
+
     /// Hit-test entries updated in place.
     HitEntriesUpdated => hit_entries_updated, Group::BackendNeutral;
 
@@ -219,6 +293,11 @@ counters! {
     /// Extra passes run to deliver size and position observations and let their handlers settle.
     ObservationPasses => observation_passes, Group::BackendNeutral;
 
+    /// Deliveries that still changed a watched value when the pass budget ran out.
+    ///
+    /// Each one costs the window a frame that delivers the rest and paints again.
+    ObservationsTruncated => observations_truncated, Group::BackendNeutral;
+
     /// Timers whose deadline passed and whose callback ran.
     TimersFired => timers_fired, Group::BackendNeutral;
 
@@ -230,6 +309,13 @@ counters! {
 
     /// Draw calls submitted to the GPU.
     DrawCalls => draw_calls, Group::RendererSpecific;
+
+    /// Instanced batches a renderer left out of a pass, because they write nothing inside its
+    /// scissor.
+    ///
+    /// A frame of several damage rectangles replays its batches once per rectangle. Each batch
+    /// whose pixels miss a rectangle counts here once for that rectangle, and draws nothing there.
+    BatchesCulled => batches_culled, Group::RendererSpecific;
 
     /// Vector rasterisation passes the scene stage planned.
     ///
@@ -265,6 +351,13 @@ counters! {
     /// a total only ever grows, so a session that thrashed for one second and behaved for an hour
     /// is indistinguishable from one that thrashed throughout.
     RebuiltAfterEviction => rebuilt_after_eviction, Group::BackendNeutral;
+
+    /// Glyphs rasterised on the layout workers before the emit walk asked for them.
+    ///
+    /// The walk still counts each key it asks for in [`Counter::GlyphsRasterised`]. A prefetched
+    /// key that the walk does not ask for is wasted work. When this is larger than
+    /// `GlyphsRasterised` on the same frame, the difference is the least waste of the prediction.
+    GlyphsPrefetched => glyphs_prefetched, Group::BackendNeutral;
 
     /// Cached rasters freed to bring the atlas back under its soft limit.
     ///
@@ -336,6 +429,12 @@ counters! {
     /// that persists means large uploads on every frame.
     StagingOneShotBytes => staging_one_shot_bytes, Group::RendererSpecific;
 
+    /// Nanoseconds the GPU spent in the renderer's timed passes.
+    ///
+    /// Zero unless GPU pass timing is on. A frame's time is added when its result is read back,
+    /// one or two frames after the frame was drawn.
+    GpuTimeNs => gpu_time_ns, Group::RendererSpecific;
+
     /// Frames the loop actually drew.
     ///
     /// Named for what it counts. A window with nothing moving in it is supposed to leave this
@@ -396,6 +495,119 @@ counters! {
     /// reported nowhere else.
     VectorFramesDropped => vector_frames_dropped, Group::BackendNeutral;
 
+    /// Times a renderer built its general vector rasteriser.
+    ///
+    /// At most one per renderer. The build costs hundreds of milliseconds and a large fixed
+    /// allocation, so a document that can draw every shape from the atlas must keep this at zero.
+    VectorBackendBuilt => vector_backend_built, Group::RendererSpecific;
+
+    /// Rasterisations the general vector rasteriser performed on the device.
+    VelloRenders => vello_renders, Group::RendererSpecific;
+
+    /// Vector item encodings the general rasteriser found current and used again.
+    VectorEncodeHits => vector_encode_hits, Group::RendererSpecific;
+
+    /// Vector item encodings the general rasteriser had to make.
+    VectorEncodeMisses => vector_encode_misses, Group::RendererSpecific;
+
+    /// Shapes emitted as coverage masks in the shared atlas.
+    VectorRouteMask => vector_route_mask, Group::BackendNeutral;
+
+    /// Shapes emitted as items for the general vector rasteriser.
+    VectorRouteGeneral => vector_route_general, Group::BackendNeutral;
+
+    /// Shapes emitted as analytic quads.
+    VectorRouteAnalytic => vector_route_analytic, Group::BackendNeutral;
+
+    /// Shapes emitted as marks.
+    VectorRouteMarks => vector_route_marks, Group::BackendNeutral;
+
+    /// Shapes and series parts emitted as path glyphs.
+    VectorRoutePathGlyphs => vector_route_path_glyphs, Group::BackendNeutral;
+
+    /// Path glyph phase cells rasterised.
+    PathGlyphTilesRasterised => path_glyph_tiles_rasterised, Group::BackendNeutral;
+
+    /// Union coverage bins planned this frame.
+    MarksUnionBins => marks_union_bins, Group::BackendNeutral;
+
+    /// Mark payload bytes uploaded.
+    MarksPayloadBytes => marks_payload_bytes, Group::RendererSpecific;
+
+    /// Series payloads built.
+    SeriesPayloadsBuilt => series_payloads_built, Group::BackendNeutral;
+
+    /// Series payload builds started on a worker thread.
+    SeriesBuildsAsync => series_builds_async, Group::BackendNeutral;
+
+    /// Series parts drawn from a payload that stands in for one a build makes.
+    SeriesDrawsProvisional => series_draws_provisional, Group::BackendNeutral;
+
+    /// Chunks of series payloads that items draw.
+    SeriesChunksDrawn => series_chunks_drawn, Group::BackendNeutral;
+
+    /// Chunks of series payloads that items leave out, because they are far from what is shown.
+    SeriesChunksCulled => series_chunks_culled, Group::BackendNeutral;
+
+    /// Recognitions and shape mark payloads kept nowhere, because every entry of their full cache
+    /// was pinned.
+    MarksUncached => marks_uncached, Group::BackendNeutral;
+
+    /// Coverage masks rasterised because no tile held their geometry.
+    VectorMaskMisses => vector_mask_misses, Group::BackendNeutral;
+
+    /// Mask requests declined because the frame had spent its budget for new masks.
+    VectorMaskBudgetOverflow => vector_mask_budget_overflow, Group::BackendNeutral;
+
+    /// Vector items a chunk replay moved.
+    VectorReplaysMoved => vector_replays_moved, Group::BackendNeutral;
+
+    /// Times one shape part went from the mask route to a decline, or back.
+    VectorTierChanges => vector_tier_changes, Group::BackendNeutral;
+
+    /// Geometry identities the mask cache maps to atlas tiles right now.
+    VectorMaskTilesLive => vector_mask_tiles_live, Group::Live;
+
+    /// Drawings emitted as one CPU layer sprite.
+    VectorRouteLayer => vector_route_layer, Group::BackendNeutral;
+
+    /// CPU layers rasterised.
+    VectorLayersRasterised => vector_layers_rasterised, Group::BackendNeutral;
+
+    /// Microseconds spent rasterising CPU layers, measured.
+    VectorLayerRasterUs => vector_layer_raster_us, Group::BackendNeutral;
+
+    /// Bytes of CPU layer texels queued for upload, mip levels included.
+    VectorLayerBytesUploaded => vector_layer_bytes_uploaded, Group::BackendNeutral;
+
+    /// Layer sprites drawn from a raster of another scale, until the drawing settles.
+    VectorLayersProvisional => vector_layers_provisional, Group::BackendNeutral;
+
+    /// Drawings that drew nothing this frame because the layer budget was spent.
+    VectorLayersDeferred => vector_layers_deferred, Group::BackendNeutral;
+
+    /// Times a drawing rasterised so often that the layer route was closed to it for a while.
+    VectorLayersDemoted => vector_layers_demoted, Group::BackendNeutral;
+
+    /// CPU layers the budget removed.
+    VectorLayersEvicted => vector_layers_evicted, Group::BackendNeutral;
+
+    /// Layer candidates drawn shape by shape instead.
+    VectorLayerFallbacks => vector_layer_fallbacks, Group::BackendNeutral;
+
+    /// Tiles of large CPU layers rasterised.
+    VectorLayerTilesRasterised => vector_layer_tiles_rasterised, Group::BackendNeutral;
+
+    /// Tiles of large CPU layers a frame needed and drew nothing for, because the layer budget was
+    /// spent.
+    VectorLayerTilesDeferred => vector_layer_tiles_deferred, Group::BackendNeutral;
+
+    /// Tiles of a new tiled source that an equal tile of an earlier source already rasterised.
+    VectorLayerTilesReused => vector_layer_tiles_reused, Group::BackendNeutral;
+
+    /// Bytes of CPU layer tiles the layer cache keeps right now.
+    VectorLayerBytesLive => vector_layer_bytes_live, Group::Live;
+
     /// Primitives whose paint was re-anchored because the primitive moved.
     ///
     /// A ramp and a sampled image are read at the point being drawn, in the coordinates they were
@@ -403,6 +615,24 @@ counters! {
     /// came. Only a paint that is read at a point is counted: a flat fill is the same colour
     /// everywhere and moving it is not re-anchoring anything.
     PaintsReanchored => paints_reanchored, Group::BackendNeutral;
+
+    /// Bytes the text engine's shaped paragraphs hold right now, as the engine estimates them.
+    ///
+    /// A trend figure: compare it between runs. The allocation tags for shaping and breaking give
+    /// the absolute bytes. Zero for an engine that makes no estimate.
+    ParagraphBytesLive => paragraph_bytes_live, Group::Live;
+
+    /// Brush slots in use in the text paint table, released slots excluded.
+    TextBrushSlotsLive => text_brush_slots_live, Group::Live;
+
+    /// Cascade results the text paint table resolves to a brush slot.
+    TextBrushKeysLive => text_brush_keys_live, Group::Live;
+
+    /// Element runs the window records a brush slot for.
+    TextSlotRecordsLive => text_slot_records_live, Group::Live;
+
+    /// Cascade results the text engine holds so that the brush table can file them by address.
+    TextBrushPinsLive => text_brush_pins_live, Group::Live;
 
     /// Shaped paragraphs thrown away.
     ParagraphsForgotten => paragraphs_forgotten, Group::BackendNeutral;
@@ -418,8 +648,31 @@ counters! {
     /// everything the window has ever shaped.
     ParagraphsEvicted => paragraphs_evicted, Group::BackendNeutral;
 
+    /// Shaped paragraphs the shaping cache examined to keep its eviction candidates.
+    ///
+    /// Follows what changed: a frame that releases or shapes no paragraph adds nothing.
+    ParagraphsExamined => paragraphs_examined, Group::BackendNeutral;
+
     /// Boxes whose layout was thrown away because the text in them has to be shaped again.
     BoxesReshaped => boxes_reshaped, Group::BackendNeutral;
+
+    /// Styles replaced by the groups of an equal style an earlier element was given.
+    StylesShared => styles_shared, Group::BackendNeutral;
+
+    /// Cascades of a restyle that the traversal's memo answered.
+    CascadeMemoHits => cascade_memo_hits, Group::BackendNeutral;
+
+    /// Cascades of a restyle that the memo could answer and did not hold.
+    CascadeMemoMisses => cascade_memo_misses, Group::BackendNeutral;
+
+    /// Cascades of a restyle that the memo cannot answer.
+    CascadeMemoSkips => cascade_memo_skips, Group::BackendNeutral;
+
+    /// Fragment passes that followed repaint marks and composed nothing.
+    RepaintWalks => repaint_walks, Group::BackendNeutral;
+
+    /// Boxes those walks read.
+    RepaintWalkBoxes => repaint_walk_boxes, Group::BackendNeutral;
 }
 
 impl Counter {

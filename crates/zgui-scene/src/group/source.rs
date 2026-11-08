@@ -28,10 +28,10 @@ use crate::group::filter::Filter;
 /// // A per-pixel filter reads exactly what it writes.
 /// assert_eq!(read_extent(bounds, &[Filter::Saturate(1.8)]), bounds);
 ///
-/// // A blur reads three standard deviations beyond it, on every side.
+/// // A blur reads three standard deviations beyond it, plus its resampling reach, on every side.
 /// let blurred = read_extent(bounds, &[Filter::Blur(4.0)]);
-/// assert_eq!(blurred.origin, Point::new(DevicePx(88.0), DevicePx(88.0)));
-/// assert_eq!(blurred.size, Size::new(DevicePx(74.0), DevicePx(74.0)));
+/// assert_eq!(blurred.origin, Point::new(DevicePx(86.0), DevicePx(86.0)));
+/// assert_eq!(blurred.size, Size::new(DevicePx(78.0), DevicePx(78.0)));
 /// ```
 pub fn read_extent(bounds: Rect<DevicePx, Device>, filters: &[Filter]) -> Rect<DevicePx, Device> {
     let mut left = 0.0f32;
@@ -104,7 +104,7 @@ mod tests {
         let read = read_extent(bounds(), &[Filter::Blur(2.0), effect(4.0)]);
         assert_eq!(
             read.origin.x.0,
-            -(Filter::BLUR_EXTENT * 2.0 + 4.0),
+            -(Filter::BLUR_EXTENT * 2.0 + Filter::RESAMPLE_REACH + 4.0),
             "the two supports add rather than taking a maximum"
         );
     }

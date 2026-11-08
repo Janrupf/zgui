@@ -9,9 +9,11 @@
 use zgui::bits::DamageSet;
 use zgui::geom::{Device, DevicePx, Point, Rect, Size};
 use zgui::render::Renderer as _;
-use zgui::scene::{PaintRef, Quad, Scene};
+use zgui::scene::{Paint, PaintRef, Quad, Scene};
 use zgui_color::Color;
 use zgui_render_wgpu::{Pixels, WgpuRenderer};
+
+use crate::raster::page::INK;
 
 /// What one of the application's frames produced on the device.
 pub struct Recorded {
@@ -29,7 +31,7 @@ pub struct Recorded {
     pub declared: Option<Rect<i32, Device>>,
     /// How many vector passes the frame reported.
     pub vector_passes: u32,
-    /// How many vector items the display list held.
+    /// How many primitives of the drawing the display list held. See [`drawing`].
     pub items: usize,
 }
 
@@ -46,8 +48,9 @@ pub fn record(renderer: &mut WgpuRenderer, scene: &Scene, background: [u8; 4]) -
     let vector_passes = outcome.stats().map_or(0, |stats| stats.vector_passes);
     let full = read(renderer);
 
-    let declared = ink(scene);
-    let items = scene.primitives.vectors.len();
+    let shapes = drawing(scene);
+    let declared = ink(&shapes);
+    let items = shapes.len();
     let Some(rectangle) = declared else {
         return Recorded {
             full,
@@ -88,20 +91,71 @@ fn read(renderer: &WgpuRenderer) -> Pixels {
         .expect("these fixtures draw to a texture, which can be read back")
 }
 
-/// The rectangle every vector item's ink covers, rounded outwards to whole pixels.
+/// Where each primitive of the drawing lands, in device pixels.
+///
+/// The display list picks a route per shape, so a drawing arrives as vector items, mark items,
+/// coverage sprites or quads. Every vector item is a drawing. The other kinds are also what a box
+/// is drawn with, so only the ones painted in [`INK`] count. No document here has a transform, so
+/// the rectangles are the recorded ones.
+fn drawing(scene: &Scene) -> Vec<Rect<DevicePx, Device>> {
+    let primitives = &scene.primitives;
+    let inked = |paint: PaintRef| {
+        paint.id().and_then(|id| scene.paints.get(id)).is_some_and(
+            |paint| matches!(paint, Paint::Solid(color) if is_ink(color.to_premultiplied_srgb())),
+        )
+    };
+    let mut shapes: Vec<Rect<DevicePx, Device>> =
+        primitives.vectors.iter().map(|item| item.ink).collect();
+    shapes.extend(
+        primitives
+            .quads
+            .iter()
+            .filter(|quad| inked(quad.fill) || inked(quad.stroke))
+            .map(|quad| rect_of(quad.bounds)),
+    );
+    shapes.extend(
+        primitives
+            .marks
+            .iter()
+            .filter(|mark| inked(mark.paint))
+            .map(|mark| rect_of(mark.bounds)),
+    );
+    shapes.extend(
+        primitives
+            .mono_sprites
+            .iter()
+            .filter(|sprite| is_ink(sprite.color))
+            .map(|sprite| rect_of(sprite.bounds)),
+    );
+    shapes
+}
+
+/// Whether a premultiplied colour is [`INK`], to within one step of eight bits.
+fn is_ink(color: [f32; 4]) -> bool {
+    color
+        .iter()
+        .zip(INK)
+        .all(|(channel, ink)| (channel * 255.0 - f32::from(ink)).abs() <= 1.0)
+}
+
+/// One `[x, y, width, height]` as a rectangle.
+fn rect_of(bounds: [f32; 4]) -> Rect<DevicePx, Device> {
+    Rect::new(
+        Point::new(DevicePx(bounds[0]), DevicePx(bounds[1])),
+        Size::new(DevicePx(bounds[2]), DevicePx(bounds[3])),
+    )
+}
+
+/// The rectangle every one of `shapes` covers, rounded outwards to whole pixels.
 ///
 /// Taken from the display list rather than from the layout tree because it is the display list's
 /// own claim about where the ink goes, and the whole question here is whether the device put the
 /// ink where the display list said it would.
-fn ink(scene: &Scene) -> Option<Rect<i32, Device>> {
-    let mut bounds: Option<Rect<DevicePx, Device>> = None;
-    for item in &scene.primitives.vectors {
-        bounds = Some(match bounds {
-            None => item.ink,
-            Some(so_far) => so_far.union(item.ink),
-        });
-    }
-    let bounds = bounds?;
+fn ink(shapes: &[Rect<DevicePx, Device>]) -> Option<Rect<i32, Device>> {
+    let bounds = shapes
+        .iter()
+        .copied()
+        .reduce(|so_far, shape| so_far.union(shape))?;
     let left = bounds.left().0.floor() as i32;
     let top = bounds.top().0.floor() as i32;
     let right = bounds.right().0.ceil() as i32;

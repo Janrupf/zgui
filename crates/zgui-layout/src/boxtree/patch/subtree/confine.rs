@@ -10,8 +10,13 @@ use crate::tree::store::LayoutStore;
 
 /// What a confined subtree is, once it has been proved to be one.
 pub(super) struct Held {
-    /// The box the subtree's root hangs under, in both child orders.
+    /// The box that lays the subtree's root out.
     pub(super) parent: BoxKey,
+    /// The box that paints the subtree's root where it was written.
+    ///
+    /// The same box as `parent`, except for an out-of-flow root positioned by an ancestor of the
+    /// box it was written inside.
+    pub(super) painter: BoxKey,
     /// Every box in the subtree, including its root.
     pub(super) subtree: Vec<BoxKey>,
 }
@@ -20,51 +25,31 @@ pub(super) struct Held {
 ///
 /// Three things are checked, and each is a way a splice would otherwise corrupt the tree.
 ///
-/// **The box hangs in one place.** It has to be a child of one box in *both* the layout order and
-/// the paint order. A box that is in one and not the other is out of flow — laid out by an ancestor
-/// and painted where it was written — and replacing it leaves a dead key in whichever list was not
-/// looked at.
+/// **The box hangs in known places.** It has to be a child of one box in *both* the layout order and
+/// the paint order, or an out-of-flow box in the layout order of its containing block and in the
+/// paint order of the box its [`Declared`] record names. [`Held::painter`] tells the two apart, and a
+/// caller that repairs only one list must refuse the second shape.
+///
+/// [`Declared`]: crate::boxtree::absolute::Declared
 ///
 /// **Nothing inside is laid out from outside.** Every box below the root must have its layout
 /// parent inside the subtree, or something out there is holding a name that is about to be removed.
 ///
 /// **Nothing outside is written inside.** Every box in the subtree that names an element must name
-/// `target`, an element below it, or an element that has left the document — or an absolutely
+/// `target`, an element below it or an element that has left the document, or an absolutely
 /// positioned box written somewhere else has been positioned into this subtree and is about to be
 /// destroyed with it.
-///
-/// A departed element is admitted for the reason [`departed`] gives at length: a view unmounts from
-/// the inside out, so a node that has gone has no ancestry left to read and every box naming it
-/// reads as written elsewhere. Dropping those boxes is what the removal asked for. Refusing them
-/// instead rebuilds every box in the document each time a popup closes, which is what a container
-/// that holds portalled content does on every dismissal.
 pub(super) fn confined(
     store: &LayoutStore,
     document: &Document,
     target: NodeIndex,
     old: BoxKey,
-) -> Result<Held, Unheld> {
+) -> Option<Held> {
+    // An element that has left the document is admitted too: its boxes go with the subtree, and
+    // nothing the document still reaches can name them.
     proved(store, document, old, &|index| {
         target::is_at_or_below(document, index, target) || gone(document, index)
     })
-}
-
-/// Which of the three proofs a subtree failed.
-///
-/// A refusal builds every box in the document, so which question said no is worth naming: the three
-/// are refused by different things and are answered by different fixes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Unheld {
-    /// The box, its parent, or a box below it is no longer in the tree.
-    Missing,
-    /// The box hangs under one box to be laid out and another to be painted.
-    ///
-    /// Out of flow: replacing it leaves a dead key in whichever list was not looked at.
-    InTwoPlaces,
-    /// A box below the root is laid out by a box outside the subtree.
-    LaidOutFromOutside(NodeIndex),
-    /// A box inside the subtree names an element that is not below its root.
-    WrittenElsewhere(NodeIndex),
 }
 
 /// The same proof for the boxes of a subtree that has **left** the document.
@@ -81,7 +66,7 @@ pub(super) enum Unheld {
 /// this subtree, whose paint order is a list nothing here can repair — while admitting the subtree the
 /// caller is actually taking out.
 pub(super) fn departed(store: &LayoutStore, document: &Document, root: BoxKey) -> Option<Held> {
-    proved(store, document, root, &|index| gone(document, index)).ok()
+    proved(store, document, root, &|index| gone(document, index))
 }
 
 /// Whether `index` can no longer be reached from the document node.
@@ -109,34 +94,41 @@ fn proved(
     document: &Document,
     old: BoxKey,
     written_inside: &dyn Fn(NodeIndex) -> bool,
-) -> Result<Held, Unheld> {
-    let parent = store
-        .get(old)
-        .and_then(|node| node.parent)
-        .ok_or(Unheld::Missing)?;
-    let above = store.get(parent).ok_or(Unheld::Missing)?;
-    if !above.children.contains(&old) || !above.paint_children.contains(&old) {
-        return Err(Unheld::InTwoPlaces);
+) -> Option<Held> {
+    let parent = store.get(old)?.parent?;
+    let above = store.get(parent)?;
+    if !above.children.contains(&old) {
+        return None;
     }
+    let painter = if above.paint_children.contains(&old) {
+        parent
+    } else {
+        let painter = store.declared(old)?.parent;
+        if !store.get(painter)?.paint_children.contains(&old) {
+            return None;
+        }
+        painter
+    };
 
     let subtree = collect(store, old);
     let inside: FxHashSet<BoxKey> = subtree.iter().copied().collect();
     for &key in &subtree {
-        let node = store.get(key).ok_or(Unheld::Missing)?;
-        let index = node
-            .source
-            .map(|source| document.store().index_of(source).ok_or(Unheld::Missing))
-            .transpose()?;
+        let node = store.get(key)?;
         if key != old && !node.parent.is_some_and(|parent| inside.contains(&parent)) {
-            return Err(index.map_or(Unheld::Missing, Unheld::LaidOutFromOutside));
+            return None;
         }
-        if let Some(index) = index
-            && !written_inside(index)
-        {
-            return Err(Unheld::WrittenElsewhere(index));
+        if let Some(source) = node.source {
+            let index = document.store().index_of(source)?;
+            if !written_inside(index) {
+                return None;
+            }
         }
     }
-    Ok(Held { parent, subtree })
+    Some(Held {
+        parent,
+        painter,
+        subtree,
+    })
 }
 
 /// Every box at or below `root`, in both child orders, each named once.

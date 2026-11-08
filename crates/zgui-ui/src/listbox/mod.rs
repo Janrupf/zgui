@@ -9,6 +9,7 @@
 //! [`active_descendant`]: zgui::prelude::A11yBinding::active_descendant
 
 mod catalogue;
+mod group;
 mod keys;
 mod labels;
 mod option;
@@ -17,6 +18,7 @@ mod registry;
 pub use crate::listbox::catalogue::{
     ListboxCatalogue, ListboxCatalogueOf, ListboxCatalogueOfProps,
 };
+pub use crate::listbox::group::ListboxGroup;
 pub use crate::listbox::keys::{ListboxAction, action_for};
 pub use crate::listbox::labels::ListboxLabels;
 pub use crate::listbox::option::{ListboxEntry, ListboxOption};

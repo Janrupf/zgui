@@ -7,11 +7,16 @@
 
 mod support;
 
+use std::sync::Arc;
+
 use zgui_bits::DamageSet;
+use zgui_color::Color;
 use zgui_geom::{Device, DevicePx, Point, Rect, Scale, Size};
 use zgui_render::{RenderTarget, Renderer};
 use zgui_render_wgpu::{Pixels, WgpuRenderer};
-use zgui_scene::{BackdropFilter, Filter, GroupBoundary, Quad, Scene};
+use zgui_scene::{
+    BackdropFilter, Filter, GroupBoundary, MarkFlags, MarkItem, MarkPayload, PaintRef, Quad, Scene,
+};
 
 use support::{SIDE, opaque, plain_renderer, present, rect};
 
@@ -22,8 +27,8 @@ struct Item {
     bounds: (f32, f32, f32, f32),
     /// What colour it is.
     color: [u8; 3],
-    /// The deviation of the blur over what lies beneath it, or zero for a plain rectangle.
-    frost: f32,
+    /// The deviation of the blur over what lies beneath it, or `None` for a plain rectangle.
+    frost: Option<f32>,
     /// How far the coordinate system this is drawn under is translated from the viewport's.
     ///
     /// The transform half of the fixture. A rectangle drawn under a coordinate system of its own
@@ -39,7 +44,7 @@ impl Item {
         Self {
             bounds,
             color,
-            frost: 0.0,
+            frost: None,
             shift: (0.0, 0.0),
         }
     }
@@ -55,7 +60,7 @@ impl Item {
         Self {
             bounds,
             color: [0; 3],
-            frost: deviation,
+            frost: Some(deviation),
             shift: (0.0, 0.0),
         }
     }
@@ -77,15 +82,17 @@ impl Item {
 
     /// Every pixel this reads, which is what it paints unless it filters what is beneath it.
     fn source(&self) -> Rect<DevicePx, Device> {
-        if self.frost > 0.0 {
-            BackdropFilter::new(self.ink(), [Filter::Blur(self.frost)].into_iter().collect()).source
-        } else {
-            self.ink()
+        match self.frost {
+            Some(deviation) => {
+                BackdropFilter::new(self.ink(), [Filter::Blur(deviation)].into_iter().collect())
+                    .source
+            }
+            None => self.ink(),
         }
     }
 }
 
-/// Builds `items` into a finished scene, with every frosted panel renewing its capture.
+/// Builds `items` into a finished scene.
 fn build(items: &[Item]) -> Scene {
     build_with(items, false)
 }
@@ -105,9 +112,9 @@ fn build_with(items: &[Item], keeping: bool) -> Scene {
         white,
     ));
     for (index, item) in items.iter().enumerate() {
-        if item.frost > 0.0 {
+        if let Some(deviation) = item.frost {
             let mut filter =
-                BackdropFilter::new(item.ink(), [Filter::Blur(item.frost)].into_iter().collect());
+                BackdropFilter::new(item.ink(), [Filter::Blur(deviation)].into_iter().collect());
             if keeping {
                 filter = filter.keeping_its_capture();
             }
@@ -236,10 +243,15 @@ fn transform_animation(step: i32) -> Vec<Item> {
 /// exactly why it is the fixture that matters: the damage that reaches it comes from the content
 /// beneath it, and a rule that only looked at what changed would miss the region the panel reads.
 fn backdrop_filter_over_animating_content(step: i32) -> Vec<Item> {
+    frosted_over_animating_content(step, 5.0)
+}
+
+/// [`backdrop_filter_over_animating_content`] with a blur of `deviation`.
+fn frosted_over_animating_content(step: i32, deviation: f32) -> Vec<Item> {
     vec![
         Item::plain((0.0, 0.0, 128.0, 128.0), [230, 230, 230]),
         Item::plain((8.0 + step as f32 * 3.0, 40.0, 32.0, 48.0), [20, 20, 200]),
-        Item::frosted((32.0, 32.0, 64.0, 64.0), 5.0),
+        Item::frosted((32.0, 32.0, 64.0, 64.0), deviation),
     ]
 }
 
@@ -358,6 +370,40 @@ fn a_backdrop_over_animating_content_is_redrawn_without_smearing() {
 }
 
 #[test]
+fn a_backdrop_with_a_small_or_zero_blur_is_redrawn_without_a_seam() {
+    // A blur resamples through a half-resolution target, which reads two device pixels past its
+    // kernel. A small blur reaches less than that, and a blur of zero has no kernel at all, so
+    // these are the deviations where the read extent must count the resampling or skip the blur.
+    for deviation in [0.0, 0.2] {
+        let Some((mut tracked, mut whole_surface)) = support::renderer_pair() else {
+            return;
+        };
+        let mut items = frosted_over_animating_content(0, deviation);
+        present(&mut tracked, &build(&items));
+        present(&mut whole_surface, &build(&items));
+        for step in 1..8 {
+            let previous = items.clone();
+            items = frosted_over_animating_content(step, deviation);
+            let damaged = draw_damaged(&mut tracked, &previous, &items);
+            let full = present(&mut whole_surface, &build(&items));
+            assert_eq!(
+                damaged.max_difference(&full),
+                0,
+                "blur({deviation}), step {step}: the partial frame differs from the whole frame"
+            );
+        }
+        assert!(
+            !damage_between(
+                &frosted_over_animating_content(6, deviation),
+                &frosted_over_animating_content(7, deviation)
+            )
+            .is_full(),
+            "the fixture must exercise a partial redraw"
+        );
+    }
+}
+
+#[test]
 fn nothing_outside_a_damage_rectangle_is_touched() {
     // The mechanism, rather than the outcome: a frame whose damage names one corner has to leave
     // every other pixel exactly as the previous frame left it — including pixels whose content
@@ -450,6 +496,131 @@ fn a_group_inside_a_damage_rectangle_is_composited_from_what_the_rectangle_holds
         0,
         "the same group composited in two rectangles is the same picture"
     );
+}
+
+/// Lines and rectangles stacked in the top left, the same stack turned in the bottom right, and a
+/// blurred group whose content sits on both sides of the top-left rectangle's edge.
+///
+/// Each layer of a stack alternates kind, and the top layer of each is a rectangle `tint` colours.
+fn culled_corners(tint: [u8; 3]) -> Scene {
+    let mut scene = Scene::new();
+    scene.begin_frame(Size::new(SIDE, SIDE));
+    let white = scene
+        .paints
+        .add(zgui_scene::Paint::Solid(opaque(255, 255, 255)));
+    let grey = scene
+        .paints
+        .add(zgui_scene::Paint::Solid(opaque(90, 90, 90)));
+    let tinted = scene
+        .paints
+        .add(zgui_scene::Paint::Solid(opaque(tint[0], tint[1], tint[2])));
+    scene.push_quad(Quad::filled(
+        rect(0.0, 0.0, SIDE as f32, SIDE as f32),
+        white,
+    ));
+    // A turn of 0.3 rad about the centre of the bottom-right stack.
+    let (sin, cos) = 0.3f32.sin_cos();
+    let owner = zgui_scene::PropertyOwner::new(9).expect("a handle is never the empty word");
+    let turn = zgui_geom::Matrix4::from_columns([
+        [cos, sin, 0.0, 0.0],
+        [-sin, cos, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [96.0, 96.0, 0.0, 1.0],
+    ]);
+    let viewport = scene.spatial.viewport();
+    let turned = scene.spatial.space_of(
+        viewport,
+        owner,
+        zgui_scene::OwnSpace::of(Some(turn), None, false),
+    );
+    // The turned stack starts with a line, so no layer of it shares a batch with the other stack.
+    for (origin, space, layers) in [((8.0, 8.0), None, 5), ((-16.0, -16.0), Some(turned), 6)] {
+        for layer in 0..layers {
+            let top = layer + 1 == layers;
+            let at = rect(
+                origin.0,
+                origin.1 + 3.0 * layer as f32,
+                32.0,
+                if top { 12.0 } else { 8.0 },
+            );
+            if (layer + layers) % 2 == 0 {
+                let mut line = zgui_scene::Decoration::new(
+                    at,
+                    2.0,
+                    opaque(200, 30, 30),
+                    zgui_scene::prim::DecorationStyle::Solid,
+                );
+                if let Some(space) = space {
+                    line.transform = space.index();
+                }
+                scene.push_decoration(line);
+            } else {
+                let paint = if top { tinted } else { grey };
+                let mut quad = Quad::filled(at, paint);
+                if let Some(space) = space {
+                    quad = quad.transformed(space);
+                }
+                scene.push_quad(quad);
+            }
+        }
+    }
+    // The group's line lies past the top-left rectangle, and its blur reaches into it.
+    let boundary = GroupBoundary::start(
+        rect(0.0, 48.0, 64.0, 24.0),
+        1.0,
+        zgui_scene::peniko::BlendMode::default(),
+        [Filter::Blur(3.0)].into_iter().collect(),
+    );
+    scene.push_group(boundary.clone());
+    scene.push_quad(Quad::filled(rect(4.0, 52.0, 16.0, 8.0), tinted));
+    scene.push_decoration(zgui_scene::Decoration::new(
+        rect(44.0, 52.0, 12.0, 6.0),
+        2.0,
+        opaque(30, 30, 200),
+        zgui_scene::prim::DecorationStyle::Solid,
+    ));
+    scene.push_group(boundary.end());
+    scene.finish(&DamageSet::full());
+    scene
+}
+
+#[test]
+fn a_frame_with_batches_left_out_of_a_rectangle_is_the_frame_drawn_whole() {
+    // With several rectangles, a batch that writes nothing inside one is not drawn into it. The
+    // picture is the one property that must not notice.
+    let Some((mut split, mut once)) = support::renderer_pair() else {
+        return;
+    };
+    present(&mut split, &culled_corners([40, 160, 40]));
+    let after = culled_corners([160, 40, 160]);
+
+    let mut corners: DamageSet = DamageSet::new();
+    corners.absorb(Rect::new(Point::new(0, 0), Size::new(42, 80)));
+    corners.absorb(Rect::new(Point::new(68, 68), Size::new(56, 56)));
+    assert_eq!(corners.len(), 2, "two disjoint rectangles");
+
+    let culled = {
+        let _turn = zgui_profile::counter::exclusive();
+        let before = zgui_profile::counter::get(zgui_profile::Counter::BatchesCulled);
+        let outcome = split.draw(&after, &corners);
+        assert!(outcome.retires_damage(), "{outcome:?}");
+        zgui_profile::counter::get(zgui_profile::Counter::BatchesCulled) - before
+    };
+    let in_corners = split
+        .read_presented()
+        .expect("a stand-in surface can be read back");
+    let whole_frame = present(&mut once, &after);
+    assert_eq!(
+        in_corners.max_difference(&whole_frame),
+        0,
+        "the corners redrawn with batches left out are the frame drawn whole"
+    );
+    if zgui_profile::COUNTERS_ENABLED {
+        assert!(
+            culled > 0,
+            "the fixture must leave batches out of a rectangle"
+        );
+    }
 }
 
 #[test]
@@ -604,6 +775,170 @@ fn a_transform_that_moves_nothing_else_still_damages_what_it_moved() {
     );
 }
 
+#[test]
+fn a_frame_the_renderer_widens_paints_a_union_overlap_once() {
+    // A fresh renderer redraws its first frame whole, whatever damage it is handed. The scene plans
+    // its bins for a corner the discs do not reach, so the frame that draws them plans its own.
+    let Some(mut renderer) = plain_renderer() else {
+        return;
+    };
+    let mut scene = Scene::new();
+    scene.begin_frame(Size::new(SIDE, SIDE));
+    let translucent = PaintRef::solid(scene.paints.solid(Color::srgb_u8(200, 60, 20, 128)));
+    let discs = MarkPayload {
+        discs: vec![[48.0, 64.0, 24.0, 0.0], [80.0, 64.0, 24.0, 0.0]],
+        ..MarkPayload::default()
+    };
+    let mut union = MarkItem::new(rect(24.0, 40.0, 80.0, 48.0), translucent, discs.counts());
+    union.flags |= MarkFlags::UNION;
+    scene.push_marks(union, Arc::new(discs));
+    let mut corner = DamageSet::new();
+    corner.absorb(Rect::new(Point::new(0, 0), Size::new(16, 16)));
+    scene.finish(&corner);
+    assert!(scene.mark_plan().is_empty(), "the corner reaches no disc");
+
+    let outcome = renderer.draw(&scene, &corner);
+    assert_eq!(
+        outcome.stats().map(|stats| stats.damage_px),
+        Some((SIDE * SIDE) as u64),
+        "the first frame redraws all of the surface"
+    );
+    let pixels = renderer.read_composed();
+    let single = pixels.rgba(36, 64)[3];
+    let overlap = pixels.rgba(64, 64)[3];
+    assert!((127..=129).contains(&single), "one disc: {single}");
+    assert!(
+        overlap.abs_diff(single) <= 1,
+        "the overlap paints alpha once ({overlap}), as one disc does ({single}), never twice"
+    );
+}
+
+/// A half-transparent square drawn through a group, under a coordinate system shifted by `shift`,
+/// or drawn at the shifted place with no coordinate system at all when `flat`.
+fn isolated(shift: f32, flat: bool) -> Scene {
+    let mut scene = Scene::new();
+    scene.begin_frame(Size::new(SIDE, SIDE));
+    let white = scene
+        .paints
+        .add(zgui_scene::Paint::Solid(opaque(255, 255, 255)));
+    scene.push_quad(Quad::filled(
+        rect(0.0, 0.0, SIDE as f32, SIDE as f32),
+        white,
+    ));
+    let red = scene
+        .paints
+        .add(zgui_scene::Paint::Solid(opaque(200, 30, 30)));
+    let (offset, space) = if flat {
+        (shift, None)
+    } else {
+        let owner = zgui_scene::PropertyOwner::new(9).expect("a handle");
+        let own = zgui_scene::OwnSpace::of(
+            Some(zgui_geom::Matrix4::translation(shift, 0.0, 0.0)),
+            None,
+            false,
+        );
+        let viewport = scene.spatial.viewport();
+        (0.0, Some(scene.spatial.space_of(viewport, owner, own)))
+    };
+    let bounds = rect(20.0 + offset, 20.0, 30.0, 30.0);
+    let mut group = GroupBoundary::start(
+        bounds,
+        0.5,
+        zgui_scene::peniko::BlendMode::default(),
+        Default::default(),
+    );
+    group.transform = space;
+    scene.push_group(group.clone());
+    let mut quad = Quad::filled(bounds, red);
+    if let Some(space) = space {
+        quad = quad.transformed(space);
+    }
+    scene.push_quad(quad);
+    scene.push_group(group.end());
+    scene.finish(&DamageSet::full());
+    scene
+}
+
+#[test]
+fn a_group_is_composited_where_its_coordinate_system_now_is() {
+    // A group's bounds are in its own coordinate system, so a write that moves the system moves
+    // the region the group is drawn and composited over with it. Read on the device as they were
+    // emitted, they cut the content off where the system has moved away from.
+    let Some((mut moved, mut flat)) = support::renderer_pair() else {
+        return;
+    };
+    for shift in [0.0, 6.0, 40.0] {
+        let drawn = present(&mut moved, &isolated(shift, false));
+        let expected = present(&mut flat, &isolated(shift, true));
+        assert_eq!(
+            drawn.max_difference(&expected),
+            0,
+            "shifted by {shift}: the group under the system differs from the group drawn there"
+        );
+    }
+}
+
+/// Stripes under a blurring panel, drawn under a coordinate system shifted by `shift`, or drawn at
+/// the shifted place with no coordinate system at all when `flat`.
+fn frosted_in_space(shift: f32, flat: bool) -> Scene {
+    let mut scene = Scene::new();
+    scene.begin_frame(Size::new(SIDE, SIDE));
+    let white = scene
+        .paints
+        .add(zgui_scene::Paint::Solid(opaque(255, 255, 255)));
+    scene.push_quad(Quad::filled(
+        rect(0.0, 0.0, SIDE as f32, SIDE as f32),
+        white,
+    ));
+    let black = scene.paints.add(zgui_scene::Paint::Solid(opaque(0, 0, 0)));
+    for stripe in 0..(SIDE / 8) {
+        scene.push_quad(Quad::filled(
+            rect(stripe as f32 * 8.0, 0.0, 4.0, SIDE as f32),
+            black,
+        ));
+    }
+    let (offset, space) = if flat {
+        (shift, None)
+    } else {
+        let owner = zgui_scene::PropertyOwner::new(9).expect("a handle");
+        let own = zgui_scene::OwnSpace::of(
+            Some(zgui_geom::Matrix4::translation(shift, 0.0, 0.0)),
+            None,
+            false,
+        );
+        let viewport = scene.spatial.viewport();
+        (0.0, Some(scene.spatial.space_of(viewport, owner, own)))
+    };
+    scene.push_backdrop(
+        BackdropFilter::new(
+            rect(12.0 + offset, 12.0, 24.0, 24.0),
+            [Filter::Blur(3.0)].into_iter().collect(),
+        )
+        .in_space(space),
+    );
+    scene.finish(&DamageSet::full());
+    scene
+}
+
+#[test]
+fn a_backdrop_is_drawn_where_its_coordinate_system_now_is() {
+    // A backdrop's rectangles are in its own coordinate system, so a write that moves the system
+    // moves what the filter reads and writes with it. Read on the device as they were emitted,
+    // they blur the place the system has moved away from.
+    let Some((mut moved, mut flat)) = support::renderer_pair() else {
+        return;
+    };
+    for shift in [0.0, 6.0, 20.0] {
+        let drawn = present(&mut moved, &frosted_in_space(shift, false));
+        let expected = present(&mut flat, &frosted_in_space(shift, true));
+        assert_eq!(
+            drawn.max_difference(&expected),
+            0,
+            "shifted by {shift}: the backdrop under the system differs from the backdrop drawn there"
+        );
+    }
+}
+
 /// The damage a frame owes when the frosted panel reads the copy kept from the last one.
 ///
 /// The panel's own read region is deliberately *not* absorbed — that is the whole point of keeping
@@ -617,9 +952,12 @@ fn damage_keeping(before: &[Item], after: &[Item]) -> DamageSet {
             damage.absorb(whole(is.ink()));
         }
     }
-    for panel in after.iter().filter(|item| item.frost > 0.0) {
+    for (panel, deviation) in after
+        .iter()
+        .filter_map(|item| item.frost.map(|f| (item, f)))
+    {
         let bounds = whole(panel.ink());
-        let reach = (Filter::BLUR_EXTENT * panel.frost).ceil() as i32;
+        let reach = (Filter::BLUR_EXTENT * deviation).ceil() as i32;
         for moved in damage.rects().to_vec() {
             let Some(changed) = moved
                 .outset(zgui_geom::Edges::uniform(reach))
@@ -685,5 +1023,92 @@ fn keeping_the_capture_is_what_stops_the_damage_reaching_the_panel() {
     assert!(
         kept * 2 < renewed,
         "keeping the copy cost {kept} px against renewing it at {renewed}"
+    );
+}
+
+/// The vertical bands `rects` touch, merged the way whatever copies a frame out wants them.
+///
+/// Worked out here from the rectangles the frame reported rather than by calling the renderer's
+/// own helper, so the two answers are checked against each other.
+fn bands(rects: &[Rect<i32, Device>]) -> Vec<core::ops::Range<u32>> {
+    let mut spans: Vec<core::ops::Range<u32>> = rects
+        .iter()
+        .filter(|rect| rect.size.height > 0)
+        .map(|rect| {
+            let top = rect.origin.y.max(0) as u32;
+            top..rect.origin.y.saturating_add(rect.size.height).max(0) as u32
+        })
+        .collect();
+    spans.sort_unstable_by_key(|band| band.start);
+    let mut merged: Vec<core::ops::Range<u32>> = Vec::new();
+    for span in spans {
+        match merged.last_mut() {
+            Some(last) if span.start <= last.end => last.end = last.end.max(span.end),
+            _ => merged.push(span),
+        }
+    }
+    merged
+}
+
+#[test]
+fn a_frame_says_which_rectangles_and_rows_it_drew() {
+    // Nothing else in this crate reads the answer, so nothing else fails when it is empty. A
+    // console copies exactly these rectangles onto the buffer its display scans out of, and a
+    // frame that reports none is copied nowhere: the display then holds whatever its buffer was
+    // allocated with, which is black. That is a defect no pixel assertion in this file can see,
+    // because the frame itself is drawn correctly either way.
+    let Some(mut renderer) = plain_renderer() else {
+        return;
+    };
+    let surface = Rect::new(Point::new(0, 0), Size::new(SIDE, SIDE));
+
+    let items = base();
+    present(&mut renderer, &build(&items));
+    assert_eq!(
+        renderer.composed_rects(),
+        [surface],
+        "a frame drawn against the whole surface drew the whole surface"
+    );
+    assert_eq!(
+        renderer.composed_rows(),
+        bands(&[surface]),
+        "and its rows are the whole of it"
+    );
+
+    // One rectangle changes colour, so the damage is that rectangle and nothing like the surface.
+    let mut recoloured = items.clone();
+    recoloured[2].color = [10, 220, 10];
+    let damage = damage_between(&items, &recoloured);
+    let outcome = renderer.draw(&build(&recoloured), &damage);
+    assert!(outcome.retires_damage(), "{outcome:?}");
+
+    let reported = renderer.composed_rects().to_vec();
+    assert!(
+        !reported.is_empty(),
+        "a damaged frame has to say what it drew, and this one said nothing"
+    );
+    let covered: i64 = reported
+        .iter()
+        .map(|rect| i64::from(rect.size.width) * i64::from(rect.size.height))
+        .sum();
+    assert!(
+        covered < i64::from(SIDE) * i64::from(SIDE),
+        "this frame redrew one rectangle, so its report has to be smaller than the surface: \
+         {reported:?}"
+    );
+    // The ink that changed has to be inside what the frame says it drew, or whatever copies the
+    // frame out leaves part of the change behind on the screen.
+    let changed = Point::new(
+        recoloured[2].bounds.0 as i32 + recoloured[2].bounds.2 as i32 / 2,
+        recoloured[2].bounds.1 as i32 + recoloured[2].bounds.3 as i32 / 2,
+    );
+    assert!(
+        reported.iter().any(|rect| rect.contains(changed)),
+        "the rectangle that changed at {changed:?} is outside the report: {reported:?}"
+    );
+    assert_eq!(
+        renderer.composed_rows(),
+        bands(&reported),
+        "the rows and the rectangles have to be the same answer"
     );
 }

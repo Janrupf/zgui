@@ -17,7 +17,9 @@
 //! So every fixture below drives the window through more frames than one and asks after each of
 //! them whether the drawings are still there. The display list is asked as well as the pixels: an
 //! icon missing from the display list and an icon whose curves happen to land on page-coloured
-//! pixels are the same photograph.
+//! pixels are the same photograph. An icon reaches the display list as a vector item, a mark item,
+//! a coverage sprite or quads, depending on the route its shapes take, so the list is asked for
+//! shapes of any of these kinds.
 
 mod desktop;
 mod device;
@@ -33,6 +35,7 @@ use zgui_ui_icons::set::chevron::CHEVRON_RIGHT;
 use zgui_ui_icons::set::mark::CHECK;
 use zgui_ui_tokens::prelude::*;
 
+use crate::device::frame::Drawing;
 use crate::painted::stage::Stage;
 use crate::painted::words::ink;
 
@@ -117,15 +120,23 @@ fn panels(built: &Built) -> impl Fn() -> AnyView + use<> {
     }
 }
 
+/// How many rows of drawings the scrollport holds.
+const ROWS: usize = 8;
+
 /// A scrollport with a column of drawings taller than it is.
+///
+/// The port is the first reference and each row is one after it.
 fn scrolled(built: &Built) -> impl Fn() -> AnyView + use<> {
     let built = built.clone();
     move || {
         let port = NodeRef::new();
-        built.keep(&[port]);
-        let rows = (0..8).map(|_| {
+        let refs: Vec<NodeRef> = (0..ROWS).map(|_| NodeRef::new()).collect();
+        let mut kept = vec![port];
+        kept.extend(refs.iter().copied());
+        built.keep(&kept);
+        let rows = refs.into_iter().map(|row| {
             view! {
-                row(class = "panel") {Icon(icon = CHECK, size = IconSize::Md)}
+                row(class = "panel", node_ref = row) {Icon(icon = CHECK, size = IconSize::Md)}
             }
         });
         AnyView::new(view! {
@@ -166,14 +177,25 @@ fn select(built: &Built) -> impl Fn() -> AnyView + use<> {
     }
 }
 
+/// What reads the shapes of the drawings inside a rectangle off the last frame that drew.
+type Shapes = fn(&Stage, Rect<DevicePx, Device>) -> Vec<Drawing>;
+
 /// Asserts that every drawing inside `rect` reached the display list of the last frame that drew.
 ///
 /// The display list rather than the pixels, because that is the question an ordinary frame can
 /// answer. A window repaints the rectangles it damaged and nothing else, so the frame after an
 /// interaction holds the control that changed and not the page around it — but if the damage
 /// brought the walk to a drawing at all, the frame that cleared those pixels has to have drawn it.
-fn assert_listed(stage: &Stage, rect: Rect<DevicePx, Device>, expected: usize, when: &str) {
-    let drawings = stage.drawings_in(rect);
+///
+/// Each icon here is one shape, so `expected` counts icons.
+fn assert_listed(
+    stage: &Stage,
+    shapes: Shapes,
+    rect: Rect<DevicePx, Device>,
+    expected: usize,
+    when: &str,
+) {
+    let drawings = shapes(stage, rect);
     assert_eq!(
         drawings.len(),
         expected,
@@ -187,9 +209,15 @@ fn assert_listed(stage: &Stage, rect: Rect<DevicePx, Device>, expected: usize, w
 /// Only meaningful over a whole-window frame. The second half is what a display list cannot answer:
 /// a drawing composited into the wrong target, or under a clip that excludes it, is listed and
 /// invisible.
-fn assert_drawn(stage: &Stage, rect: Rect<DevicePx, Device>, expected: usize, when: &str) {
-    assert_listed(stage, rect, expected, when);
-    for drawing in stage.drawings_in(rect) {
+fn assert_drawn(
+    stage: &Stage,
+    shapes: Shapes,
+    rect: Rect<DevicePx, Device>,
+    expected: usize,
+    when: &str,
+) {
+    assert_listed(stage, shapes, rect, expected, when);
+    for drawing in shapes(stage, rect) {
         let marked = ink(stage, padded(drawing.ink));
         assert!(
             marked > MARKED,
@@ -236,45 +264,116 @@ fn a_drawing_is_in_every_ordinary_frame_that_repaints_the_panel_it_sits_in() {
     for round in 1..=5 {
         stage.move_to(stage.centre_of(built.node(1)));
         stage.settle();
-        assert_listed(&stage, panel, 1, &format!("hovered, round {round}"));
+        assert_listed(
+            &stage,
+            Stage::shapes_in,
+            panel,
+            1,
+            &format!("hovered, round {round}"),
+        );
         stage.move_to(elsewhere);
         stage.settle();
-        assert_listed(&stage, panel, 1, &format!("unhovered, round {round}"));
+        assert_listed(
+            &stage,
+            Stage::shapes_in,
+            panel,
+            1,
+            &format!("unhovered, round {round}"),
+        );
     }
     stage.repaint();
-    assert_drawn(&stage, stage.rect_of(built.node(0)), 2, "after five sweeps");
+    for side in [1, 2] {
+        let panel = stage.rect_of(built.node(side));
+        assert_drawn(&stage, Stage::shapes_in, panel, 1, "after five sweeps");
+    }
     stage.capture("redrawn-hover");
+}
+
+/// The rows of [`scrolled`] whose whole box is inside the scrollport now.
+///
+/// Rows rather than the port, because the port also holds its scrollbar, and a thumb is a shape
+/// that is drawn whether or not any icon is.
+fn shown_rows(stage: &Stage, built: &Built) -> Vec<Rect<DevicePx, Device>> {
+    let port = stage.rect_of(built.node(0));
+    (1..=ROWS)
+        .map(|index| stage.rect_of(built.node(index)))
+        .filter(|row| {
+            row.origin.y.0 >= port.origin.y.0
+                && row.origin.y.0 + row.size.height.0 <= port.origin.y.0 + port.size.height.0
+        })
+        .collect()
+}
+
+/// How many shapes the last frame that drew held inside the rows shown in the scrollport.
+fn shown_icons(stage: &Stage, built: &Built) -> usize {
+    shown_rows(stage, built)
+        .into_iter()
+        .map(|row| stage.shapes_in(row).len())
+        .sum()
 }
 
 /// A drawing carried through a scroll is still drawn on the frames that carry it.
 ///
 /// Scrolling is the case that replays most: the rows are the same rows in the same styles at new
-/// places, which is exactly what a translated replay is for. The drawings inside them cannot take
-/// that path, and a scrollport is where the largest number of them would go out at once.
+/// places, which is exactly what a translated replay is for. A scrollport is where the largest
+/// number of drawings would go out at once.
 #[test]
 fn drawings_in_a_scrollport_are_still_drawn_while_it_is_scrolled() {
     let built = Built::default();
     let mut stage = staged!(scrolled(&built));
-    let port = stage.rect_of(built.node(0));
-    let before = stage.drawings_in(port).len();
-    assert!(before > 0, "the scrollport drew no icons to begin with");
+    assert!(
+        shown_icons(&stage, &built) > 0,
+        "the scrollport drew no icons to begin with"
+    );
 
     stage.move_to(stage.centre_of(built.node(0)));
     for round in 1..=4 {
         stage.wheel(-1.0);
         stage.settle();
         assert!(
-            !stage.drawings_in(port).is_empty(),
+            shown_icons(&stage, &built) > 0,
             "scroll round {round}: the frame that repainted the scrollport held no drawings"
         );
     }
     stage.repaint();
-    assert_drawn(
-        &stage,
-        port,
-        stage.drawings_in(port).len(),
-        "after four detents",
-    );
+    let rows = shown_rows(&stage, &built);
+    assert!(!rows.is_empty(), "no row is whole inside the scrollport");
+    for row in rows {
+        assert_drawn(&stage, Stage::shapes_in, row, 1, "after four detents");
+    }
+}
+
+/// The shapes the last frame that drew held inside the trigger, without its text.
+///
+/// The text is removed by the box of the smallest node that says it, because a glyph can arrive
+/// as a coverage sprite exactly as the chevron can.
+fn chevrons(stage: &Stage, trigger: Rect<DevicePx, Device>) -> Vec<Drawing> {
+    let census = stage.census();
+    let text = census
+        .nodes
+        .iter()
+        .filter(|node| node.text == "Euro")
+        .filter_map(|node| node.rect)
+        .filter(|rect| middle_of(*rect, trigger))
+        .min_by(|left, right| {
+            (left.size.width.0 * left.size.height.0)
+                .total_cmp(&(right.size.width.0 * right.size.height.0))
+        });
+    stage
+        .shapes_in(trigger)
+        .into_iter()
+        .filter(|shape| text.is_none_or(|rect| !middle_of(shape.ink, rect)))
+        .collect()
+}
+
+/// Whether the middle of `inner` is inside `outer`.
+fn middle_of(inner: Rect<DevicePx, Device>, outer: Rect<DevicePx, Device>) -> bool {
+    let x = inner.origin.x.0 + inner.size.width.0 / 2.0;
+    let y = inner.origin.y.0 + inner.size.height.0 / 2.0;
+    x >= outer.origin.x.0
+        && x <= outer.origin.x.0 + outer.size.width.0
+        && y >= outer.origin.y.0
+        && y <= outer.origin.y.0 + outer.size.height.0
 }
 
 /// The control the defect was seen on: a select trigger whose chevron went out and stayed out.
@@ -289,7 +388,7 @@ fn a_select_triggers_chevron_is_still_drawn_after_the_list_has_been_opened_and_c
     let mut stage = staged!(select(&built));
     let trigger = stage.rect_of(built.node(0));
     stage.repaint();
-    assert_drawn(&stage, trigger, 1, "the first frame");
+    assert_drawn(&stage, chevrons, trigger, 1, "the first frame");
 
     // The rounds are collected and reported together rather than asserted inside the loop. A
     // failure raised while the list is still animating out unwinds a document with a surface half
@@ -308,7 +407,7 @@ fn a_select_triggers_chevron_is_still_drawn_after_the_list_has_been_opened_and_c
         if stage.glyphs_in(trigger).is_empty() {
             continue;
         }
-        if stage.drawings_in(trigger).len() != 1 {
+        if chevrons(&stage, trigger).len() != 1 {
             lost.push(round);
         }
     }
@@ -317,6 +416,6 @@ fn a_select_triggers_chevron_is_still_drawn_after_the_list_has_been_opened_and_c
         lost.is_empty(),
         "the trigger's chevron was missing from the frame that repainted it after cycles {lost:?}"
     );
-    assert_drawn(&stage, trigger, 1, "after four cycles");
+    assert_drawn(&stage, chevrons, trigger, 1, "after four cycles");
     stage.capture("redrawn-select-chevron");
 }

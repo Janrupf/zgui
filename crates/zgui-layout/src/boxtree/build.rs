@@ -12,7 +12,6 @@ use crate::boxtree::{order, pseudo};
 use crate::node::box_node::BoxNode;
 use crate::node::kind::{BoxKind, FormattingContext, PseudoKind};
 use crate::style::convert::display::Participation;
-use crate::style::grid;
 use crate::tree::store::LayoutStore;
 
 /// The obligations that mean a document's box tree no longer describes it.
@@ -105,7 +104,9 @@ pub fn retire(document: &mut Document, root: NodeIndex) -> Owed {
 /// Returns the root box, or nothing if the document generates none — which an empty document and a
 /// document whose root element is hidden both do.
 pub fn build(store: &mut LayoutStore, document: &Document) -> Option<BoxKey> {
+    let _tag = zgui_profile::alloc_tag::enter(zgui_profile::alloc_tag::Tag::BoxTree);
     let root = document.root_index()?;
+    counter::bump(Counter::BoxTreeBuilds);
     // The tree that was there is removed before the new one is built. A rebuild issues fresh keys
     // for every box, so leaving the old ones live leaves each element listing boxes from both
     // trees — and every question answered by unioning an element's pieces ("where is this",
@@ -143,8 +144,8 @@ pub struct Subtree {
 /// Builds the boxes one element generates, without touching any other box.
 ///
 /// `containing_block` is the box that positions an out-of-flow descendant — the nearest ancestor
-/// box that establishes a containing block, which is outside the subtree and therefore has to be
-/// supplied — and `parent_style` is the style an anonymous box directly inside `index` inherits
+/// box that establishes a containing block, or the root's box when none does, which is outside the
+/// subtree and therefore has to be supplied — and `parent_style` is the style an anonymous box directly inside `index` inherits
 /// from.
 ///
 /// Returns nothing when the element generates no box at all, which `display: none` and
@@ -157,7 +158,7 @@ pub fn build_subtree(
     store: &mut LayoutStore,
     document: &Document,
     index: NodeIndex,
-    containing_block: Option<BoxKey>,
+    containing_block: BoxKey,
     parent_style: Option<&ComputedStyle>,
 ) -> Option<Subtree> {
     let mut builder = Builder {
@@ -165,7 +166,7 @@ pub fn build_subtree(
         document,
         reparented: Vec::new(),
     };
-    let root = builder.element(index, containing_block, parent_style)?;
+    let root = builder.element(index, Some(containing_block), parent_style)?;
     let reparented = core::mem::take(&mut builder.reparented);
     Some(Subtree { root, reparented })
 }
@@ -253,16 +254,15 @@ impl Builder<'_> {
             custom: custom.map(Into::into),
             draws_vector,
         };
-        if matches!(fc, FormattingContext::Grid) {
-            let names = grid::resolve_names(style);
-            if !names.is_empty() {
-                node.grid = Some(Box::new(names));
-            }
-        }
         let key = self.store.insert_with_content(node, content);
         counter::bump(Counter::BoxesRebuilt);
 
-        let inner_cb = if establishes_containing_block(classification.positioned, fc) {
+        // A box that arrives with no containing block is the root of the tree, and the root's box
+        // is the initial containing block: an out-of-flow box with no positioned ancestor is laid
+        // out against it rather than against the box it was written inside.
+        let inner_cb = if containing_block.is_none()
+            || establishes_containing_block(classification.positioned, fc)
+        {
             Some(key)
         } else {
             containing_block
@@ -455,9 +455,25 @@ impl Builder<'_> {
                 node.parent_fc = fc;
             }
         }
+        // Where each out-of-flow child was written, which orders it among the siblings it is
+        // re-parented next to.
+        let mut after = None;
+        for child in &children {
+            if child.out_of_flow {
+                self.store.set_declared(
+                    child.key,
+                    Some(crate::boxtree::absolute::Declared { parent: key, after }),
+                );
+            } else {
+                after = Some(child.key);
+            }
+        }
+        let atomic_percent_block = fc == FormattingContext::Inline
+            && crate::boxtree::percent::of_children(self.store, &layout_children);
         let node = self.store.get_mut(key).expect("a live box");
         node.children = layout_children;
         node.paint_children = paint_children;
+        node.atomic_percent_block = atomic_percent_block;
     }
 
     /// Blockifies one flex or grid item in place, and reports what it became.

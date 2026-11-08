@@ -2,7 +2,7 @@
 //!
 //! An effect reaches this crate as a [`EffectProgram`] — a representation already lowered by the
 //! application's own build, and the text it was lowered from. The registry keys them by
-//! [`ShaderId`], and everything above the render seam names nothing but that handle.
+//! [`ShaderId`](zgui_scene::shader::ShaderId), and everything above the render seam names nothing but that handle.
 //!
 //! # Why the text travels beside the representation
 //!

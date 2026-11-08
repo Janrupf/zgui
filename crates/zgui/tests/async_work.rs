@@ -2,7 +2,7 @@
 //!
 //! The unit tests in `zgui-reactive` call `flush` by hand, which proves the executor works but not
 //! that anything *asks* it to. That question only has an answer here: work finishing on a worker
-//! thread has to travel the whole wake edge — the composite waker, the frame gate, the platform's
+//! thread has to travel the whole wake edge — the task waker, the frame gate, the platform's
 //! wake reason, the window's redraw request — before a frame runs and the value reaches the
 //! screen. This drives that path over buffers.
 //!
@@ -123,8 +123,11 @@ fn buffers(handler: Box<dyn AppHandler>) -> Result<(), PlatformError> {
 
     // Real time, because the work is on a real thread: the harness's virtual clock does not move
     // it along. Each turn parks rather than spins, which is what makes the frame count meaningful.
+    // The loop ends when both results have arrived. The deadline only stops a lost result from
+    // hanging the suite; a loaded machine can take many times the work's own duration.
     let started = std::time::Instant::now();
-    while started.elapsed() < WORK * 4 {
+    let arrived = || !LOADED.lock().unwrap().is_empty() && POSTED.load(Ordering::Relaxed) > 0;
+    while !arrived() && started.elapsed() < WORK * 80 {
         harness.pump();
         std::thread::sleep(Duration::from_millis(5));
     }

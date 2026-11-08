@@ -2,7 +2,9 @@
 //!
 //! Adapted code carries a header naming its origin and licence, and `NOTICE` carries a matching
 //! row. Both directions are checked, because a header nobody records and a record nobody wrote
-//! fail in opposite ways. Copyleft headers are refused outright outside `vendor/`.
+//! fail in opposite ways. A GPL header is refused outright outside `vendor/`. An MPL-2.0 notice is
+//! accepted only in a derived file whose header declares MPL-2.0: that licence applies per file, so
+//! the file keeps it and the rest of its crate stays Apache-2.0.
 
 use crate::ledger::report::Report;
 use crate::ledger::tree::Tree;
@@ -11,16 +13,21 @@ use crate::ledger::tree::Tree;
 const MARKER: &str = "DERIVED-FROM:";
 
 /// The licence texts a derived file may carry, and the identifier its header must name.
-const LICENCES: [(&str, &str); 2] = [
+const LICENCES: [(&str, &str); 3] = [
     ("Apache-2.0", "Apache License, Version 2.0"),
     ("MIT", "MIT License"),
+    ("MPL-2.0", "Mozilla Public License, v. 2.0"),
 ];
 
 /// The `NOTICE` heading whose rows list the derived files.
 const NOTICE_SECTION: &str = "## Derived files";
 
-/// Licence families that may not appear in a workspace source file at all.
-const REFUSED: [&str; 2] = ["Mozilla Public License", "GNU General Public License"];
+/// Licence families that may not appear in a workspace source file, each with the identifier that
+/// admits it in a file whose `DERIVED-FROM:` header declares that identifier.
+const REFUSED: [(&str, Option<&str>); 2] = [
+    ("Mozilla Public License", Some("MPL-2.0")),
+    ("GNU General Public License", None),
+];
 
 /// The member that defines the markers above, and would otherwise trip on its own vocabulary.
 const EXEMPT: [&str; 1] = ["xtask"];
@@ -36,15 +43,19 @@ pub(crate) fn check(tree: &Tree) -> Report {
             continue;
         }
         for file in &member.sources {
-            for refused in REFUSED {
-                if file.text.contains(refused) {
+            let header = file.text.lines().find(|line| line.contains(MARKER));
+            for (refused, admitted_by) in REFUSED {
+                let admitted = admitted_by
+                    .zip(header)
+                    .is_some_and(|(identifier, header)| header.contains(identifier));
+                if file.text.contains(refused) && !admitted {
                     report.violation(
                         file.rel_path.clone(),
                         format!("carries a {refused} header, which no crate here may contain"),
                     );
                 }
             }
-            let Some(header) = file.text.lines().find(|line| line.contains(MARKER)) else {
+            let Some(header) = header else {
                 continue;
             };
             found.push(file.rel_path.clone());

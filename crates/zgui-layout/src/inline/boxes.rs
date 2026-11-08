@@ -11,9 +11,9 @@
 //! three are baked into numbers it was handed once. Recomputing them here, and letting the break
 //! key cover them, is what stops a re-style against a warm cache from being a silent no-op.
 
-use taffy::{AvailableSpace, Size};
+use cephal::{AvailableSpace, Rect, Size};
 use zgui_css::ComputedStyle;
-use zgui_css::values::text::BaselineSource;
+use zgui_css::values::text::{AlignmentBaseline, BaselineShift, BaselineSource};
 use zgui_dom::side::BoxKey;
 use zgui_geom::CssPx;
 use zgui_text::{InlineBoxGeometry, StrutMetrics};
@@ -21,7 +21,7 @@ use zgui_text::{InlineBoxGeometry, StrutMetrics};
 use crate::inline::atomic;
 use crate::inline::content::{Generated, Role};
 use crate::inline::insets::edges_of;
-use crate::inline::vertical_align::{self, Alignment};
+use crate::inline::vertical_align::{self, Alignment, scale_strut};
 use crate::measure::MeasureContent;
 use crate::node::kind::FormattingContext;
 use crate::tree::LayoutTree;
@@ -38,6 +38,23 @@ pub(crate) struct Boxes {
     /// Kept because nothing else writes it: the algorithms position a box they laid out
     /// themselves, and an atomic inline is laid out by the line it sits on.
     pub(crate) frames: Vec<Option<Frame>>,
+    /// How far each nested inline box's edge raises the box's text above the line's baseline,
+    /// summed over the boxes it is inside, by item index.
+    ///
+    /// Empty when no nested inline box is shifted, and shorter than `geometry` when the last
+    /// shifted edge comes before the last item: a missing entry is zero.
+    pub(crate) shifts: Vec<f32>,
+}
+
+impl Boxes {
+    /// The capacity of the vectors these boxes hold, in bytes.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        use core::mem::size_of;
+        self.geometry.capacity() * size_of::<InlineBoxGeometry>()
+            + self.alignments.capacity() * size_of::<Alignment>()
+            + self.frames.capacity() * size_of::<Option<Frame>>()
+            + self.shifts.capacity() * size_of::<f32>()
+    }
 }
 
 /// One atomic inline's own resolved box, for writing back into the tree.
@@ -46,11 +63,11 @@ pub(crate) struct Frame {
     /// The border box.
     pub(crate) size: Size<f32>,
     /// The resolved margins, which the line has already consumed.
-    pub(crate) margin: taffy::Rect<f32>,
+    pub(crate) margin: Rect<f32>,
     /// The resolved padding.
-    pub(crate) padding: taffy::Rect<f32>,
+    pub(crate) padding: Rect<f32>,
     /// The resolved border widths.
-    pub(crate) border: taffy::Rect<f32>,
+    pub(crate) border: Rect<f32>,
 }
 
 impl Boxes {
@@ -69,28 +86,129 @@ pub(crate) fn resolve<C: MeasureContent>(
     strut: &StrutMetrics,
     available: Size<AvailableSpace>,
     basis: Option<f32>,
+    basis_height: Option<f32>,
 ) -> Boxes {
     let mut boxes = Boxes::default();
-    for item in &generated.items {
+    // The nested inline boxes open at this item: the shift of each, summed over the boxes it is
+    // inside, and the raised geometry its edges carry when it moves off its parent's baseline.
+    let mut open: smallvec::SmallVec<[Raise; 4]> = smallvec::SmallVec::new();
+    for (index, item) in generated.items.iter().enumerate() {
         let key = item.role.box_();
         let (geometry, alignment, frame) = match item.role {
-            Role::Atomic(_) => atomic_box(tree, key, item.id, item.offset, available, basis, strut),
-            Role::StartEdge(_) => (
-                edge(tree, key, item.id, item.offset, basis, true),
-                Alignment::Baseline,
-                None,
+            Role::Atomic(_) => atomic_box(
+                tree,
+                key,
+                item.id,
+                item.offset,
+                available,
+                Size {
+                    width: basis,
+                    height: basis_height,
+                },
+                strut,
             ),
-            Role::EndEdge(_) => (
-                edge(tree, key, item.id, item.offset, basis, false),
-                Alignment::Baseline,
-                None,
-            ),
+            Role::StartEdge(_) => {
+                let mut geometry = edge(tree, key, item.id, item.offset, basis, true);
+                let raise = raise_of(tree, key, open.last(), strut);
+                raise.apply(&mut geometry);
+                boxes.record_shift(index, raise.shift);
+                open.push(raise);
+                (geometry, Alignment::Baseline, None)
+            }
+            Role::EndEdge(_) => {
+                let mut geometry = edge(tree, key, item.id, item.offset, basis, false);
+                if let Some(raise) = open.pop() {
+                    raise.apply(&mut geometry);
+                    boxes.record_shift(index, raise.shift);
+                }
+                (geometry, Alignment::Baseline, None)
+            }
         };
         boxes.geometry.push(geometry);
         boxes.alignments.push(alignment);
         boxes.frames.push(frame);
     }
     boxes
+}
+
+impl Boxes {
+    /// Records the summed shift of the nested inline box whose edge is item `index`.
+    fn record_shift(&mut self, index: usize, shift: f32) {
+        if shift == 0.0 {
+            return;
+        }
+        if self.shifts.len() <= index {
+            self.shifts.resize(index + 1, 0.0);
+        }
+        self.shifts[index] = shift;
+    }
+}
+
+/// How one nested inline box moves its text off the line's baseline.
+#[derive(Clone, Copy, Debug)]
+struct Raise {
+    /// The box's own shift plus the shifts of every box it is inside, positive upwards.
+    shift: f32,
+    /// The box's own strut, when the box moves off its parent's baseline; a box inside it
+    /// resolves its alignment against it.
+    own: Option<StrutMetrics>,
+}
+
+impl Raise {
+    /// Gives an edge the box's line-height-tall extent at its shift, so the line grows to hold
+    /// the shifted text. An edge of a box on its parent's baseline keeps no height, exactly as an
+    /// unshifted box's does.
+    fn apply(&self, geometry: &mut InlineBoxGeometry) {
+        if let Some(strut) = self.own {
+            geometry.height = strut.line_height;
+            geometry.ascent = strut.ascent();
+            geometry.shift = CssPx(self.shift);
+        }
+    }
+}
+
+/// How a nested inline box is raised, given the box it is inside and the context's strut.
+///
+/// A box at the initial `vertical-align` inside no raised box is the common case, and it is
+/// answered without measuring a strut. `top` and `bottom` align to the line box, which a nested
+/// inline box does not wait for; such a box stays on its parent's baseline.
+fn raise_of<C: MeasureContent>(
+    tree: &mut LayoutTree<'_, C>,
+    key: BoxKey,
+    parent: Option<&Raise>,
+    root: &StrutMetrics,
+) -> Raise {
+    let inherited = parent.map_or(0.0, |parent| parent.shift);
+    let style = &tree.structure().node(key).style;
+    let group = style.get_box();
+    let baseline = group.alignment_baseline == AlignmentBaseline::Baseline
+        && group.baseline_shift == BaselineShift::zero();
+    if baseline {
+        return Raise {
+            shift: inherited,
+            own: None,
+        };
+    }
+    let style = style.clone();
+    let scale = tree.device().scale;
+    let lowered = tree.text_styles_mut().get(&style);
+    let own = scale_strut(tree.content().strut(&lowered.text), scale);
+    let alignment = match vertical_align::of(&style, own.line_height.0, scale) {
+        alignment if alignment.needs_line_box() => Alignment::Baseline,
+        alignment => alignment,
+    };
+    let against = parent.and_then(|parent| parent.own).unwrap_or(*root);
+    let shift = vertical_align::resolve(alignment, own.ascent().0, own.line_height.0, &against);
+    if shift == 0.0 {
+        return Raise {
+            shift: inherited,
+            own: None,
+        };
+    }
+    Raise {
+        shift: inherited + shift,
+        own: Some(own),
+    }
 }
 
 /// One atomic inline's margin box, its own baseline, and its shift.
@@ -100,11 +218,11 @@ fn atomic_box<C: MeasureContent>(
     id: u64,
     offset: usize,
     available: Size<AvailableSpace>,
-    basis: Option<f32>,
+    basis: Size<Option<f32>>,
     strut: &StrutMetrics,
 ) -> (InlineBoxGeometry, Alignment, Option<Frame>) {
-    let (margins, padding, border) = crate::inline::insets::frame_of(tree, key, basis);
-    let measured = atomic::measure(tree, key, Size::NONE, available);
+    let (margins, padding, border) = crate::inline::insets::frame_of(tree, key, basis.width);
+    let measured = atomic::measure(tree, key, Size::NONE, available, basis.height);
     let node = tree.structure().node(key);
     let style = node.style.clone();
     let replaced = node.fc == FormattingContext::Replaced;
@@ -158,8 +276,8 @@ fn atomic_box<C: MeasureContent>(
 /// content off at the box's own edges, and a baseline taken from a line that can be cut off is not
 /// a baseline anything outside the box can align to.
 fn clips_its_own_content<C: MeasureContent>(tree: &LayoutTree<'_, C>, key: BoxKey) -> bool {
-    let overflow = taffy::CoreStyle::overflow(&tree.style_of(key));
-    overflow.x != taffy::Overflow::Visible || overflow.y != taffy::Overflow::Visible
+    let overflow = tree.engine_style(key).overflow;
+    overflow.x != cephal::style::Overflow::Visible || overflow.y != cephal::style::Overflow::Visible
 }
 
 /// One edge of a nested inline box: the width it occupies, and nothing else.

@@ -28,7 +28,7 @@ struct ShadedQuad {
 
 @group(1) @binding(0) var shaded: texture_2d<u32>;
 
-/// One shaded quad, which spans 7 texels of the arena.
+/// One `ShadedQuad`, which the arena pads to 7 texels.
 fn load_shaded(slot: u32) -> ShadedQuad {
     let base = slot * 7u;
     let t0 = textureLoad(shaded, table_texel(base + 0u), 0);
@@ -72,9 +72,11 @@ struct ShaderParams {
 
 struct ShadedVarying {
     @builtin(position) position: vec4<f32>,
+    // The point, from the quad's origin in the space it was encoded in.
     @location(0) local: vec2<f32>,
     @location(1) @interpolate(flat) instance: u32,
-    @location(2) @interpolate(flat) shift: vec2<f32>,
+    // The quad's origin in that space.
+    @location(2) @interpolate(flat) origin: vec2<f32>,
 }
 
 @vertex
@@ -87,18 +89,17 @@ fn vs_shaded(
     let local = inflated_corner(vertex, quad.bounds) + shift;
     var out: ShadedVarying;
     out.position = to_clip_position(local, quad.transform);
-    out.local = local;
+    out.local = inflated_offset(vertex, quad.bounds);
     out.instance = slot;
-    out.shift = shift;
+    out.origin = bounds_origin(quad.bounds);
     return out;
 }
 
-// What the effect is told about the point being drawn.
-fn shader_input(quad: ShadedQuad, point: vec2<f32>) -> ShaderInput {
-    let origin = bounds_origin(quad.bounds);
+// What the effect is told about the point being drawn, at `local` from the quad's origin.
+fn shader_input(quad: ShadedQuad, local: vec2<f32>) -> ShaderInput {
     let size = max(bounds_size(quad.bounds), vec2<f32>(1.0e-4));
     var input: ShaderInput;
-    input.local = point - origin;
+    input.local = local;
     input.uv = input.local / size;
     input.size = size;
     input.scale = globals.frame.z;

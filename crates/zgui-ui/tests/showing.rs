@@ -49,7 +49,8 @@ const SHEET: &str = ":root { background-color: #ffffff; color: #101010; font-fam
                      .rail { width: 320px }
                      .plain { min-width: 0 }
                      .wide { flex: 0 0 400px }
-                     .narrow { flex: 0 0 240px }";
+                     .narrow { flex: 0 0 240px }
+                     .third.third { flex: 0 0 33.333% }";
 
 /// Opens `view`, or reports the run skipped on a machine with no graphics device.
 macro_rules! staged {
@@ -371,6 +372,111 @@ fn the_arrow_keys_step_a_carousel_to_the_slide_they_paint() {
     let seen = showing(&mut stage, &built);
     assert!(seen[0].is_some(), "the left arrow key went back one slide");
     assert_eq!(seen[1], None);
+}
+
+/// The words of the five slides of [`thirds`].
+const FIVE: [&str; 5] = ["One", "Two", "Three", "Four", "Five"];
+
+/// A carousel of `count` slides a third of the rail wide, with a reference line for each.
+fn thirds(built: &Built, count: usize) -> impl Fn() -> AnyView + use<> {
+    let built = built.clone();
+    move || {
+        let rail = NodeRef::new();
+        let lines: Vec<NodeRef> = (0..count).map(|_| NodeRef::new()).collect();
+        let mut kept = vec![rail];
+        kept.extend(lines.iter().copied());
+        built.keep(&kept);
+        let slides: Vec<AnyView> = FIVE[..count]
+            .iter()
+            .map(|word| AnyView::new(view! { CarouselItem(class = "third") {text {{*word}}} }))
+            .collect();
+        let references: Vec<AnyView> = FIVE[..count]
+            .iter()
+            .zip(lines)
+            .map(|(word, line)| AnyView::new(view! { text(node_ref = line) {{*word}} }))
+            .collect();
+        AnyView::new(view! {
+            ThemeProvider {
+                column(class = "page") {
+                    Carousel(node_ref = rail, class = "rail", label = "Thirds") {
+                        CarouselContent {{slides}}
+                        CarouselPrevious()
+                        CarouselNext()
+                    }
+                    {references}
+                }
+            }
+        })
+    }
+}
+
+/// Where each of the first `count` slides' words were drawn inside the rail.
+fn showing_of(stage: &mut Stage, built: &Built, count: usize) -> Vec<Option<f32>> {
+    stage.wait(SETTLED);
+    let rail = stage.rect_of(built.node(RAIL));
+    (0..count)
+        .map(|at| {
+            let word = spelling(stage, stage.rect_of(built.node(at + 1)));
+            found(stage, rail, &word)
+        })
+        .collect()
+}
+
+#[test]
+fn a_carousel_of_thirds_stops_with_its_last_slide_against_the_trailing_edge() {
+    let built = Built::default();
+    let mut stage = staged!(thirds(&built, 5));
+    let start = showing_of(&mut stage, &built, 5);
+    let first = start[0].expect("the first slide shows to begin with");
+    assert!(
+        start[2].is_some() && start[3].is_none(),
+        "three slides fit the rail: {start:?}"
+    );
+
+    let [_, on] = arrows(&stage, built.node(RAIL));
+    for _ in 0..2 {
+        stage.click(stage.centre_of(on));
+        stage.wait(SETTLED);
+    }
+    let end = showing_of(&mut stage, &built, 5);
+    let third = end[2].expect("the third slide leads after two steps");
+    assert!(
+        (third - first).abs() < 1.0,
+        "two steps put the third slide at {third}, where the first was at {first}"
+    );
+    assert!(
+        end[4].is_some(),
+        "and the last slide is on the screen: {end:?}"
+    );
+
+    // The last slide is against the trailing edge, so a further press has nowhere to go.
+    stage.click(stage.centre_of(on));
+    stage.wait(SETTLED);
+    let after = showing_of(&mut stage, &built, 5);
+    assert_eq!(
+        after, end,
+        "a press past the last reachable slide moved the strip"
+    );
+}
+
+#[test]
+fn a_carousel_whose_slides_all_fit_does_not_step() {
+    let built = Built::default();
+    let mut stage = staged!(thirds(&built, 3));
+    let start = showing_of(&mut stage, &built, 3);
+    assert!(
+        start.iter().all(Option::is_some),
+        "every slide fits: {start:?}"
+    );
+
+    let [_, on] = arrows(&stage, built.node(RAIL));
+    stage.click(stage.centre_of(on));
+    stage.wait(SETTLED);
+    assert_eq!(
+        showing_of(&mut stage, &built, 3),
+        start,
+        "a press moved a strip that fits"
+    );
 }
 
 // ---- a select's chosen option -----------------------------------------------------------------

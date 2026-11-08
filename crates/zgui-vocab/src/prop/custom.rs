@@ -8,6 +8,25 @@
 /// the document than a shape list can.
 pub const ELEMENT: &str = "custom-element";
 
+/// The tag a custom element is built on.
+pub const TAG: &str = "custom";
+
+/// The property naming the custom properties a custom element's implementation reads.
+///
+/// Text: entries separated by spaces, each a name without its `--`, or a prefix followed by `*`.
+/// An element without it reads every name.
+pub const READS: &str = "custom-reads";
+
+/// Whether an element whose [`READS`] entries are `reads` reads the custom property `name`.
+pub fn reads_name(reads: &str, name: &str) -> bool {
+    reads
+        .split_ascii_whitespace()
+        .any(|entry| match entry.strip_suffix('*') {
+            Some(prefix) => name.starts_with(prefix),
+            None => entry == name,
+        })
+}
+
 /// Packs a registry token and the two revisions into the integer [`ELEMENT`] carries.
 ///
 /// The revisions are sixteen bits each and wrap; the cost of a wrap landing exactly on a held
@@ -30,6 +49,14 @@ pub fn relayouts(before: i64, after: i64) -> bool {
     parts(before).1 != parts(after).1
 }
 
+/// Whether a change of the packed value names a different implementation.
+///
+/// A new token owes a new box, as the property appearing does: the box captured the token when it
+/// was built.
+pub fn owner_changed(before: i64, after: i64) -> bool {
+    parts(before).0 != parts(after).0
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -38,5 +65,16 @@ mod tests {
         assert_eq!(super::parts(packed), (7, 3, 9));
         assert!(super::relayouts(packed, super::reference(7, 4, 9)));
         assert!(!super::relayouts(packed, super::reference(7, 3, 10)));
+        assert!(super::owner_changed(packed, super::reference(8, 3, 9)));
+        assert!(!super::owner_changed(packed, super::reference(7, 4, 10)));
+    }
+
+    #[test]
+    fn a_read_list_names_exact_names_and_prefixes() {
+        let reads = "accent syntax-*";
+        assert!(super::reads_name(reads, "accent"));
+        assert!(super::reads_name(reads, "syntax-keyword"));
+        assert!(!super::reads_name(reads, "accent-2"));
+        assert!(!super::reads_name(reads, "hover-bg"));
     }
 }

@@ -69,7 +69,8 @@ fn every_fragment_the_damage_reaches_is_emitted() {
     harness.damage.absorb(rect(0, 0, 300, 30));
     harness.expand();
     let report = harness.paint();
-    report.assert_emission_complete(&harness.store, &harness.damage);
+    let placements = zgui_scene::Placements::of(&harness.scene.spatial);
+    report.assert_emission_complete(&harness.store, &harness.damage, &placements);
 }
 
 #[test]
@@ -121,7 +122,8 @@ fn a_blurred_panel_over_animating_content_has_its_source_region_repainted() {
     );
 
     let report = harness.paint();
-    report.assert_emission_complete(&harness.store, &harness.damage);
+    let placements = zgui_scene::Placements::of(&harness.scene.spatial);
+    report.assert_emission_complete(&harness.store, &harness.damage, &placements);
 }
 
 #[test]
@@ -174,7 +176,11 @@ fn a_removed_subtree_damages_the_area_it_occupied() {
     harness.paint_everything();
 
     let key = harness.document.store().key_of(harness.element("gone"));
-    let vacated_ink = zgui_layout::fragment::index::ink_of(&harness.store, key);
+    let vacated_ink = zgui_layout::fragment::index::device_ink_of(
+        &harness.store,
+        key,
+        &zgui_scene::Placements::of(&harness.scene.spatial),
+    );
     assert!(
         !vacated_ink.is_empty(),
         "the fixture's removed box has to have painted something"
@@ -184,7 +190,12 @@ fn a_removed_subtree_damages_the_area_it_occupied() {
     harness.edit_and_restyle(|batch| batch.remove(gone));
     harness.clear_damage();
 
-    let absorbed = zgui_paint::vacated(&mut harness.document, &harness.store, &mut harness.damage);
+    let absorbed = zgui_paint::vacated(
+        &mut harness.document,
+        &harness.store,
+        &mut harness.damage,
+        &zgui_scene::Placements::of(&harness.scene.spatial),
+    );
     assert_eq!(absorbed, 1, "one root was removed and one contributed");
     assert!(
         harness
@@ -198,7 +209,12 @@ fn a_removed_subtree_damages_the_area_it_occupied() {
 
     // The list is consumed rather than borrowed, which is why there is exactly one consumer and
     // this is it: a second reader would find it emptied and absorb nothing, silently.
-    let again = zgui_paint::vacated(&mut harness.document, &harness.store, &mut harness.damage);
+    let again = zgui_paint::vacated(
+        &mut harness.document,
+        &harness.store,
+        &mut harness.damage,
+        &zgui_scene::Placements::of(&harness.scene.spatial),
+    );
     assert_eq!(again, 0);
 }
 
@@ -228,6 +244,47 @@ fn every_group_marker_is_matched() {
         "the fixture has to open a group, or this counts nothing"
     );
     assert_eq!(starts, ends, "every group opened has to be closed");
+}
+
+/// How many groups a box over a `multiply` child opens, with `parent` declared on the box.
+fn groups_over_a_blending_child(parent: &str) -> usize {
+    let mut harness = Harness::new(
+        Element::new("root").children(vec![
+            Element::new("card").children(vec![Element::new("inner")]),
+        ]),
+        &format!(
+            "root {{ display: block; width: 300px }}
+             card {{ display: block; height: 60px; {parent} }}
+             inner {{ display: block; height: 20px; background: #333; mix-blend-mode: multiply }}"
+        ),
+    );
+    harness.paint_everything();
+    harness
+        .scene
+        .primitives
+        .groups
+        .iter()
+        .filter(|marker| marker.is_start)
+        .count()
+}
+
+#[test]
+fn a_filter_that_changes_no_pixel_still_isolates_a_blending_child() {
+    // `blur(0)` is an identity, so the chain it lowers to is empty. It still declares a filter,
+    // and a filter isolates what blends below it: without a group of its own the child blends
+    // with whatever is behind the card.
+    let plain = groups_over_a_blending_child("");
+    assert_eq!(
+        plain, 1,
+        "the control: the child opens its own group and nothing else does"
+    );
+    for declaration in ["filter: blur(0)", "backdrop-filter: blur(0)"] {
+        assert_eq!(
+            groups_over_a_blending_child(declaration),
+            plain + 1,
+            "`{declaration}` opened no group around the blending child"
+        );
+    }
 }
 
 #[test]
@@ -328,6 +385,27 @@ fn an_empty_damage_set_paints_nothing_and_a_full_one_paints_everything() {
 }
 
 #[test]
+fn the_expansion_settles_over_one_blurred_panel() {
+    // One registered panel: the pass that absorbs it grows the damage, and the pass after it finds
+    // nothing left, which is the fixpoint and no escalation.
+    let mut harness = Harness::sized(
+        Element::new("root").children(vec![Element::new("one")]),
+        "root { display: block; width: 400px; height: 400px }
+         one { display: block; height: 40px; filter: blur(6px) }",
+        400.0,
+        400.0,
+    );
+    harness.paint_everything();
+    harness.clear_damage();
+    harness.damage.absorb(rect(0, 0, 10, 10));
+    let expansion = harness.expand();
+    assert_eq!(expansion.absorbed, 1);
+    assert_eq!(expansion.passes, 2);
+    assert!(!expansion.escalated, "one small panel is not a full redraw");
+    assert!(!harness.damage.is_full());
+}
+
+#[test]
 fn the_expansion_settles_over_two_overlapping_blurred_panels() {
     // Two blurred panels whose source regions overlap: growing the damage to cover the first can
     // bring the second into range, which is why the loop runs to a fixpoint rather than once.
@@ -397,13 +475,17 @@ fn the_emit_walk_and_the_hit_index_agree_about_painting_order() {
     // two from drifting apart in a way that shows up only as a click landing on the wrong element.
     let mut harness = Harness::sized(
         Element::new("root").children(vec![
+            Element::new("absolute"),
             Element::new("under").classes(&["back"]),
             Element::new("mid").children(vec![Element::new("relative")]),
             Element::new("over").classes(&["front"]),
             Element::new("floated"),
+            Element::new("late"),
         ]),
         "root { display: block; width: 300px; height: 400px; position: relative; z-index: 0 }
          under, mid, over, floated { display: block; height: 40px; background: #eee }
+         absolute { display: block; position: absolute; inset: 0; background: #888 }
+         late { display: block; height: 40px; position: relative; background: #555 }
          .back { position: relative; z-index: -1 }
          .front { position: relative; z-index: 3 }
          relative { display: block; height: 20px; position: relative; background: #333 }
@@ -433,6 +515,15 @@ fn the_emit_walk_and_the_hit_index_agree_about_painting_order() {
         painted, expected,
         "the walk that emits and the walk that indexes hits put the boxes in different orders"
     );
+    // The absolute box is re-parented onto the root's layout list, and still paints in tree order.
+    let at = |name| {
+        let key = harness.box_of(name);
+        painted
+            .iter()
+            .position(|held| *held == key)
+            .expect("painted")
+    };
+    assert!(at("absolute") < at("late"));
 }
 
 #[test]
@@ -528,6 +619,62 @@ fn emit_and_hit_agree_on_the_same_matrix() {
         !answers(&harness, 120.0),
         "and stops answering where the previous frame drew it",
     );
+}
+
+#[test]
+fn a_backdrop_is_cut_to_the_rounded_border_box_in_the_space_of_its_box() {
+    // A frosted card with round corners frosts only inside them, as its background does. The cut
+    // is measured in the box's own coordinate system, so a transform moves it with the box.
+    let mut harness = Harness::new(
+        Element::new("root").children(vec![Element::new("card")]),
+        "root { display: block; width: 300px }
+         card { display: block; height: 80px; margin: 20px; border-radius: 12px;
+                transform: translateX(10px); backdrop-filter: blur(8px) }",
+    );
+    harness.paint_everything();
+    let scene = harness.scene();
+    let backdrop = scene
+        .primitives
+        .backdrops
+        .first()
+        .expect("the card frosts what is beneath it");
+    let card = harness
+        .store()
+        .fragment(harness.fragment_of("card"))
+        .expect("the card has a fragment");
+    let Some(zgui_scene::ClipNode::Link { link, parent, .. }) = scene.clips.get(backdrop.clip)
+    else {
+        panic!("the backdrop has a clip of its own");
+    };
+    assert_eq!(
+        *parent, card.clip,
+        "inside the chain the card is clipped by"
+    );
+    assert!(link.is_rounded(), "with the card's round corners");
+    let zgui_scene::ClipLink::RoundedRect { rect, space, .. } = link else {
+        panic!("a rounded rectangle");
+    };
+    assert_eq!(*rect, card.border_box);
+    assert_eq!(
+        Some(*space),
+        card.transform,
+        "in the card's own coordinate system"
+    );
+}
+
+#[test]
+fn a_square_backdrop_keeps_the_clip_of_its_box() {
+    let mut harness = Harness::new(
+        Element::new("root").children(vec![Element::new("card")]),
+        "root { display: block; width: 300px }
+         card { display: block; height: 80px; backdrop-filter: blur(8px) }",
+    );
+    harness.paint_everything();
+    let card = harness
+        .store()
+        .fragment(harness.fragment_of("card"))
+        .expect("the card has a fragment");
+    assert_eq!(harness.scene().primitives.backdrops[0].clip, card.clip);
 }
 
 /// A full-window scrim with the component library's own backdrop blur, over a page.

@@ -2,8 +2,8 @@
 
 use crate::new_crate::layer::Layer;
 
-/// The manifest: version, edition, licence and lints all inherited from the workspace, and no
-/// dependency table to tempt anyone into pinning a version locally.
+/// The manifest: version, edition, licence, package metadata and lints all inherited from the
+/// workspace, and no dependency table to tempt anyone into pinning a version locally.
 pub(crate) fn manifest(name: &str, layer: Layer) -> String {
     format!(
         "[package]\n\
@@ -11,6 +11,12 @@ pub(crate) fn manifest(name: &str, layer: Layer) -> String {
          version.workspace = true\n\
          edition.workspace = true\n\
          license.workspace = true\n\
+         repository.workspace = true\n\
+         homepage.workspace = true\n\
+         rust-version.workspace = true\n\
+         keywords.workspace = true\n\
+         categories.workspace = true\n\
+         include.workspace = true\n\
          \n\
          # {layer} — {description}. Every dependency is inherited: `foo.workspace = true`.\n\
          [dependencies]\n\

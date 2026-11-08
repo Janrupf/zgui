@@ -80,6 +80,11 @@ pub enum Paint {
         /// Whether copies repeat outside `destination`.
         repeating: bool,
     },
+    /// One colour per side of a border: top, right, bottom and left.
+    ///
+    /// Only a border stroke uses it. The sides meet on the diagonals through the corners, as CSS
+    /// draws them.
+    Sides([Color; 4]),
 }
 
 impl Paint {
@@ -89,6 +94,7 @@ impl Paint {
             Self::Solid(_) => 0,
             Self::Gradient { .. } => 1,
             Self::Image { .. } => 2,
+            Self::Sides(_) => 3,
         }
     }
 
@@ -138,6 +144,12 @@ impl Paint {
             Self::Solid(color) => Some(*color),
             Self::Gradient { stops, .. } => mean_of(stops),
             Self::Image { .. } => None,
+            // The first visible side, which a single-colour stroke used before sides existed.
+            Self::Sides(colors) => colors
+                .iter()
+                .copied()
+                .find(|color| color.alpha() != 0.0)
+                .or(Some(colors[0])),
         }
     }
 }
@@ -245,6 +257,10 @@ impl Content for Paint {
                 .u32(transform.index())
                 .u32(u32::from(transform.generation().get()))
                 .u32(u32::from(*repeating))
+                .finish(),
+            Self::Sides(colors) => colors
+                .iter()
+                .fold(hash, |hash, color| hash_color(hash, *color))
                 .finish(),
         }
     }

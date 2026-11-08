@@ -76,6 +76,10 @@ fn changing_the_scheme_replaces_the_one_sheet_rather_than_adding_another() {
 
     let light = window.host.stylesheet(THEME_SHEET).expect("installed");
     assert!(!light.contains("@media"), "a pinned scheme writes no query");
+    assert!(
+        light.contains("color-scheme: light"),
+        "the sheet tells the engine which scheme it draws in"
+    );
     let installs = window.host.stylesheet_installs();
 
     scheme.set(ColorScheme::System);
@@ -86,6 +90,7 @@ fn changing_the_scheme_replaces_the_one_sheet_rather_than_adding_another() {
         .stylesheet(THEME_SHEET)
         .expect("still installed");
     assert!(system.contains("@media (prefers-color-scheme: dark)"));
+    assert!(system.contains("color-scheme: dark"));
     assert_eq!(
         window.host.stylesheet_count(),
         1,

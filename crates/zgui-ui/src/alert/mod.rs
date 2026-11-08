@@ -59,10 +59,11 @@ variants! {
 ///
 /// Drawn from the variant and hidden from the accessibility tree, because it says the same thing
 /// the title does and a reader that met both would say it twice. An alert with an icon of its own
-/// passes one as a child and turns this one off.
+/// turns this one off and passes an `Icon` as its first child.
 ///
-/// The icon occupies a column of its own, and the alert says in `data-icon` whether that column
-/// has any width — the title and the description line up down the second one either way.
+/// The icon occupies a column of its own, as wide as the icon. With no icon the column has no
+/// width. The title and the description line up down the second column either way. The alert
+/// says in `data-icon` whether it draws its own icon.
 ///
 /// # What the destructive variant changes
 ///
@@ -96,8 +97,7 @@ pub fn Alert(
     } else {
         A11yBinding::new(Role::Group)
     };
-    // Which column the writing starts in depends on whether there is a mark to put in the first
-    // one, and a sheet has no way to ask. So the answer is written down where it is already known.
+    // Whether the alert draws its own mark, for sheets that style it.
     let own = variant_attrs(variants.classes(), variants.data_attributes())
         .attribute(
             zgui::view::AttrName::new("data-icon"),

@@ -47,6 +47,7 @@ impl GlyphSource for Recorder {
             format: GlyphFormat::Mono,
             paint: zgui_scene::PaintSlot(0),
             synthetic_bold: 0.0,
+            text_start: 0,
         });
     }
 }
@@ -67,7 +68,6 @@ fn placement(ellipsis: Option<EllipsisPaint>) -> TextPlacement {
         transform: SpatialId::VIEWPORT,
         opaque_target: true,
         subpixel_capable: false,
-        upright: true,
         scale: 1.0,
         ellipsis,
     }

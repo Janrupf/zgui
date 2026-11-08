@@ -71,15 +71,18 @@ fn placed(origin: (f32, f32), positions: &[f32]) -> Vec<(PlacedGlyph, SubpixelOf
     let run = ShapedRun {
         face: FaceId(1),
         size: 16.0,
+        instance: zgui_text::VariationInstance::DEFAULT,
         synthetic_bold: 0.0,
         synthetic_slant: 0.0,
         has_color: false,
         brush: PaintSlot(0),
         glyphs: &glyphs,
+        text_start: 0,
     };
     let raster = Recording::default();
     let mut cache = GlyphCache::default();
     let mut vector_masks = VectorMaskCache::default();
+    let mut vector_layers = crate::content::vectors::VectorLayerCache::default();
     let mut atlas = Atlas::new(AtlasLimits::default());
     let mut out = Vec::new();
     super::place(
@@ -87,6 +90,7 @@ fn placed(origin: (f32, f32), positions: &[f32]) -> Vec<(PlacedGlyph, SubpixelOf
             glyphs: &mut cache,
             atlas: &mut atlas,
             vector_masks: &mut vector_masks,
+            vector_layers: &mut vector_layers,
             named: Vec::new(),
         },
         &raster,
@@ -224,4 +228,61 @@ fn a_line_of_glyphs_shares_one_rounded_baseline() {
             DevicePx((12.4f32 + 20.0).round() - 7.0),
         );
     }
+}
+
+/// A variable face's instance reaches the key a glyph is rasterised and cached under, so one
+/// glyph drawn at two instances is two rasterisations and never one shared tile.
+#[test]
+fn each_variation_instance_is_its_own_rasterisation() {
+    let glyphs = [ShapedGlyph {
+        glyph: 4,
+        x: 0.0,
+        y: 20.0,
+    }];
+    let raster = Recording::default();
+    let mut cache = GlyphCache::default();
+    let mut vector_masks = VectorMaskCache::default();
+    let mut vector_layers = crate::content::vectors::VectorLayerCache::default();
+    let mut atlas = Atlas::new(AtlasLimits::default());
+    let mut rasterising = Rasterising {
+        glyphs: &mut cache,
+        atlas: &mut atlas,
+        vector_masks: &mut vector_masks,
+        vector_layers: &mut vector_layers,
+        named: Vec::new(),
+    };
+    for instance in [0, 2, 2, 0] {
+        let run = ShapedRun {
+            face: FaceId(1),
+            size: 16.0,
+            instance: zgui_text::VariationInstance(instance),
+            synthetic_bold: 0.0,
+            synthetic_slant: 0.0,
+            has_color: false,
+            brush: PaintSlot(0),
+            text_start: 0,
+            glyphs: &glyphs,
+        };
+        let mut out = Vec::new();
+        super::place(
+            &mut rasterising,
+            &raster,
+            &run,
+            RasterStyle::Grayscale,
+            Point::new(DevicePx(0.0), DevicePx(0.0)),
+            &mut out,
+        );
+    }
+    let asked: Vec<u32> = raster
+        .asked
+        .lock()
+        .expect("no panic held the lock")
+        .iter()
+        .map(|key| key.instance.0)
+        .collect();
+    assert_eq!(
+        asked,
+        vec![0, 2],
+        "each instance is rasterised once, under its own key"
+    );
 }

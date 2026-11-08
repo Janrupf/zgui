@@ -35,7 +35,7 @@ const LEDGER: &[(&str, &[&str])] = &[
     // itself may not: the firewall is worth nothing if two of its three names go unpoliced.
     ("app_units", &["zgui-css", "zgui-dom", "zgui-style"]),
     ("euclid", &["zgui-css", "zgui-dom", "zgui-style"]),
-    ("taffy", &["zgui-layout"]),
+    ("cephal", &["zgui-layout"]),
     // A parser and nothing else: it reads an SVG document into a tree of paths, paints and clips
     // and draws none of it. That is why only the crate that owns the parse boundary may name it —
     // a document is mapped onto this framework's own vector model there, and both path rasterisers
@@ -77,6 +77,11 @@ const LEDGER: &[(&str, &[&str])] = &[
     ("accesskit_winit", &["zgui-platform-winit"]),
     ("arboard", &["zgui-platform-winit"]),
     ("smithay-clipboard", &["zgui-platform-winit"]),
+    ("muda", &["zgui-platform-winit"]),
+    ("objc2", &["zgui-platform-winit"]),
+    ("block2", &["zgui-platform-winit"]),
+    ("objc2-app-kit", &["zgui-platform-winit"]),
+    ("objc2-foundation", &["zgui-platform-winit"]),
     ("zbus", &["zgui-platform-winit", "zgui-platform-wayland"]),
     // The compositor, spoken to directly. Every one of these names a Wayland protocol or the loop
     // it is read on, and the whole point of a second platform backend is that none of them is

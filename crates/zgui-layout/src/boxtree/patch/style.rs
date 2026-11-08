@@ -30,7 +30,7 @@ use zgui_dom::side::BoxKey;
 use zgui_dom::{Document, NodeIndex, NodeKind};
 
 use crate::boxtree::anonymous::synthesised_style;
-use crate::node::box_node::BoxNode;
+
 use crate::node::kind::{BoxKind, PseudoKind};
 use crate::tree::dirty::mark_dirty;
 use crate::tree::store::LayoutStore;
@@ -58,9 +58,22 @@ use crate::tree::store::LayoutStore;
 ///
 /// Only such an element: a hover that moves a colour rewrites styles too, and invalidating the path
 /// to the root for it would relayout the document for a change that moves nothing.
-pub fn restyle(store: &mut LayoutStore, document: &Document, nodes: &[NodeIndex]) -> u32 {
+///
+/// # Why a rebreak also drops the flattened forms
+///
+/// A flattened form holds the runs with the text styles they had when it was built, and it is
+/// checked only against the sequence of boxes it was built from. A style written in place keeps
+/// that sequence. An element that owes a rebreak changed a property that only moves the lines,
+/// such as `white-space` or `text-align`, so each flattened form that holds its text is dropped
+/// here: the form of each box written, and of each box above the element's own boxes.
+pub fn restyle(
+    store: &mut LayoutStore,
+    document: &Document,
+    nodes: impl IntoIterator<Item = NodeIndex>,
+) -> u32 {
     let mut moved = 0;
-    for &index in nodes {
+    let mut scratch = Scratch::default();
+    for index in nodes {
         let Some(core) = document.store().try_core(index) else {
             continue;
         };
@@ -68,6 +81,7 @@ pub fn restyle(store: &mut LayoutStore, document: &Document, nodes: &[NodeIndex]
             continue;
         }
         let relayout = core.dirty().own().contains(Dirty::RELAYOUT);
+        let rebreak = core.dirty().own().contains(Dirty::REBREAK);
         let source = document.store().key_of(index);
         let node = document.node(index);
         for key in store.boxes_of(source).to_vec() {
@@ -89,10 +103,25 @@ pub fn restyle(store: &mut LayoutStore, document: &Document, nodes: &[NodeIndex]
                 continue;
             };
             moved += write(store, key, &owned, relayout);
-            moved += descend(store, key, &owned, relayout);
+            moved += descend(store, key, &owned, relayout, rebreak, &mut scratch);
+            if rebreak {
+                super::text::forget_flattened(store, key, Some(&mut scratch.climbed));
+            }
         }
     }
     moved
+}
+
+/// The buffers one descent borrows, kept across elements so a document-wide restyle allocates
+/// them once.
+#[derive(Default)]
+struct Scratch {
+    /// The boxes still to descend from.
+    stack: Vec<BoxKey>,
+    /// The boxes already reached.
+    seen: rustc_hash::FxHashSet<BoxKey>,
+    /// The boxes whose flattened forms a rebreak already dropped, with every box above them.
+    climbed: rustc_hash::FxHashSet<BoxKey>,
 }
 
 /// Writes `style` onto one box, and reports whether that changed anything.
@@ -109,9 +138,13 @@ fn write(store: &mut LayoutStore, key: BoxKey, style: &ComputedStyle, relayout: 
     if !store.set_style(key, style) {
         return 0;
     }
-    if relayout {
+    // A custom element reads its style in `layout` and nowhere else: a colour it draws with, a
+    // custom property a theme moved. Any new cascade on its box is a relayout, whatever the
+    // engine classified the change as.
+    if relayout || store.custom_content(key).is_some() {
         mark_dirty(store, key);
     }
+    crate::boxtree::percent::refresh_parent_of(store, key);
     1
 }
 
@@ -128,17 +161,37 @@ fn write(store: &mut LayoutStore, key: BoxKey, style: &ComputedStyle, relayout: 
 /// so it holds the style the painter tints those glyphs with: left at the one it was built with,
 /// a label keeps the colour it had when the button was first drawn, whatever the cascade has done
 /// to it since.
-fn descend(store: &mut LayoutStore, key: BoxKey, owner: &ComputedStyle, relayout: bool) -> u32 {
+///
+/// With `rebreak`, each box reached also drops its flattened form.
+fn descend(
+    store: &mut LayoutStore,
+    key: BoxKey,
+    owner: &ComputedStyle,
+    relayout: bool,
+    rebreak: bool,
+    scratch: &mut Scratch,
+) -> u32 {
     let mut moved = 0;
-    let mut stack = vec![key];
-    let mut seen: rustc_hash::FxHashSet<BoxKey> = rustc_hash::FxHashSet::default();
+    let Scratch { stack, seen, .. } = scratch;
+    stack.clear();
+    seen.clear();
+    stack.push(key);
     let mut synthesised = None;
     while let Some(current) = stack.pop() {
         let Some(node) = store.get(current) else {
             continue;
         };
-        let children = children_of(node);
-        for child in children {
+        // Both orders, each box once: `seen` is what dedupes them, so no list is built first.
+        let count = node.children.len() + node.paint_children.len();
+        for position in 0..count {
+            let Some(node) = store.get(current) else {
+                break;
+            };
+            let child = if position < node.children.len() {
+                node.children[position]
+            } else {
+                node.paint_children[position - node.children.len()]
+            };
             if !seen.insert(child) {
                 continue;
             }
@@ -152,24 +205,13 @@ fn descend(store: &mut LayoutStore, key: BoxKey, owner: &ComputedStyle, relayout
             }
             let style = synthesised.get_or_insert_with(|| synthesised_style(owner));
             moved += write(store, child, style, relayout);
+            if rebreak {
+                store.forget_flattened(child);
+            }
             stack.push(child);
         }
     }
     moved
-}
-
-/// One box's children in both orders, each named once.
-///
-/// The two orders are different sets and not merely different sequences, so the union is what
-/// "every box below this one" means here.
-fn children_of(node: &BoxNode) -> Vec<BoxKey> {
-    let mut children = node.children.clone();
-    for key in &node.paint_children {
-        if !children.contains(key) {
-            children.push(*key);
-        }
-    }
-    children
 }
 
 #[cfg(test)]
@@ -183,7 +225,7 @@ mod tests {
     use crate::style::same_cascade as same;
     use crate::tree::store::LayoutStore;
 
-    use super::{descend, write};
+    use super::{Scratch, descend, write};
 
     /// A box of the given kind under `parent`, in both child orders.
     fn insert(store: &mut LayoutStore, parent: Option<BoxKey>, kind: BoxKind) -> BoxKey {
@@ -226,6 +268,38 @@ mod tests {
     }
 
     #[test]
+    fn a_restyled_custom_box_is_laid_out_again_whatever_the_change_was() {
+        use crate::axis::Axis;
+        use crate::style::convert::length::IntrinsicSizes;
+        use crate::tree::store::content::{BoxContent, CustomBox};
+
+        let mut store = LayoutStore::new(DocumentId::FIRST);
+        let key = store.insert_with_content(
+            BoxNode::new(
+                StyleDraft::initial().build(),
+                BoxKind::Element,
+                FormattingContext::Block,
+            ),
+            BoxContent {
+                custom: Some(CustomBox::from((7, 0, 0))),
+                ..BoxContent::default()
+            },
+        );
+        store.set_intrinsic(key, Axis::Horizontal, IntrinsicSizes::default());
+
+        // A cascade the engine called a repaint: a custom element reads its style only when it
+        // is laid out, so the held answer goes all the same.
+        assert_eq!(
+            write(&mut store, key, &StyleDraft::initial().build(), false),
+            1
+        );
+        assert!(
+            store.intrinsic(key, Axis::Horizontal).is_none(),
+            "the custom box kept a measurement taken against the old style"
+        );
+    }
+
+    #[test]
     fn writing_a_different_allocation_replaces_what_the_box_holds() {
         let mut store = LayoutStore::new(DocumentId::FIRST);
         let key = insert(&mut store, None, BoxKind::Element);
@@ -246,7 +320,17 @@ mod tests {
 
         let owner = StyleDraft::initial().build();
         let before = store.node(nested_run).style.clone();
-        assert_eq!(descend(&mut store, element, &owner, false), 2);
+        assert_eq!(
+            descend(
+                &mut store,
+                element,
+                &owner,
+                false,
+                false,
+                &mut Scratch::default()
+            ),
+            2
+        );
 
         let wrapper_style = store.node(wrapper).style.clone();
         assert!(
@@ -280,7 +364,17 @@ mod tests {
 
         let stale = store.node(root).style.clone();
         let owner = StyleDraft::initial().build();
-        assert_eq!(descend(&mut store, element, &owner, false), 2);
+        assert_eq!(
+            descend(
+                &mut store,
+                element,
+                &owner,
+                false,
+                false,
+                &mut Scratch::default()
+            ),
+            2
+        );
         assert!(
             !same(&stale, &store.node(root).style),
             "the box that generates the line fragments kept the style it was built with, so the \

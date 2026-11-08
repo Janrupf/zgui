@@ -84,11 +84,22 @@ struct Opened {
     frames: Vec<Frame>,
     /// The rectangle of each panel that was found, by title.
     panels: Vec<(String, Rect<DevicePx, Device>)>,
+    /// The box of every element in the document.
+    boxes: Vec<Rect<DevicePx, Device>>,
+}
+
+/// Where things were laid out, read while the window was open.
+#[derive(Default)]
+struct Found {
+    /// See [`Opened::panels`].
+    panels: Vec<(String, Rect<DevicePx, Device>)>,
+    /// See [`Opened::boxes`].
+    boxes: Vec<Rect<DevicePx, Device>>,
 }
 
 /// Drives the application over buffers until it settles, and records where its panels are.
 fn buffers(
-    panels: &Mutex<Vec<(String, Rect<DevicePx, Device>)>>,
+    found: &Mutex<Found>,
 ) -> impl FnOnce(Box<dyn AppHandler>) -> Result<(), PlatformError> + '_ {
     move |handler| {
         let mut harness = zgui_platform_headless::Harness::new(handler);
@@ -101,12 +112,13 @@ fn buffers(
         // Read while the window is still open: the document goes with it.
         if let Some(handles) = grab::taken() {
             let census = Census::take(&handles);
-            let mut found = panels.lock().unwrap_or_else(|held| held.into_inner());
+            let mut found = found.lock().unwrap_or_else(|held| held.into_inner());
             for title in ["Icon"] {
                 if let Some(rect) = census.panel(title).and_then(|node| node.rect) {
-                    found.push((title.to_owned(), rect));
+                    found.panels.push((title.to_owned(), rect));
                 }
             }
+            found.boxes = census.nodes.iter().filter_map(|node| node.rect).collect();
         }
         harness.shut_down();
         Ok(())
@@ -124,19 +136,21 @@ fn run() -> Option<&'static Opened> {
             let _guard = device::device_lock();
             grab::forget();
             let log: Log = Arc::new(Mutex::new(Vec::new()));
-            let panels = Mutex::new(Vec::new());
+            let found = Mutex::new(Found::default());
             zgui::app()
                 .with_title("gallery")
                 .with_size(crate::app::WIDTH, crate::app::HEIGHT)
                 .with_stylesheet(crate::shell::SHEET)
                 .with_renderer(Box::new(device::factory(&log)))
-                .run_on(buffers(&panels), || (Grab, view! { Gallery() }.into_view()))
+                .run_on(buffers(&found), || (Grab, view! { Gallery() }.into_view()))
                 .expect("the gallery ran");
             let frames = core::mem::take(&mut *log.lock().unwrap_or_else(|held| held.into_inner()));
             assert!(!frames.is_empty(), "the gallery drew no frame at all");
+            let found = found.into_inner().unwrap_or_else(|held| held.into_inner());
             Some(Opened {
                 frames,
-                panels: panels.into_inner().unwrap_or_else(|held| held.into_inner()),
+                panels: found.panels,
+                boxes: found.boxes,
             })
         })
         .as_ref()
@@ -183,6 +197,23 @@ fn within(outer: Rect<DevicePx, Device>, inner: Rect<DevicePx, Device>) -> bool 
         && inner.origin.y.0 + inner.size.height.0 <= outer.origin.y.0 + outer.size.height.0
 }
 
+/// `rect` with one pixel more on every side.
+///
+/// A quad fills its own rectangle edge to edge, so that rectangle is one flat colour whether the
+/// quad was drawn or not. The rim puts some of what is behind it in the reading.
+fn rimmed(rect: Rect<DevicePx, Device>) -> Rect<DevicePx, Device> {
+    Rect::new(
+        zgui::geom::Point::new(
+            DevicePx(rect.origin.x.0 - 1.0),
+            DevicePx(rect.origin.y.0 - 1.0),
+        ),
+        zgui::geom::Size::new(
+            DevicePx(rect.size.width.0 + 2.0),
+            DevicePx(rect.size.height.0 + 2.0),
+        ),
+    )
+}
+
 #[test]
 fn the_gallery_puts_its_drawings_in_the_display_list() {
     let opened = opened!();
@@ -217,9 +248,11 @@ fn every_icon_on_the_gallery_s_icon_panel_marks_the_pixels_it_claimed() {
     let frame = settled(opened);
     let card = panel(opened, "Icon");
 
+    // Every shape an icon can arrive as. The routes turn most of these icons into quads and
+    // coverage sprites, and the card's own background is the one quad left out.
     let inside: Vec<_> = frame
-        .drawings
-        .iter()
+        .shapes_in(card, &opened.boxes)
+        .into_iter()
         .filter(|drawing| within(card, drawing.ink))
         .collect();
     assert!(
@@ -231,7 +264,7 @@ fn every_icon_on_the_gallery_s_icon_panel_marks_the_pixels_it_claimed() {
 
     let blank: Vec<_> = inside
         .iter()
-        .filter(|drawing| device::ink::fraction(&frame.pixels, drawing.ink) <= 0.0)
+        .filter(|drawing| device::ink::fraction(&frame.pixels, rimmed(drawing.ink)) <= 0.0)
         .map(|drawing| (drawing.order, drawing.ink))
         .collect();
     assert!(

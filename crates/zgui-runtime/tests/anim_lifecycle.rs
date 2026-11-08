@@ -195,3 +195,65 @@ fn content_kept_mounted_for_its_exit_transition_is_unmounted_when_that_transitio
          window with nothing visible on it"
     );
 }
+
+/// A surface whose exit animation takes no time, as a theme with its motion turned off has it.
+const INSTANT_EXIT_CSS: &str = "root { display: block; width: 400px; height: 300px }
+                                .surface { display: block; width: 200px; height: 100px;
+                                           background-color: rgb(30, 30, 30) }
+                                .surface[data-state=\"closed\"] { animation: leave 0s both }
+                                @keyframes leave { to { opacity: 0 } }";
+
+#[test]
+fn content_kept_mounted_for_an_exit_animation_of_no_length_is_unmounted_when_it_ends() {
+    let mounted = RwSignal::new(true);
+    let leaving = RwSignal::new(false);
+
+    let mut harness = support::app(INSTANT_EXIT_CSS, move |cx: &mut BuildCx<'_>| {
+        let view = zgui_view::Show::new(
+            move || mounted.get(),
+            move || {
+                let handle = NodeRef::new();
+                zgui_view::AnyView::new(
+                    zgui_elements::r#box()
+                        .class("surface")
+                        .node_ref(handle)
+                        .attribute(zgui_view::AttrName::new("data-state"), move || {
+                            Some(if leaving.get() { "closed" } else { "open" }.to_owned())
+                        })
+                        .on(
+                            zgui_view::events::ANIMATION_END,
+                            move |_ev: &mut zgui_view::EventCx<
+                                '_,
+                                zgui_view::events::AnimationEnd,
+                            >| {
+                                if leaving.get_untracked() && handle.running_animations() == 0 {
+                                    mounted.set(false);
+                                }
+                            },
+                        ),
+                )
+            },
+        )
+        .fallback(|| zgui_view::AnyView::new(()))
+        .into_view();
+        Box::new(view.build(cx)) as Box<dyn zgui_view::Anchor>
+    });
+    harness.settle(8);
+    assert_eq!(
+        count(&harness, "surface"),
+        1,
+        "the surface is on the screen"
+    );
+
+    leaving.set(true);
+    harness.settle(8);
+    for _ in 0..4 {
+        harness.advance(FRAME);
+        harness.settle(8);
+    }
+    assert_eq!(
+        count(&harness, "surface"),
+        0,
+        "the exit of no length ended and the surface was never taken away"
+    );
+}

@@ -3,9 +3,8 @@
 //! A chain is rendered as its **links**, innermost last, and not as the flattened rectangle a draw
 //! call binds. The flattening deliberately drops rounded tests beyond the two one draw call can
 //! apply, so a transcript built from it would render two chains that clip differently as the same
-//! text — which is exactly the case
-//! [`ClipTable::needs_group_target`](zgui_scene::ClipTable::needs_group_target) exists to catch,
-//! and the case a golden most needs to see.
+//! text. A chain of more than two rounded links therefore also reports how many tests its
+//! resolution applies, and how many that change pixels it drops.
 
 use zgui_scene::{ClipId, ClipLink, ClipTable, MaskSource};
 
@@ -24,12 +23,19 @@ pub fn chain(table: &ClipTable, id: ClipId) -> String {
         return format!("#{} <missing>", id.index());
     }
     let rendered: Vec<String> = links.iter().map(link).collect();
-    let promoted = if table.needs_group_target(id) {
-        " needs_group_target"
+    let total = table.rounded_links(id);
+    let overflow = if total > ClipTable::MAX_INLINE_ROUNDED {
+        let resolved = table.resolve(id);
+        let dropped = if resolved.dropped > 0 {
+            format!(" dropped={}", resolved.dropped)
+        } else {
+            String::new()
+        };
+        format!(" rounded={}/{total}{dropped}", resolved.rounded_count)
     } else {
-        ""
+        String::new()
     };
-    format!("[{}]{promoted}", rendered.join(" > "))
+    format!("[{}]{overflow}", rendered.join(" > "))
 }
 
 /// One link of a chain.
@@ -121,8 +127,8 @@ mod tests {
     #[test]
     fn a_third_rounded_link_is_visible_even_though_flattening_drops_it() {
         // Flattening keeps two rounded tests. A transcript built from the flattened form would
-        // render this chain identically to its two-link prefix, and the promotion to a group target
-        // — a real, visible difference — would never appear in a golden.
+        // render this chain identically to its two-link prefix, and the dropped test — a real,
+        // visible difference — would never appear in a golden.
         let mut table = ClipTable::rooted();
         let radius = Vec2::splat(DevicePx(4.0));
         let mut id = ClipId::ROOT;
@@ -139,6 +145,6 @@ mod tests {
         }
         let rendered = chain(&table, id);
         assert_eq!(rendered.matches("radii=").count(), 3);
-        assert!(rendered.ends_with("needs_group_target"));
+        assert!(rendered.ends_with(" rounded=2/3 dropped=1"), "{rendered}");
     }
 }

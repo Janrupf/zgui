@@ -6,11 +6,17 @@ style! { pub CommandStyle =>
     // A palette is a panel the colour of a popover with a field at the top of it and a list under.
     // It takes whatever room it is given — inside a dialog that is the dialog, and on a page it is
     // whatever the page allotted — which is why nothing here states a width.
+    //
+    // The height is a flex item's rather than a percentage of the parent. A dialog is as tall as
+    // what is on it, so a percentage of it is a percentage of a height that is still being
+    // decided, and the panel comes out at nothing. `flex` fills a parent that states a height and
+    // takes the height of the field and the list in one that does not.
     ":scope {
         display: flex;
         flex-direction: column;
         width: 100%;
-        height: 100%;
+        flex: 1 1 auto;
+        min-height: 0;
         overflow: hidden;
         border-radius: var(--zui-radius-md);
         background-color: var(--zui-color-popover);
@@ -34,9 +40,12 @@ style! { pub CommandStyle =>
     // The field inside the band gives up every mark of being a field: its border, its background,
     // its own focus ring. There is exactly one thing to type into on this surface and the caret is
     // already in it, so a ring drawn round it would outline the obvious.
+    // It fills the band from rule to rule, so the band's height is the field's.
     ".zui-command__field .zui-command__input {
         flex: 1 1 auto;
-        height: 40px;
+        align-self: stretch;
+        height: auto;
+        min-width: 0;
         padding: 0;
         border: none;
         background-color: transparent;
@@ -61,7 +70,11 @@ style! { pub CommandStyle =>
         padding: var(--zui-space-xs);
         gap: 0;
     }"
+    // A command has no tick, so its row keeps no room for one at the end.
+    ".zui-select__item.zui-command__item { padding: 6px 8px; }"
     ".zui-command__group { display: flex; flex-direction: column; gap: 0; padding: var(--zui-space-xs); }"
+    // A group the filter has emptied says `hidden`, which the rule above would otherwise override.
+    ".zui-command__group[hidden] { display: none; }"
     // A group's heading is quieter than a menu's, because a palette is read by typing rather than
     // by scanning: the headings are there to say what *kind* of thing was found, not to be aimed at.
     ".zui-command__group .zui-menu__label {

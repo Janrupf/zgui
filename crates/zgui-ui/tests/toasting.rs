@@ -18,6 +18,11 @@ use zgui_ui_tokens::prelude::*;
 
 use crate::desktop::stage::{HEIGHT, Stage};
 
+/// How long a fixture waits after a push, longer than the 400 ms `--zui-toast-move`.
+///
+/// A toast read before its arrival ends is read part way along it.
+const ARRIVED: Duration = Duration::from_millis(500);
+
 const SHEET: &str = ":root { background-color: #ffffff; color: #101010; font-family: sans-serif }
                      .page { padding: 40px; gap: 12px; align-items: flex-start }
                      .low { padding-top: 400px }";
@@ -90,6 +95,39 @@ fn Push(
         }) {
             {label}
         }
+    }
+}
+
+/// A page whose first button announces one message and whose second puts another in its place.
+#[component]
+fn Progress() -> impl IntoView {
+    view! {
+        ThemeProvider {
+            Toaster {
+                Steps()
+            }
+        }
+    }
+}
+
+/// The two buttons of [`Progress`], inside its toaster.
+#[component]
+fn Steps() -> impl IntoView {
+    let toasts = use_toaster();
+    let held = RwSignal::new_local(None);
+    view! {
+                column(class = "page") {
+                    Button(on:click = move |_| {
+                        if let Some(toasts) = toasts {
+                            held.set(Some(toasts.push(Toast::new("1 of 3 done").persistent())));
+                        }
+                    }) {"start"}
+                    Button(on:click = move |_| {
+                        if let (Some(toasts), Some(id)) = (toasts, held.get_untracked()) {
+                            toasts.replace(id, Toast::new("3 of 3 done"));
+                        }
+                    }) {"advance"}
+                }
     }
 }
 
@@ -167,7 +205,7 @@ fn stacked(titles: &[&str]) -> Stage {
     let mut stage = Stage::open(SHEET, || view! { Page() });
     for title in titles {
         stage.click_saying(&format!("push {title}"));
-        stage.hold(Duration::from_millis(300));
+        stage.hold(ARRIVED);
     }
     stage
 }
@@ -372,9 +410,9 @@ fn a_stack_in_the_opposite_corner_grows_the_other_way_and_still_lets_go() {
     // second later by a deadline rather than when it finishes — which is what this timing catches.
     let mut stage = Stage::open(SHEET, || view! { UpsideDown() });
     stage.click_saying("push one");
-    stage.hold(Duration::from_millis(300));
+    stage.hold(ARRIVED);
     stage.click_saying("push two");
-    stage.hold(Duration::from_millis(300));
+    stage.hold(ARRIVED);
 
     let one = toast_of(&stage, "one").expect("the first is on the screen");
     let two = toast_of(&stage, "two").expect("the second is on the screen");
@@ -421,5 +459,27 @@ fn a_toast_and_the_control_that_dismisses_it_are_both_announced() {
     assert!(
         said("Button", "Dismiss"),
         "and the control that takes it away has a name: {announced:?}"
+    );
+}
+
+#[test]
+fn a_replaced_toast_says_the_new_message_in_the_same_place() {
+    // One run of work reports in one toast. A queue that pushed a new toast per step would stack
+    // three messages about the same thing, and one that replaced the row without the view reading it
+    // would keep showing the first step.
+    let mut stage = Stage::open(SHEET, || view! { Progress() });
+    stage.click_saying("start");
+    stage.hold(ARRIVED);
+    let before = toast_of(&stage, "1 of 3 done").expect("the first step is on the screen");
+    stage.click_saying("advance");
+    stage.hold(ARRIVED);
+    let after = toast_of(&stage, "3 of 3 done").expect("the last step is on the screen");
+    assert!(
+        toast_of(&stage, "1 of 3 done").is_none(),
+        "the first step is gone"
+    );
+    assert!(
+        (bottom(after) - bottom(before)).abs() < 1.0,
+        "and the toast stands where it stood: {before:?} then {after:?}"
     );
 }

@@ -15,6 +15,7 @@
 
 use crate::brush::Brush;
 use crate::font::face::FaceId;
+use crate::glyph::instance::VariationInstance;
 use crate::glyph::key::{GlyphKey, RasterStyle, SubpixelOffset};
 
 /// How much a synthesised bold thickens a stem, as a fraction of the size it is drawn at.
@@ -52,6 +53,8 @@ pub struct ShapedRun<'a> {
     pub face: FaceId,
     /// The size the run is drawn at, in device pixels.
     pub size: f32,
+    /// The point in a variable face's design space the glyphs are drawn at.
+    pub instance: VariationInstance,
     /// How much the glyphs are emboldened to stand in for a weight the face does not have, as a
     /// fraction of the size; zero when the face covers the requested weight.
     pub synthetic_bold: f32,
@@ -65,6 +68,10 @@ pub struct ShapedRun<'a> {
     pub brush: Brush,
     /// The glyphs, in visual order.
     pub glyphs: &'a [ShapedGlyph],
+    /// The byte offset in the generated string where the run's text starts.
+    ///
+    /// It says which nested inline box the run belongs to. No cache key holds it.
+    pub text_start: u32,
 }
 
 impl ShapedRun<'_> {
@@ -77,16 +84,18 @@ impl ShapedRun<'_> {
     ///
     /// ```
     /// use zgui_scene::PaintSlot;
-    /// use zgui_text::{FaceId, RasterStyle, ShapedRun};
+    /// use zgui_text::{FaceId, RasterStyle, ShapedRun, VariationInstance};
     ///
     /// let run = ShapedRun {
     ///     face: FaceId(0),
     ///     size: 16.0,
+    ///     instance: VariationInstance::DEFAULT,
     ///     synthetic_bold: 0.0,
     ///     synthetic_slant: 0.0,
     ///     has_color: false,
     ///     brush: PaintSlot(0),
     ///     glyphs: &[],
+    ///     text_start: 0,
     /// };
     /// assert_eq!(run.raster_style(true), RasterStyle::Subpixel);
     /// assert_eq!(run.raster_style(false), RasterStyle::Grayscale);
@@ -119,6 +128,7 @@ impl ShapedRun<'_> {
             face: self.face,
             glyph,
             size_bits: self.size.to_bits(),
+            instance: self.instance,
             offset,
             style,
             synthetic_bold_bits: (self.synthetic_bold * self.size).to_bits(),
@@ -136,16 +146,20 @@ impl ShapedRun<'_> {
     ///
     /// ```
     /// use zgui_scene::PaintSlot;
-    /// use zgui_text::{FaceId, RasterStyle, ShapedGlyph, ShapedRun, SubpixelOffset};
+    /// use zgui_text::{
+    ///     FaceId, RasterStyle, ShapedGlyph, ShapedRun, SubpixelOffset, VariationInstance,
+    /// };
     ///
     /// let run = ShapedRun {
     ///     face: FaceId(3),
     ///     size: 16.0,
+    ///     instance: VariationInstance::DEFAULT,
     ///     synthetic_bold: 0.0,
     ///     synthetic_slant: 0.0,
     ///     has_color: false,
     ///     brush: PaintSlot(0),
     ///     glyphs: &[],
+    ///     text_start: 0,
     /// };
     /// let here = run.key_for(ShapedGlyph { glyph: 9, x: 12.25, y: 0.0 }, 0.0, RasterStyle::Grayscale);
     /// let there = run.key_for(ShapedGlyph { glyph: 9, x: 40.25, y: 0.0 }, 0.0, RasterStyle::Grayscale);
@@ -169,6 +183,7 @@ impl ShapedRun<'_> {
             face: self.face,
             glyph,
             size_bits: self.size.to_bits(),
+            instance: self.instance,
             synthetic_slant_bits: self.synthetic_slant.to_bits(),
         }
     }
@@ -194,7 +209,7 @@ pub trait ShapedGlyphs {
 
 #[cfg(test)]
 mod tests {
-    use super::{ShapedGlyph, ShapedRun};
+    use super::{ShapedGlyph, ShapedRun, VariationInstance};
     use crate::glyph::key::RasterStyle;
 
     /// A run over one face at one size.
@@ -202,11 +217,13 @@ mod tests {
         ShapedRun {
             face: crate::font::face::FaceId(1),
             size: 16.0,
+            instance: VariationInstance::DEFAULT,
             synthetic_bold: 0.0,
             synthetic_slant: 0.0,
             has_color: false,
             brush: zgui_scene::PaintSlot(0),
             glyphs: &[],
+            text_start: 0,
         }
     }
 

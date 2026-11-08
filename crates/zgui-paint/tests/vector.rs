@@ -119,9 +119,10 @@ fn an_eligible_canvas_fill_uses_the_same_mask_route() {
 fn a_small_solid_canvas_stroke_uses_a_mask_instead_of_the_vector_rasteriser() {
     let handle = zgui_canvas::SceneHandle::new();
     handle.edit(|scene| {
+        // A curve, because a straight one is a quad on the analytic route or a mark.
         let mut path = zgui_scene::kurbo::BezPath::new();
-        path.move_to((3.0, 12.0));
-        path.line_to((21.0, 12.0));
+        path.move_to((3.0, 3.0));
+        path.curve_to((9.0, 3.0), (15.0, 21.0), (21.0, 21.0));
         scene.push(
             zgui_canvas::ShapeBuilder::new(path)
                 .stroke(zgui_canvas::Brush::Inherited { alpha: 1.0 }, 2.0)
@@ -316,7 +317,7 @@ fn a_drawing_is_fitted_to_the_box_its_style_gave_it() {
     let cache = VectorCache::new();
     harness.paint_vectors(&cache);
     let item = &harness.scene().primitives.vectors[0];
-    let bounds = zgui_scene::kurbo::Shape::bounding_box(&*item.path);
+    let bounds = item.placed_bounds();
     assert_eq!(
         (bounds.width(), bounds.height()),
         (16.0, 16.0),
@@ -327,7 +328,7 @@ fn a_drawing_is_fitted_to_the_box_its_style_gave_it() {
     let cache = VectorCache::new();
     harness.paint_vectors(&cache);
     let item = &harness.scene().primitives.vectors[0];
-    let bounds = zgui_scene::kurbo::Shape::bounding_box(&*item.path);
+    let bounds = item.placed_bounds();
     assert_eq!((bounds.width(), bounds.height()), (48.0, 48.0));
 }
 
@@ -344,11 +345,66 @@ fn a_drawing_is_placed_at_its_own_boxs_content_box() {
         .store()
         .fragment(harness.fragment_of("mark"))
         .expect("the drawing produced a fragment")
-        .content_box;
+        .content_box();
     let item = &harness.scene().primitives.vectors[0];
-    let bounds = zgui_scene::kurbo::Shape::bounding_box(&*item.path);
+    let bounds = item.placed_bounds();
     assert_eq!(bounds.x0 as f32, content_box.origin.x.0);
     assert_eq!(bounds.y0 as f32, content_box.origin.y.0);
+}
+
+/// The general route draws the drawing's own source path, with the fit as the item's placement.
+#[test]
+fn a_general_shape_draws_its_source_path_under_the_fit() {
+    let mut harness = Harness::new(tree(), CSS);
+    let cache = VectorCache::new();
+    harness.paint_vectors(&cache);
+
+    let fragment = harness
+        .store()
+        .fragment(harness.fragment_of("mark"))
+        .expect("the drawing produced a fragment");
+    let node = harness.document().store().key_of(harness.element("mark"));
+    let drawing = zgui_paint::VectorSource::drawing(
+        &cache.frame(harness.document()),
+        node,
+        zgui_paint::content::vectors::Placement {
+            content_box: fragment.content_box(),
+            scale: 1.0,
+        },
+    )
+    .expect("the element draws");
+    let item = &harness.scene().primitives.vectors[0];
+    assert!(
+        std::sync::Arc::ptr_eq(&item.path, &drawing.shapes[0].path),
+        "the item draws the source path, not a placed copy"
+    );
+    assert_eq!(item.placement, drawing.fit);
+}
+
+/// An inherited stroke is a width in device pixels, so the fit that scales the path does not
+/// scale it.
+#[test]
+fn an_inherited_stroke_keeps_its_device_width_under_a_fit() {
+    let css = "root { display: block; width: 200px; height: 100px;
+                      --zgui-stroke: rgb(0, 200, 0); --zgui-stroke-width: 3px }
+               mark { display: block; width: 48px; height: 48px }";
+    let mut harness = Harness::new(tree(), css);
+    let cache = VectorCache::new();
+    harness.paint_vectors(&cache);
+
+    let item = harness
+        .scene()
+        .primitives
+        .vectors
+        .iter()
+        .find(|item| item.stroke.is_some())
+        .expect("a stroked item");
+    assert_eq!(item.placed_scale(), 2.0, "a 24 unit drawing in a 48 px box");
+    let width = item.stroke.as_ref().expect("a stroke").style.width * item.placed_scale();
+    assert!(
+        (width - 3.0).abs() < 1.0e-9,
+        "the stroke is {width} px wide on the device"
+    );
 }
 
 /// The custom-property scheme is what themes a drawing, since this engine build has no `fill`.
@@ -525,7 +581,7 @@ fn changing_only_the_outlines_redraws_the_element() {
     let mut harness = Harness::new(tree(), CSS);
     let cache = VectorCache::new();
     harness.paint_vectors(&cache);
-    let before = harness.scene().primitives.vectors[0].path.to_svg();
+    let before = harness.scene().primitives.vectors[0].placed_path().to_svg();
 
     let index = harness.element("mark");
     harness.edit_and_restyle(|edit| {
@@ -538,7 +594,7 @@ fn changing_only_the_outlines_redraws_the_element() {
     harness.compose(200.0, 100.0);
     harness.paint_vectors(&cache);
 
-    let after = harness.scene().primitives.vectors[0].path.to_svg();
+    let after = harness.scene().primitives.vectors[0].placed_path().to_svg();
     assert_ne!(
         before, after,
         "the outlines changed and the frame replayed the ones that were there"
@@ -578,7 +634,7 @@ fn changing_the_outlines_damages_the_element_that_draws_them() {
         .store()
         .fragment(harness.fragment_of("mark"))
         .expect("a fragment")
-        .ink;
+        .device_ink(&zgui_scene::Placements::of(&harness.scene.spatial));
     let damage = &harness.damage;
     assert!(
         !damage.is_full(),
@@ -635,9 +691,8 @@ fn a_drawing_with_no_view_box_is_drawn_in_css_pixels_from_its_content_box() {
         .store()
         .fragment(harness.fragment_of("mark"))
         .expect("a fragment")
-        .content_box;
-    let bounds =
-        zgui_scene::kurbo::Shape::bounding_box(&*harness.scene().primitives.vectors[0].path);
+        .content_box();
+    let bounds = harness.scene().primitives.vectors[0].placed_bounds();
     assert_eq!(
         (bounds.width(), bounds.height()),
         (10.0, 10.0),
@@ -870,9 +925,13 @@ fn a_drawing_scaled_to_nothing_reaches_neither_rasteriser() {
 }
 
 /// A bar with no view box, `width` by `height` CSS pixels, filled.
+///
+/// Its right edge leans by one pixel, so it has the bounds of a rectangle and stays off the
+/// analytic route.
 fn bar_tree(width: u32, height: u32) -> (Element, String) {
-    let path: &'static str =
-        Box::leak(format!("M0 0 L{width} 0 L{width} {height} L0 {height} Z").into_boxed_str());
+    let path: &'static str = Box::leak(
+        format!("M0 0 L{width} 0 L{} {height} L0 {height} Z", width - 1).into_boxed_str(),
+    );
     let css = format!(
         "root {{ display: block; width: 1400px; height: 1400px }}
          mark {{ display: block; width: {width}px; height: {height}px; color: rgb(0, 128, 255) }}"
@@ -905,4 +964,146 @@ fn a_wide_thin_drawing_takes_the_atlas_and_a_large_square_does_not() {
         );
         assert_eq!(vectors, 1);
     }
+}
+
+/// Replaces the canvas scene with a triangle moved by a fraction of a pixel per frame, tells the
+/// element, and lays it out again: one frame of a canvas whose drawing changes every frame.
+fn redraw(harness: &mut Harness, handle: &zgui_canvas::SceneHandle, frame: u32) {
+    let shift = f64::from(frame) * 0.1;
+    handle.edit(|scene| {
+        let mut path = zgui_scene::kurbo::BezPath::new();
+        path.move_to((1.0 + shift, 1.0));
+        path.line_to((22.0, 2.0 + shift));
+        path.line_to((3.0, 22.0));
+        path.close_path();
+        scene.clear();
+        scene.push(
+            zgui_canvas::ShapeBuilder::new(path)
+                .fill(zgui_canvas::Brush::Solid(zgui_color::Color::BLACK))
+                .build(),
+        );
+    });
+    let index = harness.element("mark");
+    let value = drawing::canvas_value(handle.token().0, handle.revision());
+    harness.edit_and_restyle(|edit| {
+        edit.set_property(
+            index,
+            PropKey::new(drawing::CANVAS),
+            Some(PropValue::Integer(value)),
+        );
+    });
+    harness.compose(200.0, 100.0);
+}
+
+/// Paints a canvas redrawn on each of `frames` frames, and reports whether each frame drew it as a
+/// mask.
+fn redrawn_canvas_masks(ready: bool, frames: u32) -> Vec<bool> {
+    let handle = zgui_canvas::SceneHandle::new();
+    let tree = Element::new("root").children(vec![Element::new("mark").canvas(&handle)]);
+    let mut harness = Harness::new(tree, CSS);
+    let vectors = VectorCache::new();
+    let mut content = zgui_paint::ContentCache::new(AtlasLimits::default());
+    let raster = zgui_testkit_scene::MonoRaster::new();
+    (0..frames)
+        .map(|frame| {
+            redraw(&mut harness, &handle, frame);
+            harness.paint_cached_vectors_ready(&vectors, &mut content, &raster, ready);
+            let primitives = &harness.scene().primitives;
+            assert_eq!(
+                primitives.mono_sprites.len() + primitives.vectors.len(),
+                1,
+                "frame {frame} drew the canvas once"
+            );
+            primitives.vectors.is_empty()
+        })
+        .collect()
+}
+
+/// A canvas redrawn every frame changes its mask every frame. Once the general rasteriser is built,
+/// it takes the shape and the atlas stops churning.
+#[test]
+fn a_canvas_redrawn_every_frame_leaves_the_mask_route_once_vector_raster_is_ready() {
+    assert_eq!(
+        redrawn_canvas_masks(true, 6),
+        [true, true, true, false, false, false]
+    );
+}
+
+/// While the general rasteriser is cold, a decline would build it, so a small shape keeps the mask.
+#[test]
+fn a_small_canvas_redrawn_every_frame_stays_on_the_mask_route_while_cold() {
+    assert!(redrawn_canvas_masks(false, 8).into_iter().all(|mask| mask));
+}
+
+/// An icon whose geometry does not change keeps its mask, however often it is emitted again.
+#[test]
+fn an_icon_grid_repainted_without_change_stays_on_the_mask_route() {
+    let tree = Element::new("root").children(
+        (0..6)
+            .map(|_| Element::new("mark").drawing(TRIANGLE, Some("0 0 24 24")))
+            .collect(),
+    );
+    let mut harness = Harness::new(tree, CSS);
+    let marks = harness.elements("mark");
+    // A drawing's mask owner is its fragment, so the same fragments keep the same histories.
+    let fragments = |harness: &Harness| -> Vec<_> {
+        marks
+            .iter()
+            .map(|&mark| {
+                let node = harness.document().store().key_of(mark);
+                let boxed = harness.store().boxes_of(node)[0];
+                harness.store().fragments_of_box(boxed)[0]
+            })
+            .collect()
+    };
+    let owners = fragments(&harness);
+    let vectors = VectorCache::new();
+    let mut content = zgui_paint::ContentCache::new(AtlasLimits::default());
+    let raster = zgui_testkit_scene::MonoRaster::new();
+    for frame in 0..8 {
+        // The same outlines, spelled two ways: each frame writes a new drawing, so every icon
+        // encodes again and its placed path is a new allocation, while the geometry stays put.
+        let paths = if frame % 2 == 0 {
+            TRIANGLE
+        } else {
+            "M0,0 L24,0 L24,24 Z"
+        };
+        harness.edit_and_restyle(|edit| {
+            for &mark in &marks {
+                edit.set_property(
+                    mark,
+                    PropKey::new(drawing::PATHS),
+                    Some(PropValue::from(paths)),
+                );
+            }
+        });
+        harness.compose(200.0, 100.0);
+        let report = harness.paint_cached_vectors_ready(&vectors, &mut content, &raster, true);
+        assert_eq!(
+            report.vector_routes.len(),
+            6,
+            "frame {frame} encoded every icon"
+        );
+        assert!(
+            report.vector_routes.iter().all(|route| !route
+                .routes
+                .contains(zgui_paint::VectorRoute::GeneralRaster)),
+            "frame {frame} sent an icon to the general route"
+        );
+        assert_eq!(
+            harness.scene().primitives.mono_sprites.len(),
+            6,
+            "frame {frame}"
+        );
+        assert!(
+            harness.scene().primitives.vectors.is_empty(),
+            "frame {frame}"
+        );
+        assert_eq!(
+            fragments(&harness),
+            owners,
+            "frame {frame} kept the fragments"
+        );
+    }
+    assert_eq!(content.report().tiles, 1, "six icons, one geometry");
 }

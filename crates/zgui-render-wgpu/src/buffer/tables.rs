@@ -36,10 +36,10 @@ pub const TEXELS_WIDE: u32 = 256;
 /// `rgba32uint`: four thirty-two-bit channels. Every structure a table holds is a multiple of four
 /// bytes, so a texel is a whole number of fields and an index into the table is a whole number of
 /// texels.
-const TEXEL: usize = 16;
+pub(crate) const TEXEL: usize = 16;
 
 /// How many bytes one row holds.
-const ROW: usize = TEXELS_WIDE as usize * TEXEL;
+pub(crate) const ROW: usize = TEXELS_WIDE as usize * TEXEL;
 
 /// A table the shaders read with `textureLoad`, which grows to the largest thing it has held.
 ///
@@ -66,7 +66,7 @@ impl TableTexture {
 
     /// An empty table named `label`.
     pub fn new(gpu: &Gpu, label: &'static str) -> Self {
-        let (texture, view) = allocate(gpu, label, Self::MINIMUM_ROWS);
+        let (texture, view) = allocate_rows(gpu, label, Self::MINIMUM_ROWS);
         Self {
             texture,
             view,
@@ -106,7 +106,7 @@ impl TableTexture {
         let grew = needed > self.rows;
         if grew {
             self.rows = needed.next_power_of_two().max(Self::MINIMUM_ROWS);
-            let (texture, view) = allocate(gpu, self.label, self.rows);
+            let (texture, view) = allocate_rows(gpu, self.label, self.rows);
             self.texture = texture;
             self.view = view;
             self.generation = self.generation.wrapping_add(1);
@@ -178,7 +178,7 @@ impl TableTexture {
             return 0;
         }
         let freed = self.capacity() - u64::from(Self::MINIMUM_ROWS) * ROW as u64;
-        let (texture, view) = allocate(gpu, self.label, Self::MINIMUM_ROWS);
+        let (texture, view) = allocate_rows(gpu, self.label, Self::MINIMUM_ROWS);
         self.texture = texture;
         self.view = view;
         self.rows = Self::MINIMUM_ROWS;
@@ -244,7 +244,14 @@ fn run_extent(texel: u32, held: u32) -> (u32, u32) {
 }
 
 /// Allocates a table of `rows` rows, and the view a bind group names it by.
-fn allocate(gpu: &Gpu, label: &'static str, rows: u32) -> (wgpu::Texture, wgpu::TextureView) {
+///
+/// Every table of this format is allocated here — the side tables, the instance arenas and the
+/// frame's vector composites — so that one place states the format, the width and the usage.
+pub(crate) fn allocate_rows(
+    gpu: &Gpu,
+    label: &'static str,
+    rows: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = gpu.device().create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
@@ -261,69 +268,4 @@ fn allocate(gpu: &Gpu, label: &'static str, rows: u32) -> (wgpu::Texture, wgpu::
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     (texture, view)
-}
-
-#[cfg(test)]
-mod tests {
-    //! The split a run is written in, which no device is needed to check.
-
-    use super::{TEXELS_WIDE, run_extent};
-
-    /// Every write a run of `texels` texels starting at `first` is made of.
-    fn writes(first: u32, texels: u32) -> Vec<(u32, u32, u32, u32)> {
-        let mut out = Vec::new();
-        let (mut texel, mut held) = (first, texels);
-        while held > 0 {
-            let (width, height) = run_extent(texel, held);
-            out.push((texel % TEXELS_WIDE, texel / TEXELS_WIDE, width, height));
-            texel += width * height;
-            held -= width * height;
-        }
-        out
-    }
-
-    #[test]
-    fn a_run_is_written_once_and_never_past_the_row_it_is_in() {
-        // A run of one texel, a run of exactly a row, one that starts mid-row and ends mid-row,
-        // and one long enough to have whole rows in the middle of it.
-        for (first, texels) in [
-            (0, 1),
-            (0, TEXELS_WIDE),
-            (0, 700),
-            (5, 3),
-            (250, 12),
-            (TEXELS_WIDE - 1, TEXELS_WIDE + 1),
-            (300, 1000),
-        ] {
-            let writes = writes(first, texels);
-            assert_eq!(
-                writes.iter().map(|(_, _, w, h)| w * h).sum::<u32>(),
-                texels,
-                "every texel of {first}+{texels} is written exactly once"
-            );
-            assert!(
-                writes.len() <= 3,
-                "{first}+{texels} took {} writes, and a run is at most three",
-                writes.len()
-            );
-
-            let mut at = first;
-            for (column, row, width, height) in writes {
-                assert_eq!(
-                    row * TEXELS_WIDE + column,
-                    at,
-                    "each write starts where the one before it ended"
-                );
-                assert!(
-                    column + width <= TEXELS_WIDE,
-                    "no write runs past the end of its row"
-                );
-                assert!(
-                    height == 1 || column == 0,
-                    "a write of whole rows starts on a row"
-                );
-                at += width * height;
-            }
-        }
-    }
 }

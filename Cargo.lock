@@ -690,6 +690,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "cephal"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e5a13dfbd5a30b3a70dd76465339854bc8fe5ec22b5bb8548e1ec564b9412bd"
+
+[[package]]
 name = "cexpr"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -924,6 +930,15 @@ checksum = "d8d80a2f4f5b554395e47b5d8305bc3d27813bacb73493eb1001e8f76dae29ea"
 dependencies = [
  "cast",
  "itertools 0.13.0",
+]
+
+[[package]]
+name = "crossbeam-channel"
+version = "0.5.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98b0cc327b5bc766e7fda9c9260cc0fa81b43a8e240440422dff70788e3f9ef1"
+dependencies = [
+ "crossbeam-utils",
 ]
 
 [[package]]
@@ -1299,9 +1314,7 @@ dependencies = [
 
 [[package]]
 name = "fontique"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e04c4750a17111ebd77c3e0aea00476ce33f59235bc4d9e7f0aded5033ad3fc"
+version = "0.11.1"
 dependencies = [
  "hashbrown 0.17.1",
  "linebender_resource_handle",
@@ -1311,7 +1324,7 @@ dependencies = [
  "objc2-core-text",
  "objc2-foundation 0.3.2",
  "parlance",
- "read-fonts 0.40.2",
+ "read-fonts 0.41.0",
  "roxmltree",
  "smallvec",
  "windows",
@@ -1598,12 +1611,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "grid"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b40ca9252762c466af32d0b1002e91e4e1bc5398f77455e55474deb466355ff5"
-
-[[package]]
 name = "guardian"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1634,13 +1641,13 @@ dependencies = [
 
 [[package]]
 name = "harfrust"
-version = "0.10.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0589ddd0d2935dd2845827ac606b4081c266225d613b268ed2910f832889cab"
+checksum = "c03d949a14aa089bbb282f7dd76a498a7f684428e4257202efc119ec010376f9"
 dependencies = [
  "bitflags 2.13.1",
  "bytemuck",
- "read-fonts 0.40.2",
+ "read-fonts 0.41.0",
  "smallvec",
 ]
 
@@ -2004,6 +2011,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyboard-types"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fbe853b403ae61a04233030ae8a79d94975281ed9770a1f9e246732b534b28d"
+dependencies = [
+ "bitflags 2.13.1",
+ "serde",
+]
+
+[[package]]
 name = "khronos-egl"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2218,6 +2235,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "muda"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6744ab645ebe79f9c428455c7cb9dfa4275fa3b50a25408e08f927da8dc618c"
+dependencies = [
+ "crossbeam-channel",
+ "dpi",
+ "keyboard-types",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
+ "once_cell",
+ "png",
+ "thiserror 2.0.19",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "naga"
 version = "29.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2409,7 +2445,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d49e936b501e5c5bf01fda3a9452ff86dc3ea98ad5f283e1455153142d97518c"
 dependencies = [
  "bitflags 2.13.1",
+ "block2 0.6.2",
  "objc2 0.6.4",
+ "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-foundation 0.3.2",
 ]
@@ -2534,6 +2572,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
 dependencies = [
  "bitflags 2.13.1",
+ "block2 0.6.2",
  "objc2 0.6.4",
  "objc2-core-foundation",
 ]
@@ -2769,9 +2808,9 @@ checksum = "4b6937eda350acc1a5d05872c3cbf99fe78619c269096e2be3d4a350058639d5"
 
 [[package]]
 name = "parley"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0478b47dd9885a5e0a4f1c0782ffc42bf6ee8c41dea0917d7a9bcee3e6585fc"
+checksum = "22d2ff88bd3f7d68d1d9b09c7e6209f9a8e8c05088295140a2bcf2e9b17038c5"
 dependencies = [
  "fontique",
  "harfrust",
@@ -2782,14 +2821,14 @@ dependencies = [
  "linebender_resource_handle",
  "parlance",
  "parley_data",
- "skrifa 0.43.2",
+ "skrifa 0.44.0",
 ]
 
 [[package]]
 name = "parley_data"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a649e01a1acc917247ee147b56b8a1fa91824acf7117bd003b4204306d601255"
+checksum = "1567535334d6ba2d3cde19221ba9a7bd0fabb3cbd99046ddfb10ae061cfcc889"
 dependencies = [
  "icu_properties",
 ]
@@ -3053,11 +3092,11 @@ version = "0.1.0"
 dependencies = [
  "accesskit",
  "accesskit_winit",
+ "cephal",
  "parley",
  "reactive_graph",
  "reactive_stores",
  "stylo",
- "taffy",
  "thiserror 2.0.19",
  "tracing",
  "vello",
@@ -3324,9 +3363,9 @@ dependencies = [
 
 [[package]]
 name = "read-fonts"
-version = "0.40.2"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "487889119a5f19ff7c0a20637196bdc76b9f54ebec17e3588b5d75e4999f8773"
+checksum = "046a7d674daf459825b32f5062056d6882db0d2f5a479fbd76ccfc870ac18709"
 dependencies = [
  "bytemuck",
  "font-types 0.12.2",
@@ -3692,12 +3731,12 @@ dependencies = [
 
 [[package]]
 name = "skrifa"
-version = "0.43.2"
+version = "0.44.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cbe997d0f2480442d727488fbe2150779114cbe480ecdbadef58b33e0318ffb"
+checksum = "819ab7d62b1d3e72d9d9dea5650bac30424f9111364bb94928dbf5ecad1baa68"
 dependencies = [
  "bytemuck",
- "read-fonts 0.40.2",
+ "read-fonts 0.41.0",
 ]
 
 [[package]]
@@ -4046,7 +4085,7 @@ version = "0.2.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c2499c2d826531388872b2268718aed907a39bd785ab0dcfe57fab26283f92e"
 dependencies = [
- "skrifa 0.43.2",
+ "skrifa 0.44.0",
  "yazi",
  "zeno",
 ]
@@ -4082,16 +4121,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "taffy"
-version = "0.12.2"
-dependencies = [
- "arrayvec",
- "grid",
- "serde",
- "slotmap",
 ]
 
 [[package]]
@@ -5605,7 +5634,6 @@ dependencies = [
 name = "zgui"
 version = "0.1.0"
 dependencies = [
- "tracing",
  "zgui-atlas",
  "zgui-bits",
  "zgui-canvas",
@@ -5614,7 +5642,6 @@ dependencies = [
  "zgui-geom",
  "zgui-layout",
  "zgui-platform",
- "zgui-platform-drm",
  "zgui-platform-headless",
  "zgui-platform-wayland",
  "zgui-platform-winit",
@@ -5647,6 +5674,7 @@ dependencies = [
  "zgui-input",
  "zgui-interned",
  "zgui-layout",
+ "zgui-profile",
  "zgui-scene",
  "zgui-vocab",
 ]
@@ -5688,14 +5716,18 @@ name = "zgui-bench"
 version = "0.1.0"
 dependencies = [
  "zgui",
+ "zgui-a11y",
+ "zgui-dom",
  "zgui-geom",
  "zgui-layout",
+ "zgui-paint",
  "zgui-platform-headless",
  "zgui-platform-winit",
  "zgui-profile",
  "zgui-render-vector-vello",
  "zgui-render-wgpu",
  "zgui-testkit-scene",
+ "zgui-text-parley",
  "zgui-ui",
  "zgui-ui-icons",
  "zgui-ui-primitives",
@@ -5753,6 +5785,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "zgui-console"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "zgui",
+ "zgui-atlas",
+ "zgui-bits",
+ "zgui-geom",
+ "zgui-platform",
+ "zgui-platform-drm",
+ "zgui-platform-headless",
+ "zgui-profile",
+ "zgui-render",
+ "zgui-render-vector-vello",
+ "zgui-render-wgpu",
+ "zgui-runtime",
+ "zgui-scene",
+ "zgui-view",
+]
+
+[[package]]
 name = "zgui-css"
 version = "0.1.0"
 dependencies = [
@@ -5774,6 +5827,7 @@ version = "0.1.0"
 dependencies = [
  "rustc-hash 2.1.3",
  "zgui-color",
+ "zgui-css",
  "zgui-dom",
  "zgui-elements",
  "zgui-geom",
@@ -5892,6 +5946,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zgui",
+ "zgui-console",
  "zgui-devtools",
 ]
 
@@ -5955,10 +6010,10 @@ dependencies = [
 name = "zgui-layout"
 version = "0.1.0"
 dependencies = [
+ "cephal",
  "rayon",
  "rustc-hash 2.1.3",
  "smallvec",
- "taffy",
  "tracing",
  "zgui-arena",
  "zgui-bits",
@@ -5972,6 +6027,7 @@ dependencies = [
  "zgui-testkit-scene",
  "zgui-text",
  "zgui-text-style",
+ "zgui-vocab",
 ]
 
 [[package]]
@@ -6100,6 +6156,11 @@ dependencies = [
  "accesskit",
  "accesskit_winit",
  "arboard",
+ "block2 0.6.2",
+ "muda",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
  "raw-window-handle",
  "smithay-clipboard",
  "tracing",
@@ -6134,6 +6195,7 @@ dependencies = [
  "reactive_graph",
  "reactive_stores",
  "send_wrapper",
+ "smallvec",
  "thiserror 2.0.19",
  "tracing",
  "trybuild",
@@ -6175,12 +6237,14 @@ version = "0.1.0"
 dependencies = [
  "kurbo",
  "peniko",
+ "rustc-hash 2.1.3",
  "tracing",
  "vello",
  "wgpu",
  "zgui-arena",
  "zgui-atlas",
  "zgui-bits",
+ "zgui-canvas",
  "zgui-color",
  "zgui-css",
  "zgui-dom",
@@ -6193,6 +6257,7 @@ dependencies = [
  "zgui-render-vector-coverage",
  "zgui-render-wgpu",
  "zgui-scene",
+ "zgui-svg",
  "zgui-text",
  "zgui-text-parley",
  "zgui-text-style",
@@ -6207,6 +6272,7 @@ dependencies = [
  "bytemuck",
  "futures",
  "naga",
+ "rustc-hash 2.1.3",
  "tracing",
  "wgpu",
  "zgui-atlas",
@@ -6436,8 +6502,9 @@ dependencies = [
  "fontique",
  "kurbo",
  "parley",
+ "proptest",
  "rustc-hash 2.1.3",
- "skrifa 0.43.2",
+ "skrifa 0.44.0",
  "smallvec",
  "swash",
  "zgui-atlas",
@@ -6482,6 +6549,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zgui",
+ "zgui-console",
  "zgui-layout",
  "zgui-platform-headless",
  "zgui-render-vector-vello",

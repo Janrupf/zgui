@@ -46,9 +46,10 @@ fn a_drop_shadows_extent_leans_the_way_it_is_offset() {
             color: [0.0, 0.0, 0.0, 1.0],
         }],
     );
-    // Six of the six-pixel blur reach is consumed by the offset on the left, and added on the right.
-    assert_eq!(extent.origin.x, DevicePx(100.0));
-    assert_eq!(extent.right(), DevicePx(132.0));
+    // Six of the eight-pixel reach (blur plus resampling) is consumed by the offset on the left, and
+    // added on the right.
+    assert_eq!(extent.origin.x, DevicePx(98.0));
+    assert_eq!(extent.right(), DevicePx(134.0));
 }
 
 #[test]
@@ -56,8 +57,8 @@ fn a_chain_of_blurs_adds_rather_than_taking_the_largest() {
     let bounds = rect(0.0, 0.0, 10.0, 10.0);
     let one = read_extent(bounds, &[Filter::Blur(1.0)]);
     let two = read_extent(bounds, &[Filter::Blur(1.0), Filter::Blur(1.0)]);
-    assert_eq!(one.size, Size::new(DevicePx(16.0), DevicePx(16.0)));
-    assert_eq!(two.size, Size::new(DevicePx(22.0), DevicePx(22.0)));
+    assert_eq!(one.size, Size::new(DevicePx(20.0), DevicePx(20.0)));
+    assert_eq!(two.size, Size::new(DevicePx(30.0), DevicePx(30.0)));
 }
 
 /// The two records that carry a read extent must derive it the same way, because a damage

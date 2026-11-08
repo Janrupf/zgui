@@ -8,6 +8,7 @@ mod handles;
 pub(crate) use crate::surface::attributes::window as window_attributes;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use accesskit::TreeUpdate;
 use winit::dpi::{LogicalPosition, LogicalSize};
@@ -15,8 +16,10 @@ use winit::window::Window;
 use zgui_geom::{Css, CssPx, Device, DevicePx, Point, Size};
 use zgui_platform::{
     ColorScheme, CursorStyle, Decorations, FullscreenMode, GpuSurface, ResizeEdge, Surface,
-    SurfaceId, TextInput, Unsupported, WindowIcon, WindowLevel,
+    SurfaceId, TextInput, TitleButtons, Unsupported, WindowIcon, WindowLevel,
 };
+
+use crate::waker::ProxyWaker;
 
 /// A window, seen as something to draw into and interact with.
 ///
@@ -40,12 +43,43 @@ pub struct WinitSurface {
     id: SurfaceId,
     /// The window itself.
     window: Arc<Window>,
+    /// Where the window buttons sit, when the application placed them.
+    title_buttons: Option<TitleButtons>,
+    /// How a frame request reaches the loop when the platform does not deliver it.
+    waker: Arc<ProxyWaker>,
+    /// Whether the window was shown at least once.
+    shown: AtomicBool,
 }
 
 impl WinitSurface {
     /// A surface over `window`, numbered `id`, with nothing listening to it yet.
-    pub(crate) const fn new(id: SurfaceId, window: Arc<Window>) -> Self {
-        Self { id, window }
+    pub(crate) const fn new(
+        id: SurfaceId,
+        window: Arc<Window>,
+        title_buttons: Option<TitleButtons>,
+        waker: Arc<ProxyWaker>,
+    ) -> Self {
+        Self {
+            id,
+            window,
+            title_buttons,
+            waker,
+            shown: AtomicBool::new(false),
+        }
+    }
+
+    /// Puts the window buttons where the application placed them.
+    ///
+    /// The desktop lays its title bar out again after a resize, a change of focus and a change of
+    /// full screen, so the loop calls this after each.
+    pub(crate) fn place_title_buttons(&self) {
+        #[cfg(target_os = "macos")]
+        if let Some(buttons) = self.title_buttons {
+            crate::macos::place_title_buttons(&self.window, buttons);
+        }
+        // The other desktops draw their buttons in a frame of their own.
+        #[cfg(not(target_os = "macos"))]
+        let _ = self.title_buttons;
     }
 
     /// The window underneath, for the parts of the loop that have to name it.
@@ -112,7 +146,14 @@ impl Surface for WinitSurface {
     }
 
     fn request_redraw(&self) {
-        self.window.request_redraw();
+        // Windows paints only visible windows, and a surface stays hidden until its first frame
+        // presents. Until the window is shown, the loop delivers the request itself. A window that
+        // is hidden later waits for the paint that shows it again.
+        if cfg!(windows) && !self.shown.load(Ordering::Relaxed) {
+            self.waker.redraw(self.window.id());
+        } else {
+            self.window.request_redraw();
+        }
     }
 
     fn pre_present_notify(&self) {
@@ -124,6 +165,9 @@ impl Surface for WinitSurface {
     }
 
     fn set_visible(&self, visible: bool) {
+        if visible {
+            self.shown.store(true, Ordering::Relaxed);
+        }
         self.window.set_visible(visible);
     }
 
@@ -199,6 +243,11 @@ impl Surface for WinitSurface {
         // something needs the user now; a desktop that draws only one kind of attention draws that.
         self.window
             .request_user_attention(urgent.then_some(winit::window::UserAttentionType::Critical));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn title_bar_double_click(&self) {
+        crate::macos::title_bar_double_click(&self.window);
     }
 
     fn begin_move_drag(&self) -> Result<(), Unsupported> {

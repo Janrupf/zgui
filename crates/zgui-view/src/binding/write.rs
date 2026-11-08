@@ -116,11 +116,15 @@ pub fn bind_property<M>(
 
 /// Binds what this element means to an accessibility tree.
 ///
-/// The accumulator is lowered to a resolved [`Semantics`] inside the binding's own effect, so a
+/// The accumulator is lowered to a resolved [`Semantics`] inside the binding's own sink, so a
 /// property that reads a signal re-runs this and nothing else.
 pub fn bind_semantics(cx: &BuildCx<'_>, el: NodeId, a11y: A11yBinding) -> Binding {
     let dom = cx.dom_handle();
-    let value = crate::value::ReactiveValue::derive(move || a11y.lower());
+    let value = if a11y.is_constant() {
+        crate::value::ReactiveValue::Constant(a11y.lower())
+    } else {
+        crate::value::ReactiveValue::derive(move || a11y.lower())
+    };
     Binding::new(cx, value, move |semantics: &Semantics| {
         dom.set_semantics(el, Some(semantics));
     })

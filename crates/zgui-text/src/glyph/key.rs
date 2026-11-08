@@ -1,6 +1,7 @@
 //! What one rasterised glyph is cached by.
 
 use crate::font::face::FaceId;
+use crate::glyph::instance::VariationInstance;
 
 /// How far into a pixel a glyph's origin falls, quantised.
 ///
@@ -64,6 +65,8 @@ pub struct GlyphKey {
     pub glyph: u16,
     /// The size in device pixels, as bits.
     pub size_bits: u32,
+    /// The point in a variable face's design space the glyph is drawn at.
+    pub instance: VariationInstance,
     /// Where in the pixel the glyph's origin falls.
     pub offset: SubpixelOffset,
     /// How it is to be rasterised.
@@ -75,7 +78,8 @@ pub struct GlyphKey {
 }
 
 impl GlyphKey {
-    /// A key with no synthesis, which is what a face that covers the requested style needs.
+    /// A key with no synthesis at the face's default instance, which is what a static face that
+    /// covers the requested style needs.
     pub fn new(
         face: FaceId,
         glyph: u16,
@@ -87,6 +91,7 @@ impl GlyphKey {
             face,
             glyph,
             size_bits: size.to_bits(),
+            instance: VariationInstance::DEFAULT,
             offset,
             style,
             synthetic_bold_bits: 0.0f32.to_bits(),

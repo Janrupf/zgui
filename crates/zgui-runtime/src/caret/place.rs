@@ -46,6 +46,8 @@ pub fn text_box(layout: &LayoutStore, node: NodeKey) -> Option<zgui_dom::side::B
 /// Built per frame and never held: it is a reading of the current layout, and a reading kept across
 /// a frame that re-broke the paragraph would place carets on lines that are no longer there.
 pub struct Located {
+    /// The box that lays the element's text out, which its line fragments are pieces of.
+    pub owner: zgui_dom::side::BoxKey,
     /// The paragraph the element's lines belong to.
     pub paragraph: ParagraphId,
     /// The top-left corner of the inline formatting context's content box, in device pixels.
@@ -70,6 +72,10 @@ pub struct Located {
     /// paragraph's text node holds the break that ends it, and the model's buffer is built by
     /// reading those nodes straight through. So this is the whole of the way between a model offset
     /// and a run-and-offset pair.
+    ///
+    /// For a secure field the nodes hold bullets, and every "model offset" in this type is an
+    /// offset into the bullets. [`Editors::to_model`](crate::editing::Editors::to_model) and
+    /// [`Editors::shown_selection`](crate::editing::Editors::shown_selection) convert.
     pub runs: Vec<usize>,
 }
 
@@ -93,7 +99,7 @@ impl Located {
             .iter()
             .filter_map(|frag| layout.fragment(*frag))
             .find(|fragment| fragment.kind == zgui_layout::FragmentKind::Box)
-            .map(|fragment| (fragment.content_box.origin, fragment.transform))?;
+            .map(|fragment| (fragment.content_box().origin, fragment.transform))?;
         let (origin, transform) = placed;
         let geometry: Vec<LineGeometry> = resolution
             .lines
@@ -122,6 +128,7 @@ impl Located {
             })
             .collect();
         Some(Self {
+            owner: box_,
             paragraph: resolution.paragraph,
             origin,
             transform,
@@ -132,6 +139,9 @@ impl Located {
     }
 
     /// The source position an offset in the editing model's own text names.
+    ///
+    /// An offset into the text the document holds, which is the model's text for a plain field
+    /// and its bullets for a secure one.
     ///
     /// The model's text is the runs written out one after another, break characters and all: a
     /// paragraph's node holds the break that ends it, so there is nothing between two runs to

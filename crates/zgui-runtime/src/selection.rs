@@ -67,6 +67,10 @@ impl Selections {
 /// — and a selection over it is expressed in offsets into all of them. The breaks between
 /// paragraphs count as one byte each, so the offsets agree with the string those paragraphs join
 /// into, which is the string every selection, event payload and accessibility range uses.
+///
+/// A secure field holds bullets in its nodes, so this is the length of the bullets. The editing
+/// model's text is shorter or the same, and the model clamps a range against it when the selection
+/// command lands.
 pub fn text_length(store: &DocumentStore, node: NodeIndex) -> usize {
     let mut length = 0;
     let mut paragraphs = 0;

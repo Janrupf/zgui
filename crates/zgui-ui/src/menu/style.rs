@@ -5,18 +5,23 @@ use zgui::style;
 style! { pub MenuStyle =>
     // A menu is the shared surface at a list's proportions: narrow padding all round, and no gap
     // at all between the rows. They are a continuous column that the highlight travels down, and a
-    // gap between them would make it flicker off and on as the pointer crossed each seam.
+    // gap between them would make it flicker off and on as the pointer crossed each seam. It is
+    // never taller than the room left in the window, and scrolls past that.
     ":scope {
         min-width: 128px;
+        max-height: var(--zui-popper-available-height, none);
         padding: var(--zui-space-xs);
         gap: 0;
         overflow-x: hidden;
         overflow-y: auto;
     }"
     // A submenu sits over the menu that opened it rather than over the page, so it is lifted one
-    // rung further off — and it does not scroll, because a submenu long enough to need scrolling
-    // is a menu that should have been one.
-    ".zui-menu--sub { --zui-surface-shadow: var(--zui-shadow-lg); overflow: hidden; }"
+    // rung further off. It scrolls like a menu when the window has less room than it needs.
+    ".zui-menu--sub {
+        --zui-surface-shadow: var(--zui-shadow-lg);
+        overflow-x: hidden;
+        overflow-y: auto;
+    }"
 
     // The list and the typeahead both build an element that is a behaviour rather than a box.
     ".zui-menu__list, .zui-menu__keys { display: contents; }"

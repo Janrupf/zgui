@@ -6,6 +6,7 @@ use zgui_geom::{Device, DevicePx, Rect};
 use crate::group::filter::Filter;
 use crate::group::source::read_extent;
 use crate::id::{ClipId, DrawOrder};
+use crate::spatial::SpatialId;
 
 /// Where a backdrop filter's copy of what lies beneath comes from.
 ///
@@ -39,7 +40,7 @@ pub enum BackdropCapture {
 pub struct BackdropFilter {
     /// Where this draws in the painting order.
     pub order: DrawOrder,
-    /// What the filter writes.
+    /// What the filter writes, in the coordinates of [`BackdropFilter::transform`].
     pub bounds: Rect<DevicePx, Device>,
     /// What the filter **reads** from beneath it, which is [`BackdropFilter::bounds`] inflated by
     /// the chain's kernel support.
@@ -50,6 +51,11 @@ pub struct BackdropFilter {
     pub clip: ClipId,
     /// The filters applied to what lies beneath.
     pub filters: SmallVec<[Filter; 2]>,
+    /// The coordinate system the rectangles are measured in, or `None` for the device.
+    ///
+    /// The renderer maps the rectangles onto the device through the system's matrix in the frame
+    /// it draws, so a place write that moves the system moves the filter with the content.
+    pub transform: Option<SpatialId>,
     /// Whether the copy this filters may be the one kept from the last frame.
     ///
     /// Decided where the damage is grown and recorded here, because the two are one decision: a
@@ -67,8 +73,15 @@ impl BackdropFilter {
             source: read_extent(bounds, &filters),
             clip: ClipId::ROOT,
             filters,
+            transform: None,
             capture: BackdropCapture::Renewed,
         }
+    }
+
+    /// The same filter measured in the coordinate system `space`.
+    pub fn in_space(mut self, space: Option<SpatialId>) -> Self {
+        self.transform = space;
+        self
     }
 
     /// The same filter drawn through `clip`.

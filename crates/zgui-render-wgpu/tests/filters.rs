@@ -4,7 +4,7 @@ mod support;
 
 use zgui_bits::DamageSet;
 use zgui_geom::{Device, Point, Rect, Size};
-use zgui_render_wgpu::Pixels;
+use zgui_render_wgpu::{GroupPool, GroupPrecision, Pixels, TargetScale};
 use zgui_scene::{BackdropFilter, Filter, GroupBoundary, Quad, Scene};
 
 use support::{SIDE, opaque, plain_renderer, present, rect};
@@ -307,7 +307,8 @@ fn a_backdrop_filter_damages_its_source_rect_and_not_the_window() {
     // What a backdrop reads has to be inside what the frame has already redrawn, so the damage set
     // has to contain the region it samples — which is its own bounds grown by the filter's reach,
     // and not the window. The expansion is the paint stage's, and this is the shape of it: the
-    // damaged area grows by three deviations on each side and stops there.
+    // damaged area grows by three deviations plus the resampling reach on each side and stops
+    // there.
     let panel: Rect<zgui_geom::DevicePx, Device> = rect(32.0, 32.0, 64.0, 64.0);
     let backdrop = BackdropFilter::new(panel, [Filter::Blur(6.0)].into_iter().collect());
     assert!(!backdrop.reads_only_what_it_writes());
@@ -324,8 +325,8 @@ fn a_backdrop_filter_damages_its_source_rect_and_not_the_window() {
     );
     assert_eq!(
         covered.size,
-        Size::new(64 + 36, 64 + 36),
-        "and it grows by three deviations on each side rather than to the window"
+        Size::new(64 + 40, 64 + 40),
+        "and it grows by three deviations and the resampling reach on each side"
     );
     assert!(
         covered.size.width < SIDE && covered.size.height < SIDE,
@@ -363,34 +364,37 @@ fn source_rect(backdrop: &BackdropFilter) -> Rect<i32, Device> {
     )
 }
 
-/// A frosted panel over a hard edge, with the panel's own tint drawn `isolated` or straight on.
-///
-/// The two are the same picture, and that is the claim the paint stage now leans on: what a
-/// backdrop filters is beneath the box and is drawn before the box paints anything of its own, so
-/// isolating that painting changes nothing about it.
-fn frosted_panel(isolated: bool) -> Scene {
-    let panel = (32.0, 32.0, 64.0, 64.0);
+/// How many bytes one target of `format` at `scale` costs for the test surface.
+fn target_bytes(format: zgui_render_wgpu::wgpu::TextureFormat, scale: TargetScale) -> u64 {
+    let allocated = GroupPool::new(Size::new(SIDE, SIDE), 0).allocated_extent(scale);
+    u64::from(format.block_copy_size(None).unwrap_or(8))
+        * allocated.width as u64
+        * allocated.height as u64
+}
+
+/// White with red on the left half and a black square for a backdrop to frost.
+fn edge_scene(backdrop: Option<Vec<Filter>>, group: bool) -> Scene {
     let mut scene = Scene::new();
     scene.begin_frame(Size::new(SIDE, SIDE));
     quad(&mut scene, (0.0, 0.0, SIDE as f32, SIDE as f32), [255; 3]);
-    quad(&mut scene, (0.0, 0.0, 64.0, SIDE as f32), [0, 0, 0]);
-    scene.push_backdrop(BackdropFilter::new(
-        rect(panel.0, panel.1, panel.2, panel.3),
-        [Filter::Blur(6.0)].into_iter().collect(),
-    ));
-    let boundary = isolated.then(|| {
-        let boundary = GroupBoundary::start(
-            rect(panel.0, panel.1, panel.2, panel.3),
-            1.0,
-            zgui_scene::peniko::BlendMode::default(),
-            Default::default(),
-        );
+    let boundary = GroupBoundary::start(
+        rect(0.0, 0.0, SIDE as f32, SIDE as f32),
+        1.0,
+        zgui_scene::peniko::BlendMode::default(),
+        Default::default(),
+    );
+    if group {
         scene.push_group(boundary.clone());
-        boundary
-    });
-    // The panel's own painting: a border, which is the shape a scrim's tint has.
-    quad(&mut scene, (panel.0, panel.1, panel.2, 4.0), [200, 40, 40]);
-    if let Some(boundary) = boundary {
+    }
+    quad(&mut scene, (0.0, 0.0, 64.0, SIDE as f32), [255, 0, 0]);
+    quad(&mut scene, (40.0, 40.0, 16.0, 16.0), [0, 0, 0]);
+    if let Some(filters) = backdrop {
+        scene.push_backdrop(BackdropFilter::new(
+            rect(32.0, 32.0, 64.0, 64.0),
+            filters.into_iter().collect(),
+        ));
+    }
+    if group {
         scene.push_group(boundary.end());
     }
     scene.finish(&DamageSet::full());
@@ -398,25 +402,143 @@ fn frosted_panel(isolated: bool) -> Scene {
 }
 
 #[test]
-fn isolating_a_backdrop_filters_own_painting_draws_the_same_picture() {
-    // Why the paint stage stopped giving one a target of its own. A `backdrop-filter` used to force
-    // an isolated target however plain the box was, and on the 32-bit target that target cost 189
-    // ms per damage rectangle — a full-window half-float allocation for a scrim that paints one
-    // flat quad. It is only legitimate to drop because of this: the two are the same pixels.
-    let Some((mut with, mut without)) = support::renderer_pair() else {
+fn a_backdrop_the_budget_cannot_copy_at_full_resolution_is_left_unfiltered() {
+    // A copy into a target of another resolution puts every texel at the wrong place, which draws
+    // the panel's content shifted. An unfiltered panel is the content it was meant to frost.
+    let Some(mut renderer) = plain_renderer() else {
         return;
     };
-    let isolated = present(&mut with, &frosted_panel(true));
-    let direct = present(&mut without, &frosted_panel(false));
-    assert_eq!(
-        isolated.max_difference(&direct),
-        0,
-        "isolating the panel's own painting changed the picture"
+    let format = zgui_render_wgpu::wgpu::TextureFormat::Bgra8Unorm;
+    renderer.set_group_budget(target_bytes(format, TargetScale::Full) - 1);
+    let frosted = present(
+        &mut renderer,
+        &edge_scene(Some(vec![Filter::Blur(4.0)]), false),
     );
-    // And the fixture has to be one where there is something to change.
-    assert_eq!(direct.rgba(34, 34)[0], 200, "the panel's own tint is drawn");
+    assert_eq!(renderer.groups().degraded(), 0, "no lease was reduced");
+    let plain = present(&mut renderer, &edge_scene(None, false));
+    assert_eq!(
+        frosted.max_difference(&plain),
+        0,
+        "the backdrop drew nothing, so the frame is the content beneath it"
+    );
+}
+
+#[test]
+fn a_backdrop_in_a_half_resolution_group_frosts_what_is_beneath_it_in_place() {
+    // A group the budget reduced to half resolution holds its texels at half the device
+    // coordinates. The copy for a backdrop inside it is at the same resolution and copies the same
+    // texels, so the frosted panel shows the content at its own place.
+    let Some(mut renderer) = plain_renderer() else {
+        return;
+    };
+    // Room for the half-resolution group and a half-resolution copy, and none for a full group.
+    // The budget counts sixteen-bit targets, so the plain group keeps that format.
+    renderer.set_group_budget(3 * target_bytes(GroupPool::FORMAT, TargetScale::Half));
+    renderer.set_group_precision(GroupPrecision::High);
+    let gray = vec![Filter::Grayscale(1.0)];
+    let frosted = present(&mut renderer, &edge_scene(Some(gray), true));
     assert!(
-        (direct.rgba(64, 64)[0] as i32 - 128).abs() <= 12,
-        "and the backdrop under it is still frosted"
+        renderer.groups().degraded() >= 1,
+        "the group is at half resolution"
+    );
+    let unfrosted = present(&mut renderer, &edge_scene(None, true));
+
+    // Inside the panel the red is gray and the black square is still where it was drawn.
+    let red = frosted.rgba(36, 80);
+    assert!(
+        red[0].abs_diff(red[1]) <= 4
+            && red[1].abs_diff(red[2]) <= 4
+            && (30..=110).contains(&red[0]),
+        "the red half under the panel is gray: {red:?}"
+    );
+    assert!(
+        frosted.rgba(48, 48)[0] < 32,
+        "the black square stays in place"
+    );
+    assert!(
+        frosted.rgba(72, 72)[0] > 220,
+        "and white stays white where nothing dark was drawn"
+    );
+    // Outside the panel nothing changes.
+    assert_eq!(frosted.rgba(16, 16), unfrosted.rgba(16, 16));
+    assert_eq!(frosted.rgba(110, 110), unfrosted.rgba(110, 110));
+}
+
+/// A group marker over `bounds` that changes nothing about its content.
+fn identity_group(bounds: (f32, f32, f32, f32)) -> GroupBoundary {
+    GroupBoundary::start(
+        rect(bounds.0, bounds.1, bounds.2, bounds.3),
+        1.0,
+        zgui_scene::peniko::BlendMode::default(),
+        Default::default(),
+    )
+}
+
+#[test]
+fn a_backdrop_in_a_group_reads_transparent_past_the_group() {
+    // The group's first pass clears all of its target, so what the blur reads above the group is
+    // transparent and belongs to no earlier frame.
+    let Some(mut renderer) = plain_renderer() else {
+        return;
+    };
+    let mut scene = Scene::new();
+    scene.begin_frame(Size::new(SIDE, SIDE));
+    quad(&mut scene, (0.0, 0.0, SIDE as f32, SIDE as f32), [255; 3]);
+    let group = identity_group((32.0, 32.0, 64.0, 64.0));
+    scene.push_group(group.clone());
+    quad(&mut scene, (32.0, 32.0, 64.0, 64.0), [0, 0, 0]);
+    scene.push_backdrop(BackdropFilter::new(
+        rect(32.0, 32.0, 64.0, 16.0),
+        [Filter::Blur(4.0)].into_iter().collect(),
+    ));
+    scene.push_group(group.end());
+    scene.finish(&DamageSet::full());
+
+    let pixels = present(&mut renderer, &scene);
+    assert!(
+        pixels.rgba(64, 64)[0] < 8,
+        "below the backdrop the group is black"
+    );
+    assert_eq!(
+        pixels.rgba(16, 16),
+        [255, 255, 255, 255],
+        "outside it is white"
+    );
+    assert_eq!(renderer.groups().lent(), 0);
+}
+
+#[test]
+fn a_backdrop_first_in_a_group_frosts_nothing_the_last_lease_left() {
+    // The second group reuses the first group's target. Nothing is drawn into it before the
+    // backdrop, so it still holds the red the first group drew there.
+    let Some(mut renderer) = plain_renderer() else {
+        return;
+    };
+    let mut scene = Scene::new();
+    scene.begin_frame(Size::new(SIDE, SIDE));
+    quad(&mut scene, (0.0, 0.0, SIDE as f32, SIDE as f32), [255; 3]);
+    let first = identity_group((0.0, 0.0, 64.0, SIDE as f32));
+    scene.push_group(first.clone());
+    quad(&mut scene, (0.0, 0.0, 64.0, SIDE as f32), [255, 0, 0]);
+    scene.push_group(first.end());
+    let second = identity_group((64.0, 0.0, 64.0, SIDE as f32));
+    scene.push_group(second.clone());
+    scene.push_backdrop(BackdropFilter::new(
+        rect(64.0, 0.0, 64.0, SIDE as f32),
+        [Filter::Blur(4.0)].into_iter().collect(),
+    ));
+    quad(&mut scene, (100.0, 100.0, 8.0, 8.0), [0, 0, 0]);
+    scene.push_group(second.end());
+    scene.finish(&DamageSet::full());
+
+    let pixels = present(&mut renderer, &scene);
+    assert_eq!(
+        pixels.rgba(66, 64),
+        [255, 255, 255, 255],
+        "no red of the first group bleeds into the second"
+    );
+    assert!(
+        pixels.rgba(104, 104)[0] < 8,
+        "and the second group's own content is drawn"
     );
 }

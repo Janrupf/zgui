@@ -318,6 +318,109 @@ fn an_alert_dialog_is_announced_as_one_and_still_answers_escape() {
 }
 
 #[test]
+fn the_answers_of_an_alert_dialog_run_the_callers_click_while_it_is_still_open() {
+    let harness = Harness::open();
+    let open = RwSignal::new_local(true);
+    let seen = RwSignal::new_local(Vec::<(&'static str, bool)>::new());
+    harness.mount(move || {
+        view! {
+            AlertDialog(open = open) {
+                AlertDialogContent {
+                    AlertDialogTitle {"Delete this project?"}
+                    AlertDialogFooter {
+                        AlertDialogCancel(
+                            on:click = move |_| seen.update(|s| s.push(("cancel", open.get_untracked())))
+                        ) {"Keep it"}
+                        AlertDialogAction(
+                            on:click = move |_| seen.update(|s| s.push(("action", open.get_untracked())))
+                        ) {"Delete"}
+                    }
+                }
+            }
+        }
+    });
+    let answer = |label: &str| {
+        every(&harness, "zui-button")
+            .into_iter()
+            .find(|node| harness.window.dom.tree().text_content(*node) == label)
+            .expect("the answer stands")
+    };
+    harness.click(answer("Delete"));
+    assert!(!open.get_untracked());
+    open.set(true);
+    settle(&harness);
+    harness.click(answer("Keep it"));
+    assert!(!open.get_untracked());
+    assert_eq!(
+        seen.get_untracked(),
+        [("action", true), ("cancel", true)],
+        "each answer acts on the dialog that is still open, then closes it"
+    );
+}
+
+#[test]
+fn a_disabled_answer_shows_as_disabled_and_leaves_its_dialog_open() {
+    let harness = Harness::open();
+    let open = RwSignal::new_local(true);
+    let pending = RwSignal::new_local(true);
+    let closed = RwSignal::new_local(true);
+    harness.mount(move || {
+        view! {
+            column {
+                AlertDialog(open = open) {
+                    AlertDialogContent {
+                        AlertDialogTitle {"Delete this project?"}
+                        AlertDialogFooter {
+                            AlertDialogCancel(disabled = pending) {"Keep it"}
+                            AlertDialogAction(disabled = pending) {"Delete"}
+                        }
+                    }
+                }
+                Dialog(open = closed) {
+                    DialogContent {
+                        DialogTitle {"Rename project"}
+                        DialogFooter {DialogClose(disabled = pending) {"Cancel"}}
+                    }
+                }
+            }
+        }
+    });
+    let answer = |label: &str| {
+        every(&harness, "zui-button")
+            .into_iter()
+            .find(|node| harness.window.dom.tree().text_content(*node) == label)
+            .expect("the answer stands")
+    };
+    for label in ["Keep it", "Delete", "Cancel"] {
+        let node = answer(label);
+        assert!(
+            harness.state(node).contains(UiState::DISABLED),
+            "{label} is not disabled"
+        );
+        harness.click(node);
+        settle(&harness);
+    }
+    assert!(
+        open.get_untracked(),
+        "a disabled answer closed the alert dialog"
+    );
+    assert!(
+        closed.get_untracked(),
+        "a disabled close control closed the dialog"
+    );
+
+    pending.set(false);
+    settle(&harness);
+    harness.click(answer("Delete"));
+    assert!(
+        !open.get_untracked(),
+        "the answer closes the dialog once it is enabled"
+    );
+    harness.click(answer("Cancel"));
+    assert!(!closed.get_untracked(), "and so does the close control");
+}
+
+#[test]
 fn a_control_inside_a_dialog_closes_it_without_anything_being_threaded_down_to_it() {
     let harness = Harness::open();
     harness.mount(|| view! { ADialog() });
@@ -370,6 +473,24 @@ fn a_sheet_says_which_edge_it_came_in_from_and_a_drawer_always_says_bottom() {
             .flags
             .contains(SemanticFlags::HIDDEN),
         "the grab bar is a picture of an affordance, not something to announce"
+    );
+}
+
+#[test]
+fn only_a_drawer_from_the_bottom_mounts_its_grab_handle() {
+    let harness = Harness::open();
+    harness.mount(|| {
+        view! {
+            Drawer(default_open = true) {
+                DrawerContent(direction = SheetSide::Right) {DrawerTitle {"Filters"}}
+            }
+        }
+    });
+
+    expect(&harness, "zui-drawer");
+    assert!(
+        find(&harness, "zui-drawer__handle").is_none(),
+        "a drawer down the side cannot be pulled, so it has no handle"
     );
 }
 
@@ -551,6 +672,52 @@ fn a_tooltip_costs_one_timer_and_appears_only_once_the_delay_has_run_out() {
 }
 
 #[test]
+fn a_tooltip_hands_over_after_the_one_showing_has_gone_with_its_trigger() {
+    // The group remembers the surface that opened last. A list that re-renders takes that
+    // surface's trigger away, and the next tooltip to open must find nothing to hand over from
+    // rather than reach into a scope that is gone.
+    let harness = Harness::open();
+    let first = RwSignal::new(true);
+    harness.mount(move || {
+        view! {
+            TooltipProvider(delay = Duration::ZERO, close_delay = Duration::ZERO) {
+                if move || first.get() {
+                    Tooltip {
+                        TooltipTrigger {Button {"A"}}
+                        TooltipContent {"Alpha"}
+                    }
+                } else {}
+                Tooltip {
+                    TooltipTrigger {Button {"B"}}
+                    TooltipContent {"Beta"}
+                }
+            }
+        }
+    });
+    let triggers = harness.find_all("zui-tooltip__trigger");
+    point_at(&harness, triggers[0], EventKind::PointerEnter, 0.0, 0.0);
+    assert!(
+        find(&harness, "zui-tooltip").is_some(),
+        "the first one opened"
+    );
+
+    first.set(false);
+    harness.window.frame();
+    let triggers = harness.find_all("zui-tooltip__trigger");
+    assert_eq!(triggers.len(), 1, "the first trigger went away");
+    point_at(&harness, triggers[0], EventKind::PointerEnter, 0.0, 0.0);
+    assert!(
+        harness
+            .window
+            .dom
+            .tree()
+            .text_content(expect(&harness, "zui-tooltip"))
+            .contains("Beta"),
+        "the second one opened"
+    );
+}
+
+#[test]
 fn a_pointer_that_leaves_before_the_delay_runs_out_raises_no_tooltip_at_all() {
     let harness = Harness::open();
     harness.mount(|| {
@@ -615,6 +782,29 @@ fn focusing_a_tooltip_trigger_shows_it_without_waiting() {
     );
     harness.window.frame();
     assert!(find(&harness, "zui-tooltip").is_some());
+}
+
+#[test]
+fn a_trigger_the_program_focused_raises_nothing() {
+    // A modal surface focuses its first control as it opens. The control was reached by the
+    // surface rather than by a reader, so its label stays down.
+    let harness = Harness::open();
+    harness.mount(|| {
+        view! {
+            Tooltip(delay = Duration::ZERO) {
+                TooltipTrigger {Button {"B"}}
+                TooltipContent {"Bold"}
+            }
+        }
+    });
+    let trigger = harness.find("zui-tooltip__trigger");
+    harness.window.dispatcher().send_to(
+        trigger,
+        EventKind::FocusIn,
+        Payload::Focus(FocusEvent::new(FocusCause::Programmatic)),
+    );
+    harness.window.frame();
+    assert!(find(&harness, "zui-tooltip").is_none());
 }
 
 #[test]
@@ -949,6 +1139,49 @@ fn a_submenu_opens_on_the_right_arrow_and_closes_on_the_left_without_closing_the
 }
 
 #[test]
+fn a_press_on_a_submenu_trigger_opens_it_at_once_and_keeps_it_open() {
+    let harness = Harness::open();
+    harness.mount(|| {
+        view! {
+            DropdownMenu(default_open = true) {
+                DropdownMenuContent {
+                    MenuSub {
+                        MenuSubTrigger {"Export as"}
+                        MenuSubContent {MenuItem {"PDF"}}
+                    }
+                }
+            }
+        }
+    });
+    let trigger = every(&harness, "zui-menu__item")
+        .into_iter()
+        .find(|node| {
+            harness
+                .window
+                .dom
+                .tree()
+                .text_content(*node)
+                .starts_with("Export as")
+        })
+        .expect("the submenu's trigger");
+    assert!(find(&harness, "zui-menu--sub").is_none());
+
+    harness.click(trigger);
+    harness.window.frame();
+    expect(&harness, "zui-menu--sub");
+    assert_eq!(harness.semantics(trigger).expanded, Some(true));
+
+    harness.click(trigger);
+    harness.window.advance(Duration::from_millis(500));
+    settle(&harness);
+    assert!(
+        find(&harness, "zui-menu--sub").is_some(),
+        "a second press keeps the branch open"
+    );
+    assert!(find(&harness, "zui-menu").is_some(), "and the menu with it");
+}
+
+#[test]
 fn a_pointer_cutting_the_corner_toward_a_submenu_does_not_close_it() {
     // The safe corridor, driven rather than computed: the pointer leaves the trigger heading for
     // the submenu, and the submenu is still there afterwards.
@@ -1061,6 +1294,46 @@ fn a_press_of_the_secondary_button_asks_for_a_context_menu_too() {
     );
     harness.window.frame();
     assert!(find(&harness, "zui-menu").is_some());
+}
+
+/// A row inside a context menu region that hands out the place of the region's menu.
+#[component]
+fn PlacedRow(
+    /// Where the row puts the place.
+    held: std::rc::Rc<std::cell::Cell<Option<ContextMenuPlace>>>,
+) -> impl IntoView {
+    held.set(ContextMenuPlace::current());
+    view! { text {"A row"} }
+}
+
+#[test]
+fn a_region_opens_its_context_menu_at_a_point_it_names() {
+    // A key opens no menu by itself. The region names the item the keyboard is on, so the menu
+    // stands beside that item.
+    let harness = Harness::open();
+    let held = std::rc::Rc::new(std::cell::Cell::new(None));
+    let handed = std::rc::Rc::clone(&held);
+    harness.mount(move || {
+        let handed = std::rc::Rc::clone(&handed);
+        view! {
+            ContextMenu {
+                ContextMenuTrigger {PlacedRow(held = handed)}
+                ContextMenuContent {MenuItem {"Copy"}}
+            }
+        }
+    });
+    let area = harness.find("zui-context-menu__area");
+    harness.window.place(area, 40.0, 20.0, 400.0, 200.0);
+    assert!(find(&harness, "zui-menu").is_none());
+
+    let place = held.get().expect("the trigger provides its place");
+    place.open_at(Point::new(zgui::geom::CssPx(90.0), zgui::geom::CssPx(50.0)));
+    harness.window.frame();
+    assert!(find(&harness, "zui-menu").is_some());
+    let anchor = harness.find("zui-context-menu__anchor");
+    let tree = harness.window.dom.tree();
+    assert_eq!(tree.style_property(anchor, "left").as_deref(), Some("50px"));
+    assert_eq!(tree.style_property(anchor, "top").as_deref(), Some("30px"));
 }
 
 // ---- select, combobox, command --------------------------------------------------------------------
@@ -1203,6 +1476,143 @@ fn a_select_shows_its_value_on_a_trigger_whose_list_has_never_been_opened() {
 }
 
 #[test]
+fn a_native_select_with_a_placeholder_shows_it_until_something_is_chosen() {
+    let harness = Harness::open();
+    let reason = harness
+        .window
+        .scope
+        .with(|| RwSignal::new_local(String::new()));
+    harness.mount(move || {
+        view! {
+            column {
+                NativeSelect(value = reason, placeholder = "Choose…", a11y:label = "Reason") {
+                    NativeSelectOption(value = "a") {"A"}
+                    NativeSelectOption(value = "b") {"B"}
+                }
+                NativeSelect(a11y:label = "Plain") {
+                    NativeSelectOption(value = "c") {"C"}
+                    NativeSelectOption(value = "d") {"D"}
+                }
+            }
+        }
+    });
+    settle(&harness);
+    let tree = harness.window.dom.tree();
+    let values = every(&harness, "zui-native-select__value");
+    assert_eq!(tree.text_content(values[0]), "Choose…");
+    assert!(
+        harness
+            .state(values[0])
+            .contains(UiState::PLACEHOLDER_SHOWN)
+    );
+    assert_eq!(
+        tree.text_content(values[1]),
+        "C",
+        "with no placeholder, the first option's text shows"
+    );
+
+    harness.window.scope.with(|| reason.set("b".to_owned()));
+    settle(&harness);
+    let tree = harness.window.dom.tree();
+    assert_eq!(tree.text_content(values[0]), "B");
+    assert!(
+        !harness
+            .state(values[0])
+            .contains(UiState::PLACEHOLDER_SHOWN)
+    );
+}
+
+/// A select whose third option starts chosen.
+#[component]
+fn AChosenSelect() -> impl IntoView {
+    view! {
+        Select(default_value = "c") {
+            SelectTrigger(label = "Letter") {SelectValue()}
+            SelectContent {
+                SelectItem(value = "a") {"A"}
+                SelectItem(value = "b") {"B"}
+                SelectItem(value = "c") {"C"}
+                SelectItem(value = "d") {"D"}
+            }
+        }
+    }
+}
+
+/// A native select whose third option starts chosen.
+#[component]
+fn AChosenNativeSelect() -> impl IntoView {
+    view! {
+        NativeSelect(default_value = "c", a11y:label = "Letter") {
+            NativeSelectOption(value = "a") {"A"}
+            NativeSelectOption(value = "b") {"B"}
+            NativeSelectOption(value = "c") {"C"}
+            NativeSelectOption(value = "d") {"D"}
+        }
+    }
+}
+
+/// Opens a chooser with `open` on its trigger, and asserts that the chosen option is the active
+/// one and that ↓ then moves to the option after it.
+fn opens_on_the_chosen_option<V: IntoView + 'static>(
+    view: fn() -> V,
+    trigger_class: &str,
+    option_class: &str,
+    open: fn(&Harness, NodeId),
+) {
+    let harness = Harness::open();
+    harness.mount(view);
+    let trigger = harness.find(trigger_class);
+    open(&harness, trigger);
+    settle(&harness);
+    let options = every(&harness, option_class);
+    assert_eq!(options.len(), 4, "the list opened");
+    harness.window.host.set_tree_order(options.clone());
+    assert_eq!(
+        harness.semantics(trigger).relations.active_descendant,
+        Some(related(options[2])),
+        "the list opened on the chosen option"
+    );
+
+    harness.press(trigger, NamedKey::ArrowDown);
+    assert_eq!(
+        harness.semantics(trigger).relations.active_descendant,
+        Some(related(options[3])),
+        "the down arrow moved on from the chosen option"
+    );
+}
+
+/// Opens a chooser by pressing ↓ on its trigger.
+fn arrow_down(harness: &Harness, trigger: NodeId) {
+    harness.press(trigger, NamedKey::ArrowDown);
+}
+
+#[test]
+fn a_select_opened_by_a_click_opens_on_its_chosen_option() {
+    let view = || view! { AChosenSelect() };
+    opens_on_the_chosen_option(view, "zui-select", "zui-select__item", Harness::click);
+}
+
+#[test]
+fn a_select_opened_by_the_arrow_key_opens_on_its_chosen_option() {
+    let view = || view! { AChosenSelect() };
+    opens_on_the_chosen_option(view, "zui-select", "zui-select__item", arrow_down);
+}
+
+#[test]
+fn a_native_select_opened_by_a_click_opens_on_its_chosen_option() {
+    let view = || view! { AChosenNativeSelect() };
+    let (trigger, option) = ("zui-native-select", "zui-native-select__option");
+    opens_on_the_chosen_option(view, trigger, option, Harness::click);
+}
+
+#[test]
+fn a_native_select_opened_by_the_arrow_key_opens_on_its_chosen_option() {
+    let view = || view! { AChosenNativeSelect() };
+    let (trigger, option) = ("zui-native-select", "zui-native-select__option");
+    opens_on_the_chosen_option(view, trigger, option, arrow_down);
+}
+
+#[test]
 fn a_select_jumps_to_the_ends_and_leaves_without_choosing_on_escape() {
     let (harness, value, trigger, options) = open_select();
 
@@ -1294,6 +1704,72 @@ fn typing_in_a_combobox_narrows_the_list_to_what_is_left_and_nothing_else_is_mou
     );
 }
 
+/// A combobox over four countries, two of which contain "an".
+#[component]
+fn ACountryCombobox(
+    /// Which value starts chosen; none when empty.
+    #[prop(into, default = String::new())]
+    default_value: String,
+) -> impl IntoView {
+    view! {
+        Combobox(default_value = default_value) {
+            ComboboxInput(placeholder = "Search", label = "Country")
+            ComboboxContent {
+                ComboboxItem(value = "de", text = "Germany") {"Germany"}
+                ComboboxItem(value = "fr", text = "France") {"France"}
+                ComboboxItem(value = "ie", text = "Ireland") {"Ireland"}
+                ComboboxItem(value = "it", text = "Italy") {"Italy"}
+            }
+        }
+    }
+}
+
+#[test]
+fn a_combobox_field_shows_the_text_of_what_was_chosen() {
+    let harness = Harness::open();
+    harness.mount(|| view! { ACountryCombobox() });
+    let field = harness.find("zui-combobox__input");
+
+    harness.type_char(field, 'a');
+    harness.type_char(field, 'n');
+    let left = every(&harness, "zui-select__item");
+    assert_eq!(left.len(), 3, "Germany, France and Ireland contain `an`");
+    harness.click(left[0]);
+    settle(&harness);
+
+    assert!(
+        find(&harness, "zui-combobox__list").is_none(),
+        "choosing closed the list"
+    );
+    assert_eq!(harness.window.dom.tree().text_content(field), "Germany");
+
+    harness.press(field, NamedKey::ArrowDown);
+    assert_eq!(
+        every(&harness, "zui-select__item").len(),
+        4,
+        "the list opened again shows every option"
+    );
+    assert_eq!(harness.window.dom.tree().text_content(field), "Germany");
+}
+
+#[test]
+fn escape_puts_the_chosen_text_back_in_a_combobox_field() {
+    let harness = Harness::open();
+    harness.mount(|| view! { ACountryCombobox(default_value = "it") });
+    let field = harness.find("zui-combobox__input");
+    assert_eq!(
+        harness.window.dom.tree().text_content(field),
+        "Italy",
+        "a value chosen before the list ever opened reads as its option's text"
+    );
+
+    harness.type_char(field, 'x');
+    assert_ne!(harness.window.dom.tree().text_content(field), "Italy");
+    harness.press(field, NamedKey::Escape);
+    settle(&harness);
+    assert_eq!(harness.window.dom.tree().text_content(field), "Italy");
+}
+
 #[test]
 fn a_combobox_field_points_at_the_option_the_arrow_keys_are_on() {
     let harness = Harness::open();
@@ -1362,6 +1838,71 @@ fn a_command_palette_runs_what_enter_lands_on_and_stays_where_it_is() {
         Some(related(options[1])),
         "the list is still there and the arrow keys still walk it"
     );
+}
+
+#[test]
+fn a_command_palette_draws_no_combobox_frame_and_no_tick() {
+    let harness = Harness::open();
+    harness.mount(|| {
+        view! {
+            Command {
+                CommandInput(placeholder = "Type a command…", label = "Command")
+                CommandList {
+                    CommandItem(value = "a") {"Calendar"}
+                    CommandItem(value = "b") {"Search"}
+                }
+            }
+        }
+    });
+    assert!(find(&harness, "zui-input-group").is_none(), "no frame");
+    assert!(find(&harness, "zui-combobox__mark").is_none(), "no chevron");
+    let field = expect(&harness, "zui-command__input");
+    assert_eq!(harness.semantics(field).role, Role::ComboBox);
+
+    harness.press(field, NamedKey::Enter);
+    settle(&harness);
+    assert!(
+        find(&harness, "zui-select__indicator").is_none(),
+        "a command that ran is not marked as chosen"
+    );
+    assert_eq!(every(&harness, "zui-command__item").len(), 2);
+}
+
+#[test]
+fn a_command_group_that_the_filter_empties_hides_with_its_heading_and_separator() {
+    let harness = Harness::open();
+    harness.mount(|| {
+        view! {
+            Command {
+                CommandInput()
+                CommandList {
+                    CommandGroup(label = "A") {CommandItem(value = "x") {"x"}}
+                    CommandSeparator()
+                    CommandGroup(label = "B") {CommandItem(value = "y") {"y"}}
+                    CommandEmpty {"None"}
+                }
+            }
+        }
+    });
+    let field = expect(&harness, "zui-combobox__input");
+    let groups = every(&harness, "zui-command__group");
+    let hidden = |group: NodeId| attribute(&harness, group, "hidden").is_some();
+    assert!(!hidden(groups[0]) && !hidden(groups[1]));
+    assert!(find(&harness, "zui-menu__separator").is_some());
+
+    for character in "zzz".chars() {
+        harness.type_char(field, character);
+    }
+    assert!(hidden(groups[0]) && hidden(groups[1]), "both groups hide");
+    assert!(find(&harness, "zui-menu__separator").is_none());
+    assert!(find(&harness, "zui-combobox__empty").is_some());
+
+    for _ in 0..3 {
+        harness.press(field, NamedKey::Backspace);
+    }
+    harness.type_char(field, 'x');
+    assert!(!hidden(groups[0]), "the group with a match shows");
+    assert!(hidden(groups[1]), "the group without one stays hidden");
 }
 
 #[test]

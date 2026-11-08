@@ -10,6 +10,7 @@ struct Shadow {
     order: u32,
     blur: f32,
     bounds: Bounds,
+    shape_bounds: Bounds,
     radii: Radii,
     element_bounds: Bounds,
     element_radii: Radii,
@@ -23,9 +24,9 @@ struct Shadow {
 
 @group(1) @binding(0) var shadows: texture_2d<u32>;
 
-/// One shadow, which spans 9 texels of the arena.
+/// One `Shadow`, which the arena pads to 10 texels.
 fn load_shadow(slot: u32) -> Shadow {
-    let base = slot * 9u;
+    let base = slot * 10u;
     let t0 = textureLoad(shadows, table_texel(base + 0u), 0);
     let t1 = textureLoad(shadows, table_texel(base + 1u), 0);
     let t2 = textureLoad(shadows, table_texel(base + 2u), 0);
@@ -35,89 +36,39 @@ fn load_shadow(slot: u32) -> Shadow {
     let t6 = textureLoad(shadows, table_texel(base + 6u), 0);
     let t7 = textureLoad(shadows, table_texel(base + 7u), 0);
     let t8 = textureLoad(shadows, table_texel(base + 8u), 0);
+    let t9 = textureLoad(shadows, table_texel(base + 9u), 0);
     return Shadow(
         t0.x,
         bitcast<f32>(t0.y),
         Bounds(bitcast<f32>(t0.z), bitcast<f32>(t0.w), bitcast<f32>(t1.x), bitcast<f32>(t1.y)),
-        Radii(bitcast<f32>(t1.z), bitcast<f32>(t1.w), bitcast<f32>(t2.x), bitcast<f32>(t2.y), bitcast<f32>(t2.z), bitcast<f32>(t2.w), bitcast<f32>(t3.x), bitcast<f32>(t3.y)),
-        Bounds(bitcast<f32>(t3.z), bitcast<f32>(t3.w), bitcast<f32>(t4.x), bitcast<f32>(t4.y)),
-        Radii(bitcast<f32>(t4.z), bitcast<f32>(t4.w), bitcast<f32>(t5.x), bitcast<f32>(t5.y), bitcast<f32>(t5.z), bitcast<f32>(t5.w), bitcast<f32>(t6.x), bitcast<f32>(t6.y)),
-        Rgba(bitcast<f32>(t6.z), bitcast<f32>(t6.w), bitcast<f32>(t7.x), bitcast<f32>(t7.y)),
-        t7.z,
-        t7.w,
-        t8.x,
-        bitcast<f32>(t8.y),
+        Bounds(bitcast<f32>(t1.z), bitcast<f32>(t1.w), bitcast<f32>(t2.x), bitcast<f32>(t2.y)),
+        Radii(bitcast<f32>(t2.z), bitcast<f32>(t2.w), bitcast<f32>(t3.x), bitcast<f32>(t3.y), bitcast<f32>(t3.z), bitcast<f32>(t3.w), bitcast<f32>(t4.x), bitcast<f32>(t4.y)),
+        Bounds(bitcast<f32>(t4.z), bitcast<f32>(t4.w), bitcast<f32>(t5.x), bitcast<f32>(t5.y)),
+        Radii(bitcast<f32>(t5.z), bitcast<f32>(t5.w), bitcast<f32>(t6.x), bitcast<f32>(t6.y), bitcast<f32>(t6.z), bitcast<f32>(t6.w), bitcast<f32>(t7.x), bitcast<f32>(t7.y)),
+        Rgba(bitcast<f32>(t7.z), bitcast<f32>(t7.w), bitcast<f32>(t8.x), bitcast<f32>(t8.y)),
+        t8.z,
+        t8.w,
+        t9.x,
+        bitcast<f32>(t9.y),
     );
 }
 
-// The record travels with the vertices rather than being fetched again per fragment.
-//
-// It is one value for the whole instance, so the four vertices already know all of it — and the
-// fragment shader was reading all nine of its texels again for every pixel it covered. On a device
-// whose tables are textures those nine fetches were 42% of the composition pass, three times what
-// the whole blur integral costs. Flat interpolation is the same value delivered without them.
 struct ShadowVarying {
     @builtin(position) position: vec4<f32>,
+    // The point, from the shadow's origin in the space it was encoded in.
     @location(0) local: vec2<f32>,
-    @location(1) @interpolate(flat) bounds: vec4<f32>,
-    @location(2) @interpolate(flat) radii_near: vec4<f32>,
-    @location(3) @interpolate(flat) radii_far: vec4<f32>,
-    @location(4) @interpolate(flat) element_bounds: vec4<f32>,
-    @location(5) @interpolate(flat) element_radii_near: vec4<f32>,
-    @location(6) @interpolate(flat) element_radii_far: vec4<f32>,
-    @location(7) @interpolate(flat) color: vec4<f32>,
-    // The clip's own box, and in `misc` the blur, whether the shadow is inset, and how many
-    // rounded tests the clip carries. The clip is read here for the same reason the record is:
-    // nearly every primitive is clipped by nothing but a box, and answering that per fragment was
-    // two more texture reads for a result the whole instance shares.
-    @location(8) @interpolate(flat) clip_box: vec4<f32>,
-    @location(9) @interpolate(flat) misc: vec4<f32>,
-    @location(10) @interpolate(flat) shift: vec2<f32>,
-    @location(11) @interpolate(flat) shape: f32,
-}
-
-// The record put back together from what the vertices carried.
-//
-// `order`, `transform` and `reserved` are the vertex stage's alone — one decides nothing here, one
-// has already been applied to the position, and one is padding — so they are not carried and are
-// filled with zero.
-fn shadow_of(in: ShadowVarying) -> Shadow {
-    return Shadow(
-        0u,
-        in.misc.x,
-        Bounds(in.bounds.x, in.bounds.y, in.bounds.z, in.bounds.w),
-        Radii(
-            in.radii_near.x, in.radii_near.y, in.radii_near.z, in.radii_near.w,
-            in.radii_far.x, in.radii_far.y, in.radii_far.z, in.radii_far.w,
-        ),
-        Bounds(
-            in.element_bounds.x, in.element_bounds.y, in.element_bounds.z, in.element_bounds.w,
-        ),
-        Radii(
-            in.element_radii_near.x, in.element_radii_near.y,
-            in.element_radii_near.z, in.element_radii_near.w,
-            in.element_radii_far.x, in.element_radii_far.y,
-            in.element_radii_far.z, in.element_radii_far.w,
-        ),
-        Rgba(in.color.x, in.color.y, in.color.z, in.color.w),
-        0u,
-        0u,
-        u32(in.misc.y),
-        in.shape,
-    );
-}
-
-// Coverage by the clip, from what the vertices carried.
-//
-// A clip that is a box and nothing else — which is nearly all of them — is settled by the box test
-// alone, and the rounded tests below it are never reached. The two texture reads that used to
-// answer this per fragment are gone; only a clip that really rounds still reads a table.
-fn clip_from(in: ShadowVarying, point: vec2<f32>) -> f32 {
-    let box = in.clip_box;
-    if point.x < box.x || point.y < box.y || point.x > box.x + box.z || point.y > box.y + box.w {
-        return 0.0;
-    }
-    return clip_rounded_coverage(point, u32(in.misc.w), u32(in.misc.z));
+    // The shadow's origin in that space.
+    @location(1) @interpolate(flat) origin: vec2<f32>,
+    // The record the fragment stage used to read again, carried across instead.
+    @location(2) @interpolate(flat) v_shape_bounds: vec4<f32>,
+    @location(3) @interpolate(flat) v_radii_lo: vec4<f32>,
+    @location(4) @interpolate(flat) v_radii_hi: vec4<f32>,
+    @location(5) @interpolate(flat) v_element_bounds: vec4<f32>,
+    @location(6) @interpolate(flat) v_element_radii_lo: vec4<f32>,
+    @location(7) @interpolate(flat) v_element_radii_hi: vec4<f32>,
+    @location(8) @interpolate(flat) v_color: vec4<f32>,
+    @location(9) @interpolate(flat) v_blur_shape: vec2<f32>,
+    @location(10) @interpolate(flat) v_clip_inset: vec2<u32>,
 }
 
 @vertex
@@ -132,49 +83,18 @@ fn vs_shadow(
     let local = inflated_corner(vertex, shadow.bounds) + shift;
     var out: ShadowVarying;
     out.position = to_clip_position(local, shadow.transform);
-    out.local = local;
-    let b = shadow.bounds;
-    out.bounds = vec4<f32>(b.x, b.y, b.w, b.h);
-    let r = shadow.radii;
-    out.radii_near = vec4<f32>(r.tl_x, r.tl_y, r.tr_x, r.tr_y);
-    out.radii_far = vec4<f32>(r.br_x, r.br_y, r.bl_x, r.bl_y);
-    let e = shadow.element_bounds;
-    out.element_bounds = vec4<f32>(e.x, e.y, e.w, e.h);
-    let q = shadow.element_radii;
-    out.element_radii_near = vec4<f32>(q.tl_x, q.tl_y, q.tr_x, q.tr_y);
-    out.element_radii_far = vec4<f32>(q.br_x, q.br_y, q.bl_x, q.bl_y);
-    let c = shadow.color;
-    out.color = vec4<f32>(c.r, c.g, c.b, c.a);
-    out.clip_box = bitcast<vec4<f32>>(textureLoad(clips, table_texel(shadow.clip * 11u + 0u), 0));
-    let rounds = textureLoad(clips, table_texel(shadow.clip * 11u + 9u), 0).x;
-    out.misc = vec4<f32>(shadow.blur, f32(shadow.inset), f32(rounds), f32(shadow.clip));
-    out.shift = shift;
-    out.shape = shadow.shape;
+    out.local = inflated_offset(vertex, shadow.bounds);
+    out.origin = bounds_origin(shadow.bounds);
+    out.v_shape_bounds = bounds_of(shadow.shape_bounds);
+    out.v_radii_lo = radii_lo(shadow.radii);
+    out.v_radii_hi = radii_hi(shadow.radii);
+    out.v_element_bounds = bounds_of(shadow.element_bounds);
+    out.v_element_radii_lo = radii_lo(shadow.element_radii);
+    out.v_element_radii_hi = radii_hi(shadow.element_radii);
+    out.v_color = rgba_of(shadow.color);
+    out.v_blur_shape = vec2<f32>(shadow.blur, shadow.shape);
+    out.v_clip_inset = vec2<u32>(shadow.clip, shadow.inset);
     return out;
-}
-
-// Three-point Gauss-Legendre, on the interval [-1, 1].
-//
-// The interior node is at zero and the outer two are symmetric about it; the weights sum to two,
-// which is the interval's own width.
-const GAUSS_NODE: f32 = 0.774596669241483;
-const GAUSS_WEIGHT_OUTER: f32 = 0.555555555555556;
-const GAUSS_WEIGHT_MIDDLE: f32 = 0.888888888888889;
-
-// One sample of the vertical convolution: the shape's blurred width at a scanline, weighted by the
-// gaussian at that offset.
-fn shadow_sample(
-    center_to_point: vec2<f32>,
-    y: f32,
-    sigma: f32,
-    corner: vec2<f32>,
-    half_size: vec2<f32>,
-    shape: f32,
-) -> f32 {
-    let blurred = blur_along_x(
-        center_to_point.x, center_to_point.y - y, sigma, corner, half_size, shape,
-    );
-    return blurred * gaussian(y, sigma);
 }
 
 // A standard gaussian, used to weight the vertical samples.
@@ -227,60 +147,60 @@ fn blur_along_x(
 
 @fragment
 fn fs_shadow(in: ShadowVarying) -> @location(0) vec4<f32> {
-    let shadow = shadow_of(in);
-    let clip = clip_from(in, device_position(in.position.xy));
+    let clip = clip_coverage(device_position(in.position.xy), in.v_clip_inset.x);
     if clip <= 0.0 {
         return vec4<f32>(0.0);
     }
 
-    // The blurred shape is the element box, offset and spread; `bounds` is that shape dilated by
-    // the blur's reach, so the shape itself has to be recovered from it.
-    let casting = shadow_shape(shadow);
+    // The blurred shape: the element box offset and grown by the spread for a drop shadow, and the
+    // hole the shadow leaves open for an inset one. All distances are from the shadow's origin, so
+    // they keep their precision far from the origin of the space.
+    let casting = bounds_from(bounds_from_vec4(in.v_shape_bounds), in.origin);
+    let element = bounds_from(bounds_from_vec4(in.v_element_bounds), in.origin);
     let half_size = bounds_size(casting) * 0.5;
     let center = bounds_origin(casting) + half_size;
-    let local = in.local - in.shift;
+    let local = in.local;
     let center_to_point = local - center;
-    let corner = pick_corner_radii(center_to_point, shadow.radii);
+    let radii = radii_from_vec4(in.v_radii_lo, in.v_radii_hi);
+    let element_radii = radii_from_vec4(in.v_element_radii_lo, in.v_element_radii_hi);
+    let corner = pick_corner_radii(center_to_point, radii);
 
     // An outer shadow paints nothing inside the box that casts it — the multiply at the end of
     // this function says so, having already paid for the integral. Settled here instead, before
     // four samples of two error functions and an exponential apiece.
-    let element_distance = quad_sdf(local, shadow.element_bounds, shadow.element_radii, shadow.shape);
-    if shadow.inset == 0u && element_distance <= -0.5 {
+    let element_distance = quad_sdf(local, element, element_radii, in.v_blur_shape.y);
+    if in.v_clip_inset.y == 0u && element_distance <= -0.5 {
         return vec4<f32>(0.0);
     }
 
     var alpha: f32;
-    if shadow.blur <= 0.0 {
-        alpha = saturate(0.5 - quad_sdf(local, casting, shadow.radii, shadow.shape));
+    if in.v_blur_shape.x <= 0.0 {
+        alpha = saturate(0.5 - quad_sdf(local, casting, radii, in.v_blur_shape.y));
     } else {
         // The gaussian is negligible beyond three standard deviations, and the shape contributes
         // nothing outside its own extent, so the samples are spent only where the two overlap.
         let low = center_to_point.y - half_size.y;
         let high = center_to_point.y + half_size.y;
-        let start = clamp(-3.0 * shadow.blur, low, high);
-        let end = clamp(3.0 * shadow.blur, low, high);
-        // Three points placed where Gauss-Legendre puts them, rather than four spread evenly.
-        //
-        // Both cheaper and closer, which is unusual enough to be worth the constants: the midpoint
-        // rule is exact for a straight line and this is exact for a fifth-degree curve, and the
-        // integrand is neither but is smooth over an interval already clipped to the shape. Against
-        // a two-hundred-point reference, over a stadium the size these blocks draw, the worst error
-        // falls from 1.52 of a 255th to 0.40 — the old rule was visible at eight bits.
-        let middle = 0.5 * (start + end);
-        let half = 0.5 * (end - start);
-        let offset = half * GAUSS_NODE;
-        alpha = half * (
-            GAUSS_WEIGHT_OUTER
-                * shadow_sample(center_to_point, middle - offset, shadow.blur, corner, half_size, shadow.shape)
-            + GAUSS_WEIGHT_MIDDLE
-                * shadow_sample(center_to_point, middle, shadow.blur, corner, half_size, shadow.shape)
-            + GAUSS_WEIGHT_OUTER
-                * shadow_sample(center_to_point, middle + offset, shadow.blur, corner, half_size, shadow.shape)
-        );
+        let start = clamp(-3.0 * in.v_blur_shape.x, low, high);
+        let end = clamp(3.0 * in.v_blur_shape.x, low, high);
+        let step = (end - start) / 4.0;
+        var y = start + step * 0.5;
+        alpha = 0.0;
+        for (var i = 0; i < 4; i += 1) {
+            let blurred = blur_along_x(
+                center_to_point.x,
+                center_to_point.y - y,
+                in.v_blur_shape.x,
+                corner,
+                half_size,
+                in.v_blur_shape.y,
+            );
+            alpha += blurred * gaussian(y, in.v_blur_shape.x) * step;
+            y += step;
+        }
     }
 
-    if shadow.inset != 0u {
+    if in.v_clip_inset.y != 0u {
         // An inset shadow is the complement of the blurred hole, clipped to the element it sits in.
         alpha = 1.0 - alpha;
         alpha *= saturate(0.5 - element_distance);
@@ -291,23 +211,6 @@ fn fs_shadow(in: ShadowVarying) -> @location(0) vec4<f32> {
         alpha *= saturate(0.5 + element_distance);
     }
 
-    return rgba_of(shadow.color) * alpha * clip;
+    return in.v_color * alpha * clip;
 }
 
-// The rectangle the blur is applied to.
-//
-// A drop shadow's `bounds` is the shape dilated by the blur's reach on every side, so the shape is
-// recovered by removing it. An inset shadow paints only inside the box that casts it, so its
-// `bounds` is that box and is already the shape the blur is applied to.
-fn shadow_shape(shadow: Shadow) -> Bounds {
-    if shadow.inset != 0u {
-        return shadow.bounds;
-    }
-    let reach = 3.0 * shadow.blur;
-    return Bounds(
-        shadow.bounds.x + reach,
-        shadow.bounds.y + reach,
-        max(shadow.bounds.w - 2.0 * reach, 0.0),
-        max(shadow.bounds.h - 2.0 * reach, 0.0),
-    );
-}

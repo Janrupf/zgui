@@ -3,6 +3,13 @@ name = "zgui-reactive"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Signals, effects and the UI-thread executor for zgui"
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+include.workspace = true
 
 # L1 — contracts. Every dependency is inherited: `foo.workspace = true`.
 #
@@ -16,6 +23,7 @@ futures.workspace = true
 reactive_graph.workspace = true
 reactive_stores.workspace = true
 send_wrapper.workspace = true
+smallvec.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

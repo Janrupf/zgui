@@ -279,7 +279,7 @@ impl Surface for DrmSurface {
     ///
     /// No graphics API in this workspace's dependency set reads the two DRM variants yet. wgpu
     /// refuses a DRM window handle as "not a Vulkan-compatible handle", which is a true report of
-    /// where the gap is. `App::run_drm` replaces the renderer factory with one that draws through
+    /// where the gap is. `zgui_console::RunDrm::run_drm` replaces the renderer factory with one that draws through
     /// this backend.
     fn gpu(&self) -> Option<&dyn GpuSurface> {
         Some(self)

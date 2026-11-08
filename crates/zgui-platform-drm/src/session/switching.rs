@@ -36,8 +36,8 @@ use crate::session::presence::{Presence, Transition};
 
 /// How long a session waits to hear that a terminal it asked for has moved.
 ///
-/// The spike this backend's session was written from measured the disable arriving **16 ms** after
-/// the ask, from logind on one ordinary machine. This bound is thirty times that measurement.
+/// On one ordinary machine, logind reports the disable **16 ms** after the ask. This bound is thirty
+/// times that measurement.
 ///
 /// It is generous because the two ways of being wrong cost different things. A bound shorter than
 /// the daemon's answer puts the pointer back on a plane the next session is about to inherit, which

@@ -148,3 +148,96 @@ fn an_unresolved_sprite_never_reaches_a_draw() {
         "the range it was in cannot stand in for the drawing next frame"
     );
 }
+
+/// A color tile of the image pool at the given origin.
+fn image_tile(x: i32) -> AtlasTile {
+    AtlasTile {
+        texture: TextureId::new(TextureKind::Image, 0),
+        tile: TileId(3),
+        bounds: Rect::new(Point::new(x, 0), Size::new(16, 16)),
+    }
+}
+
+/// The name of one color raster in the first generation.
+fn image_name(hash: u64) -> ResourceKey {
+    ResourceKey::new(TextureKind::Image, hash, ResourceGeneration::FIRST)
+}
+
+#[test]
+fn settle_named_places_blanks_and_keeps() {
+    use crate::scene::resolve::Settle;
+
+    let mut scene = scene();
+    for (index, hash) in [1_u64, 2, 3].into_iter().enumerate() {
+        scene.push_color_sprite(ColorSprite::new(
+            rect(index as f32 * 20.0, 4.0, 16.0, 16.0),
+            image_name(hash),
+        ));
+    }
+    let named = scene.named_color_sprites();
+    assert_eq!(named.len(), 3);
+    assert_eq!(named[1].0, image_name(2));
+    assert_eq!(
+        named[1].1,
+        Some(rect(20.0, 4.0, 16.0, 16.0)),
+        "the rectangle on the surface"
+    );
+
+    let placed = scene.settle_named(|key, _| match key.hash() {
+        1 => Settle::Place(image_tile(48)),
+        2 => Settle::Blank,
+        _ => Settle::Keep,
+    });
+    assert_eq!(placed, 1);
+    let sprites = &scene.primitives.color_sprites;
+    assert_eq!(sprites[0].tile.bounds, [48, 0, 16, 16]);
+    assert!(!sprites[1].tile.is_unresolved());
+    assert_eq!(sprites[1].bounds, [0.0; 4], "a blank covers nothing");
+    assert!(sprites[2].tile.is_unresolved());
+    assert!(scene.has_unresolved_resources(), "the kept one still waits");
+
+    let mut registry = ResourceRegistry::new();
+    registry.place(image_name(3), image_tile(64));
+    assert_eq!(scene.resolve_resources(&registry), 1);
+    scene.finish(&DamageSet::full());
+}
+
+#[test]
+fn a_named_sprite_is_cut_to_its_clip_where_the_clip_is_drawn() {
+    use zgui_geom::{Corners, Matrix4, Vec2};
+
+    use crate::clip::ClipLink;
+    use crate::spatial::{OwnSpace, PropertyOwner};
+
+    let mut scene = scene();
+    // A port in the viewport's space, and content under a transform that moves it left.
+    let viewport = scene.spatial.viewport();
+    let port = scene.clips.only(ClipLink::RoundedRect {
+        shape: crate::prim::CornerShape::ROUND,
+        rect: rect(0.0, 0.0, 100.0, 100.0),
+        radii: Corners::uniform(Vec2::splat(DevicePx(0.0))),
+        space: viewport,
+    });
+    let owner = PropertyOwner::new(2).expect("a handle is never the empty word");
+    let moved = scene.spatial.space_of(
+        viewport,
+        owner,
+        OwnSpace::of(Some(Matrix4::translation(-300.0, 0.0, 0.0)), None, false),
+    );
+    for (x, hash) in [(250.0, 1_u64), (500.0, 2)] {
+        let mut sprite = ColorSprite::new(rect(x, 0.0, 100.0, 100.0), image_name(hash));
+        sprite.clip = port.0;
+        sprite.transform = moved.index();
+        assert!(
+            scene.push_color_sprite(sprite).is_some(),
+            "the clip of another space is left to the shader"
+        );
+    }
+    let named = scene.named_color_sprites();
+    assert_eq!(
+        named[0].1,
+        Some(rect(0.0, 0.0, 50.0, 100.0)),
+        "the part in the port"
+    );
+    assert_eq!(named[1].1, None, "wholly outside the port");
+}

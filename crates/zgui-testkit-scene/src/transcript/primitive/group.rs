@@ -79,7 +79,7 @@ pub fn backdrop(scene: &Scene, backdrop: &BackdropFilter) -> String {
             ])
         ));
     }
-    line.push_str(&suffix(scene, backdrop.clip, None));
+    line.push_str(&suffix(scene, backdrop.clip, backdrop.transform));
     line
 }
 

@@ -18,7 +18,7 @@
 
 mod support;
 
-use support::{Element, Fixture};
+use support::{Element, Fixture, fragments, lay_out, lay_out_only, measurer};
 use zgui_dom::side::BoxKey;
 use zgui_dom::{NodeIndex, NodeKind};
 use zgui_layout::boxtree::Owed;
@@ -259,6 +259,58 @@ fn a_box_positioned_from_outside_the_subtree_refuses_the_splice() {
 }
 
 #[test]
+fn a_box_positioned_by_the_root_refuses_the_splice_of_the_panel_it_was_written_in() {
+    let _recording = Recording::begin();
+    // Nothing is positioned, so `first` is laid out by the root's box, which is the initial
+    // containing block. The splice of `left` is refused for the same reason as above.
+    let fixture = two_panels(
+        "root { display: block; width: 400px }
+         left, right, second { display: block }
+         first { display: block; position: absolute; top: 0; left: 0 }",
+    );
+    let mut store = fixture.box_tree();
+    let before = shape(&to_text(&store));
+
+    assert!(
+        patch::rebuild(
+            &mut store,
+            &fixture.document,
+            &owes_boxes(element(&fixture, "left"))
+        )
+        .is_none(),
+        "a subtree holding a box the root lays out was spliced anyway"
+    );
+    assert_eq!(
+        shape(&to_text(&store)),
+        before,
+        "a refused splice left the tree changed"
+    );
+}
+
+#[test]
+fn a_splice_in_the_panel_beside_a_box_positioned_by_the_root_leaves_the_tree_a_build_produces() {
+    let _recording = Recording::begin();
+    let fixture = two_panels(
+        "root { display: block; width: 400px }
+         left, right, second { display: block }
+         first { display: block; position: absolute; top: 0; left: 0 }",
+    );
+    let mut store = fixture.box_tree();
+
+    patch::rebuild(
+        &mut store,
+        &fixture.document,
+        &owes_boxes(element(&fixture, "second")),
+    )
+    .expect("the block in the other panel holds nothing out of flow");
+    assert_eq!(
+        shape(&to_text(&store)),
+        shape(&to_text(&fixture.box_tree())),
+        "the spliced tree differs from a build of the same document"
+    );
+}
+
+#[test]
 fn a_container_that_stops_generating_a_box_refuses_rather_than_leaving_a_hole() {
     let _recording = Recording::begin();
     // `left` is what would be replaced, and the change makes it generate nothing. The splice may
@@ -334,4 +386,578 @@ fn the_root_element_has_no_container_to_splice_it_into() {
         patch::rebuild(&mut store, &fixture.document, &owes_boxes(fixture.root)).is_none(),
         "the root element's container is the document node, which generates no box"
     );
+}
+
+/// A panel beside a band that holds its content through a `display: contents` wrapper.
+///
+/// The shape of an overlay layer: the wrapper carries behaviour and an inherited custom property,
+/// and generates no box, so whatever is mounted under it hangs under the band's box.
+fn band_with_wrapper(css: &str) -> Fixture {
+    Fixture::new(
+        Element::new("root").children(vec![
+            Element::new("panel").children(vec![Element::new("second").text("two")]),
+            Element::new("band").children(vec![
+                Element::new("wrapper").children(vec![Element::new("first").text("one")]),
+            ]),
+        ]),
+        css,
+    )
+}
+
+#[test]
+fn a_child_mounted_under_a_wrapper_with_no_box_rebuilds_the_box_that_holds_it() {
+    let mut recording = Recording::begin();
+    let mut fixture = band_with_wrapper(
+        "root { display: block; width: 400px; position: relative }
+         panel, first, second { display: block }
+         band { display: block; position: absolute; inset: 0 }
+         wrapper { display: contents }",
+    );
+    let mut store = fixture.box_tree();
+    let untouched = boxes(&store, &fixture, "panel");
+    let root = store.root().expect("the fixture generates a tree");
+
+    let wrapper = element(&fixture, "wrapper");
+    fixture.edit_and_restyle(|edit| {
+        let child = edit.create_element(zgui_interned::ElementName::new("first"));
+        let text = edit.create_text("three");
+        edit.insert_before(child, text, None);
+        edit.insert_before(wrapper, child, None);
+    });
+
+    let owed = Owed {
+        rebuilt: Vec::new(),
+        children: vec![wrapper],
+    };
+    let spliced = recording.measure(|| {
+        let done = patch::rebuild(&mut store, &fixture.document, &owed)
+            .expect("the band that holds the wrapper's children is confined");
+        assert_eq!(done.subtrees, 1, "one box-generating ancestor was rebuilt");
+    });
+    let band = boxes(&store, &fixture, "band")
+        .first()
+        .copied()
+        .expect("`band` generates a box");
+    assert_eq!(
+        spliced.get(Counter::BoxesRebuilt),
+        under(&store, band),
+        "the splice built something other than the band's own subtree"
+    );
+    assert_eq!(
+        boxes(&store, &fixture, "panel"),
+        untouched,
+        "a panel beside the band was given new boxes for a child mounted in the band"
+    );
+    assert_eq!(
+        store.root(),
+        Some(root),
+        "the document's root box was replaced"
+    );
+    assert_eq!(
+        shape(&to_text(&store)),
+        shape(&to_text(&fixture.box_tree())),
+        "the spliced tree does not hold the child mounted under the wrapper"
+    );
+}
+
+#[test]
+fn a_child_removed_from_under_a_wrapper_with_no_box_leaves_the_tree_a_build_produces() {
+    let _recording = Recording::begin();
+    let mut fixture = band_with_wrapper(
+        "root { display: block; width: 400px; position: relative }
+         panel, first, second { display: block }
+         band { display: block; position: absolute; inset: 0 }
+         wrapper { display: contents }",
+    );
+    let mut store = fixture.box_tree();
+    let untouched = boxes(&store, &fixture, "panel");
+
+    let wrapper = element(&fixture, "wrapper");
+    let first = element(&fixture, "first");
+    fixture.edit_and_restyle(|edit| edit.remove(first));
+
+    let owed = Owed {
+        rebuilt: Vec::new(),
+        children: vec![wrapper],
+    };
+    patch::rebuild(&mut store, &fixture.document, &owed)
+        .expect("removing a child from under the wrapper is confined to the band");
+    assert_eq!(boxes(&store, &fixture, "panel"), untouched);
+    assert_eq!(
+        shape(&to_text(&store)),
+        shape(&to_text(&fixture.box_tree())),
+        "the spliced tree still holds the child that was removed"
+    );
+}
+
+#[test]
+fn a_child_mounted_under_an_element_that_is_not_displayed_owes_no_boxes() {
+    let mut recording = Recording::begin();
+    let mut fixture = band_with_wrapper(
+        "root { display: block; width: 400px }
+         panel, band, first, second { display: block }
+         wrapper { display: none }",
+    );
+    let mut store = fixture.box_tree();
+    let before = shape(&to_text(&store));
+
+    let wrapper = element(&fixture, "wrapper");
+    fixture.edit_and_restyle(|edit| {
+        let child = edit.create_element(zgui_interned::ElementName::new("first"));
+        edit.insert_before(wrapper, child, None);
+    });
+
+    let owed = Owed {
+        rebuilt: Vec::new(),
+        children: vec![wrapper],
+    };
+    let spliced = recording.measure(|| {
+        let done = patch::rebuild(&mut store, &fixture.document, &owed)
+            .expect("a change nothing generates boxes for is local");
+        assert_eq!(done.subtrees, 0, "nothing was rebuilt");
+    });
+    assert_eq!(spliced.get(Counter::BoxesRebuilt), 0);
+    assert_eq!(shape(&to_text(&store)), before);
+    assert_eq!(
+        before,
+        shape(&to_text(&fixture.box_tree())),
+        "the tree a build produces differs, so something under `display: none` generates a box"
+    );
+}
+
+/// The paint order positions of the boxes the named elements generated.
+fn painted(store: &LayoutStore, fixture: &Fixture, names: &[&str]) -> Vec<usize> {
+    let root = store.root().expect("a root");
+    let order = zgui_layout::fragment::stacking::paint_order(store, root);
+    names
+        .iter()
+        .map(|name| {
+            let key = boxes(store, fixture, name)[0];
+            order.iter().position(|held| *held == key).expect("painted")
+        })
+        .collect()
+}
+
+#[test]
+fn an_absolute_box_keeps_its_tree_order_when_a_sibling_or_itself_is_rebuilt() {
+    let _recording = Recording::begin();
+    let fixture = Fixture::new(
+        Element::new("root").children(vec![Element::new("a").children(vec![
+            Element::new("x").children(vec![Element::new("xi").text("x")]),
+            Element::new("r").children(vec![Element::new("ri").text("r")]),
+            Element::new("c"),
+        ])]),
+        "root { display: block; width: 400px }
+         a { display: block; position: relative }
+         x, c { display: block; position: relative; height: 10px }
+         xi, ri { display: block }
+         r { display: block; position: absolute; inset: 0 }",
+    );
+    let mut store = fixture.box_tree();
+    let order = painted(&store, &fixture, &["x", "r", "c"]);
+    assert!(order[0] < order[1] && order[1] < order[2], "{order:?}");
+
+    // `x` is rebuilt and put in place of the box `r` was written after.
+    let x = boxes(&store, &fixture, "x");
+    patch::rebuild(
+        &mut store,
+        &fixture.document,
+        &owes_boxes(element(&fixture, "xi")),
+    )
+    .expect("a block inside a block is confined");
+    assert_ne!(boxes(&store, &fixture, "x"), x, "`x` has new boxes");
+    let order = painted(&store, &fixture, &["x", "r", "c"]);
+    assert!(order[0] < order[1] && order[1] < order[2], "{order:?}");
+    let r = boxes(&store, &fixture, "r")[0];
+    assert_eq!(
+        store.declared(r).and_then(|declared| declared.after),
+        Some(boxes(&store, &fixture, "x")[0]),
+        "the record follows the new box"
+    );
+
+    // `r` itself is rebuilt in place.
+    patch::rebuild(
+        &mut store,
+        &fixture.document,
+        &owes_boxes(element(&fixture, "ri")),
+    )
+    .expect("a block inside an absolute box is confined");
+    assert_ne!(boxes(&store, &fixture, "r")[0], r, "`r` has new boxes");
+    let order = painted(&store, &fixture, &["x", "r", "c"]);
+    assert!(order[0] < order[1] && order[1] < order[2], "{order:?}");
+}
+
+/// The elements whose boxes are painted, in the order the document paints them.
+fn paint_sequence(store: &LayoutStore, fixture: &Fixture) -> Vec<String> {
+    let root = store.root().expect("a root");
+    let core = fixture.document.store();
+    zgui_layout::fragment::stacking::paint_order(store, root)
+        .into_iter()
+        .filter_map(|key| {
+            let index = core.index_of(store.node(key).source?)?;
+            (core.core(index).kind() == NodeKind::Element)
+                .then(|| core.core(index).local_name().as_str().to_owned())
+        })
+        .collect()
+}
+
+/// Asserts that `store` is the tree a build of the document produces, in both child orders.
+fn assert_built_shape(store: &LayoutStore, fixture: &Fixture) {
+    let built = fixture.box_tree();
+    assert_eq!(
+        shape(&to_text(store)),
+        shape(&to_text(&built)),
+        "the spliced tree is not the tree a build produces"
+    );
+    assert_eq!(
+        paint_sequence(store, fixture),
+        paint_sequence(&built, fixture),
+        "the spliced tree paints in another order than a build"
+    );
+}
+
+/// A list beside out-of-flow boxes that nothing positioned holds: the root's box lays them out.
+const OVERLAYS: &str = "root { display: block; width: 400px }
+                        app, list, row { display: block; height: 20px }
+                        tip, pane { display: block; position: absolute; top: 0; left: 10px }";
+
+/// An application column holding a list of `rows` rows, then the elements `after` names.
+fn app_with_list(css: &str, rows: usize, after: &[&'static str]) -> Fixture {
+    let mut children = vec![
+        Element::new("list").children((0..rows).map(|_| Element::new("row").text("row")).collect()),
+    ];
+    children.extend(after.iter().map(|name| Element::new(name).text(name)));
+    Fixture::new(
+        Element::new("root").children(vec![Element::new("app").children(children)]),
+        css,
+    )
+}
+
+/// Mounts a `name` element with text into `app`, before the element `before` names.
+fn mount_into_app(fixture: &mut Fixture, name: &str, before: Option<&str>) -> Owed {
+    let app = element(fixture, "app");
+    let before = before.map(|name| element(fixture, name));
+    fixture.edit_and_restyle(|edit| {
+        let child = edit.create_element(zgui_interned::ElementName::new(name));
+        let text = edit.create_text(name);
+        edit.insert_before(child, text, None);
+        edit.insert_before(app, child, before);
+    });
+    Owed {
+        rebuilt: Vec::new(),
+        children: vec![app],
+    }
+}
+
+#[test]
+fn an_out_of_flow_child_mounted_where_nothing_is_positioned_is_spliced_into_the_root() {
+    let mut recording = Recording::begin();
+    let mut fixture = app_with_list(OVERLAYS, 8, &[]);
+    let mut store = fixture.box_tree();
+    let root = store.root().expect("a root");
+    let list = boxes(&store, &fixture, "list");
+
+    let owed = mount_into_app(&mut fixture, "tip", None);
+    let spliced = recording.measure(|| {
+        patch::rebuild(&mut store, &fixture.document, &owed)
+            .expect("an out-of-flow child of a block container is confined");
+    });
+    let tip = boxes(&store, &fixture, "tip")[0];
+    assert_eq!(
+        spliced.get(Counter::BoxesRebuilt),
+        under(&store, tip),
+        "the splice built more than the mounted child's own boxes"
+    );
+    assert_eq!(
+        store.node(tip).parent,
+        Some(root),
+        "the root lays the child out"
+    );
+    assert_eq!(
+        boxes(&store, &fixture, "list"),
+        list,
+        "the list was rebuilt"
+    );
+    assert_eq!(store.root(), Some(root), "the root box was replaced");
+    assert_built_shape(&store, &fixture);
+}
+
+#[test]
+fn an_out_of_flow_child_removed_where_nothing_is_positioned_leaves_the_tree_a_build_produces() {
+    let _recording = Recording::begin();
+    let mut fixture = app_with_list(OVERLAYS, 8, &["tip"]);
+    let mut store = fixture.box_tree();
+    let root = store.root().expect("a root");
+    let list = boxes(&store, &fixture, "list");
+
+    let app = element(&fixture, "app");
+    let tip = element(&fixture, "tip");
+    fixture.edit_and_restyle(|edit| edit.remove(tip));
+    patch::rebuild(
+        &mut store,
+        &fixture.document,
+        &Owed {
+            rebuilt: Vec::new(),
+            children: vec![app],
+        },
+    )
+    .expect("removing an out-of-flow child of a block container is confined");
+    assert_eq!(
+        boxes(&store, &fixture, "list"),
+        list,
+        "the list was rebuilt"
+    );
+    assert_eq!(store.root(), Some(root), "the root box was replaced");
+    assert!(
+        store
+            .node(root)
+            .children
+            .iter()
+            .all(|&key| store.contains(key)),
+        "the root still lays out a box that was removed"
+    );
+    assert_built_shape(&store, &fixture);
+}
+
+#[test]
+fn an_out_of_flow_child_mounted_before_another_paints_before_it() {
+    let _recording = Recording::begin();
+    let mut fixture = app_with_list(OVERLAYS, 2, &["pane"]);
+    let mut store = fixture.box_tree();
+
+    let owed = mount_into_app(&mut fixture, "tip", Some("pane"));
+    patch::rebuild(&mut store, &fixture.document, &owed)
+        .expect("an out-of-flow child of a block container is confined");
+    let order = paint_sequence(&store, &fixture);
+    let at = |name: &str| order.iter().position(|held| held == name);
+    assert!(at("tip") < at("pane"), "{order:?}");
+    assert_built_shape(&store, &fixture);
+}
+
+#[test]
+fn an_out_of_flow_child_mounted_into_its_own_containing_block_joins_the_tail_in_tree_order() {
+    let _recording = Recording::begin();
+    let mut fixture = app_with_list(
+        "root { display: block; width: 400px }
+         app { display: block; position: relative }
+         list, row { display: block; height: 20px }
+         tip, pane { display: block; position: absolute; top: 0; left: 10px }",
+        2,
+        &["pane"],
+    );
+    let mut store = fixture.box_tree();
+    let app = boxes(&store, &fixture, "app");
+
+    let owed = mount_into_app(&mut fixture, "tip", Some("pane"));
+    patch::rebuild(&mut store, &fixture.document, &owed)
+        .expect("an out-of-flow child of a positioned container is confined");
+    assert_eq!(
+        boxes(&store, &fixture, "app"),
+        app,
+        "the container was rebuilt"
+    );
+    assert_built_shape(&store, &fixture);
+}
+
+#[test]
+fn an_in_flow_child_holding_an_out_of_flow_box_puts_it_in_tree_order_at_the_root() {
+    let _recording = Recording::begin();
+    let mut fixture = app_with_list(OVERLAYS, 2, &["pane"]);
+    let mut store = fixture.box_tree();
+
+    // A row holding a `tip`, mounted before the `pane` that the root already lays out.
+    let app = element(&fixture, "app");
+    let pane = element(&fixture, "pane");
+    fixture.edit_and_restyle(|edit| {
+        let row = edit.create_element(zgui_interned::ElementName::new("row"));
+        let tip = edit.create_element(zgui_interned::ElementName::new("tip"));
+        let text = edit.create_text("tip");
+        edit.insert_before(tip, text, None);
+        edit.insert_before(row, tip, None);
+        edit.insert_before(app, row, Some(pane));
+    });
+    patch::rebuild(
+        &mut store,
+        &fixture.document,
+        &Owed {
+            rebuilt: Vec::new(),
+            children: vec![app],
+        },
+    )
+    .expect("an in-flow child of a block container is confined");
+    assert_built_shape(&store, &fixture);
+}
+
+#[test]
+fn a_box_positioned_by_the_root_still_refuses_to_be_replaced_in_place() {
+    let _recording = Recording::begin();
+    // Replacing `tip` would repair the root's layout list and leave `app`'s paint list naming the
+    // old box.
+    let fixture = app_with_list(OVERLAYS, 2, &["tip"]);
+    let mut store = fixture.box_tree();
+    let before = shape(&to_text(&store));
+    let text = fixture
+        .document
+        .store()
+        .core(element(&fixture, "tip"))
+        .first_child()
+        .expect("the tip's text");
+    assert!(
+        patch::rebuild(&mut store, &fixture.document, &owes_boxes(text)).is_none(),
+        "the box of an element positioned by the root was replaced in place"
+    );
+    assert_eq!(
+        shape(&to_text(&store)),
+        before,
+        "a refused splice left the tree changed"
+    );
+}
+
+/// Every box owes everything but a new painting order, which is what a mount leaves behind.
+struct Unstacked;
+
+impl zgui_layout::fragment::diff::FrameDirty for Unstacked {
+    fn own(&self, _node: Option<zgui_dom::NodeKey>) -> zgui_bits::Dirty {
+        zgui_bits::Dirty::all().difference(zgui_bits::Dirty::RESTACK)
+    }
+
+    fn subtree(&self, _node: Option<zgui_dom::NodeKey>) -> zgui_bits::Dirty {
+        zgui_bits::Dirty::all().difference(zgui_bits::Dirty::RESTACK)
+    }
+
+    fn mark(&mut self, _node: Option<zgui_dom::NodeKey>, _bits: zgui_bits::Dirty) {}
+
+    fn retire(&mut self, _node: Option<zgui_dom::NodeKey>, _phase: zgui_bits::Dirty) {}
+}
+
+#[test]
+fn a_box_born_among_children_painted_out_of_layout_order_takes_its_painting_place_in_the_hit_index()
+{
+    let mut recording = Recording::begin();
+    // The root lays out `app`, then `band`, then the mounted `tip`, and paints `band` last for its
+    // `z-index`. So the tip is born between `app` and `band` in painting order.
+    let mut fixture = Fixture::new(
+        Element::new("root").children(vec![
+            Element::new("band"),
+            Element::new("app")
+                .children(vec![Element::new("list").children(
+                    (0..100).map(|_| Element::new("row").text("row")).collect(),
+                )]),
+        ]),
+        "root { display: block; width: 400px }
+         app, list, row { display: block; height: 20px }
+         band { display: block; position: fixed; inset: 0; z-index: 5 }
+         tip { display: block; position: absolute; top: 0; left: 10px; width: 40px; height: 10px }",
+    );
+    let mut store = fixture.box_tree();
+    let mut content = measurer();
+    let mut frame = lay_out(&mut store, &mut content, 400.0, 300.0);
+
+    let owed = mount_into_app(&mut fixture, "tip", None);
+    patch::rebuild(&mut store, &fixture.document, &owed)
+        .expect("an out-of-flow child of a block container is confined");
+    let root = store.root().expect("a root");
+    assert!(
+        !zgui_layout::fragment::stacking::children_in_layout_order(&store, root),
+        "the root paints its children in layout order, so the case under test is absent"
+    );
+    let composed = recording.measure(|| {
+        lay_out_only(&mut store, &mut content, 400.0, 300.0);
+        fragments(&mut frame, &mut store, root, &mut Unstacked);
+    });
+    assert_eq!(
+        composed.get(Counter::HitIndexRebuilds),
+        0,
+        "a box born among children painted out of layout order rebuilt the whole hit index"
+    );
+    assert_hit_follows_paint(&store, &frame);
+
+    // A row born at the end of the list is a grandchild of the root. The tip paints between `app`
+    // and `band`, so the row's keys must stay below the tip's.
+    let list = element(&fixture, "list");
+    fixture.edit_and_restyle(|edit| {
+        let row = edit.create_element(zgui_interned::ElementName::new("row"));
+        let text = edit.create_text("row");
+        edit.insert_before(row, text, None);
+        edit.insert_before(list, row, None);
+    });
+    patch::rebuild(
+        &mut store,
+        &fixture.document,
+        &Owed {
+            rebuilt: Vec::new(),
+            children: vec![list],
+        },
+    )
+    .expect("an in-flow child of a block container is confined");
+    let composed = recording.measure(|| {
+        lay_out_only(&mut store, &mut content, 400.0, 300.0);
+        fragments(&mut frame, &mut store, root, &mut Unstacked);
+    });
+    assert_eq!(
+        composed.get(Counter::HitIndexRebuilds),
+        0,
+        "a box born below a child painted out of layout order rebuilt the whole hit index"
+    );
+    assert_hit_follows_paint(&store, &frame);
+}
+
+/// Asserts that the hit index orders every fragment the way the document paints its boxes.
+fn assert_hit_follows_paint(store: &LayoutStore, frame: &support::Frame) {
+    let root = store.root().expect("a root");
+    let mut previous = None;
+    for key in zgui_layout::fragment::stacking::paint_order(store, root) {
+        for &frag in store.fragments_of_box(key) {
+            let Some(order) = frame.hit.order_of(frag) else {
+                continue;
+            };
+            assert!(
+                previous.is_none_or(|previous| previous < order),
+                "the hit index orders a fragment of box {} against painting order",
+                key.index()
+            );
+            previous = Some(order);
+        }
+    }
+}
+
+#[test]
+fn a_z_index_restyle_reorders_the_children_the_fragment_walk_remembered_in_layout_order() {
+    let _recording = Recording::begin();
+    let mut fixture = Fixture::new(
+        Element::new("root").children(vec![
+            Element::new("a"),
+            Element::new("b"),
+            Element::new("c"),
+        ]),
+        "root { display: block; width: 200px }
+         a, b, c { display: block; position: relative; height: 20px }",
+    );
+    let mut store = fixture.box_tree();
+    let mut content = measurer();
+    let mut frame = lay_out(&mut store, &mut content, 200.0, 200.0);
+    let root = store.root().expect("a root");
+    assert!(zgui_layout::fragment::stacking::children_in_layout_order(
+        &store, root
+    ));
+
+    let a = element(&fixture, "a");
+    fixture.edit_restyle_and_patch(&mut store, |edit| {
+        edit.set_style_property(a, "z-index", Some("1"));
+    });
+    support::relayout(&mut frame, &mut store, &mut content, 200.0, 200.0);
+    assert!(
+        !zgui_layout::fragment::stacking::children_in_layout_order(&store, root),
+        "the root kept a layout order its children no longer paint in"
+    );
+    let order = zgui_layout::fragment::stacking::paint_order(&store, root);
+    let place = |name| {
+        let key = boxes(&store, &fixture, name)[0];
+        order.iter().position(|&it| it == key).expect("painted")
+    };
+    assert!(
+        place("b") < place("c") && place("c") < place("a"),
+        "`a` does not paint last after its z-index"
+    );
+    assert_hit_follows_paint(&store, &frame);
 }

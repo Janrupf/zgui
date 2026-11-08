@@ -1,6 +1,7 @@
 //! Typing to narrow a list, and choosing one of what is left.
 
 mod content;
+mod field;
 mod input;
 mod item;
 mod style;
@@ -8,7 +9,9 @@ mod style;
 pub use crate::combobox::content::{
     ComboboxContent, ComboboxContentProps, ComboboxEmpty, ComboboxEmptyProps,
 };
+pub(crate) use crate::combobox::field::ComboboxFieldProps;
 pub use crate::combobox::input::{ComboboxInput, ComboboxInputProps};
+pub(crate) use crate::combobox::item::ComboboxEntryProps;
 pub use crate::combobox::item::{ComboboxItem, ComboboxItemProps};
 pub use crate::combobox::style::ComboboxStyle;
 

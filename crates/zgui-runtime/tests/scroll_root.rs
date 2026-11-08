@@ -125,12 +125,6 @@ fn a_wheel_over_a_surface_fixed_across_the_window_still_scrolls_the_page_under_i
 }
 
 /// The same surface, made scrollable, so the wheel it receives has somewhere of its own to go.
-///
-/// Sized in pixels rather than in per cent, and that is not incidental: a `height: 100%` on a fixed
-/// box whose content is taller than the window grows to its content instead of staying the height
-/// of the window, and an overlay that is 3000px tall has no overflow to scroll — so the wheel would
-/// pass through to the page and this control would report "the surface was never hit" when what
-/// actually happened is that it had nothing to scroll.
 const SCROLLING_SCRIM_CSS: &str = ":root { display: block; overflow: auto }
                                    .tall { display: block; width: 400px; height: 3000px }
                                    .scrim { position: fixed; left: 0; top: 0;

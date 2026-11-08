@@ -16,7 +16,7 @@
 
 pub mod descent;
 
-use style::dom::TNode;
+use style::dom::{TElement, TNode};
 use style::invalidation::element::restyle_hints::RestyleHint;
 use style::selector_parser::SnapshotMap;
 use style::traversal_flags::TraversalFlags;
@@ -54,10 +54,10 @@ impl StyleEngine {
     ///
     /// The hint asks for the animation and transition declarations to be replaced and for nothing
     /// else, so the element's selector matches are kept and the frame costs a cascade rather than a
-    /// match. Only the animation-only traversal will process it, so the same call records that the
-    /// next restyle owes one, and raises the descent flag that traversal reads on every ancestor —
-    /// the flag is how the traversal gets from the root to an element that could be anywhere, and
-    /// the hint alone reaches nothing.
+    /// match. Only the animation-only traversal processes it, so the call records the element for
+    /// the next restyle, which raises the descent flag that traversal reads on every ancestor of
+    /// wherever the element stands by then. The flag is how the traversal gets from the root to an
+    /// element that could be anywhere, and the hint alone reaches nothing.
     pub fn mark_animation_restyle(&mut self, document: &Document, index: NodeIndex) {
         let node = document.node(index);
         let Some(element) = node.as_element() else {
@@ -72,7 +72,48 @@ impl StyleEngine {
             data.hint
                 .insert(RestyleHint::RESTYLE_CSS_ANIMATIONS | RestyleHint::RESTYLE_CSS_TRANSITIONS);
         }
-        descent::raise_to_root(node);
-        self.animation_restyle_owed = true;
+        self.animation_marks.push(node.key());
+    }
+
+    /// How many marked elements wait out of the document for a restyle that finds them in it.
+    #[must_use]
+    pub fn animation_waiting(&self) -> usize {
+        self.animation_waiting.len()
+    }
+
+    /// Raises the descent flags from where every marked element stands now, and answers whether
+    /// the animation-only traversal has an element to reach.
+    ///
+    /// An element moved since its mark has flags on the ancestors it left, and one taken out of
+    /// the document has none the traversal can follow. The first is reached from its new place;
+    /// the second waits, hint and all, for a restyle that finds it in the document again. Left
+    /// unreached, its hint meets the ordinary traversal, which refuses it.
+    pub(crate) fn settle_animation_marks(&mut self, document: &Document) -> bool {
+        let mut marked = std::mem::take(&mut self.animation_marks);
+        marked.append(&mut self.animation_waiting);
+        let root = document.root().map(|root| root.index());
+        let mut reachable = false;
+        for key in marked {
+            let Some(index) = document.store().index_of(key) else {
+                continue;
+            };
+            let node = document.node(index);
+            let Some(element) = node.as_element() else {
+                continue;
+            };
+            let pending = element
+                .borrow_data()
+                .is_some_and(|data| data.hint.has_animation_hint());
+            if !pending {
+                continue;
+            }
+            if descent::top_of(node).is_some_and(|top| Some(top) == root) {
+                descent::raise_to_root(node);
+                reachable = true;
+            } else if !self.animation_waiting.contains(&key) {
+                self.animation_waiting.push(key);
+            }
+        }
+        reachable
     }
 }

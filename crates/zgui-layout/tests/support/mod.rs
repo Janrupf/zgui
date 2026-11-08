@@ -3,6 +3,7 @@
 // The harness is compiled into several test targets and each uses a different part of it.
 #![allow(dead_code, unreachable_pub)]
 
+pub(crate) mod find;
 pub(crate) mod mono;
 pub(crate) mod text;
 
@@ -152,6 +153,58 @@ impl Fixture {
         result
     }
 
+    /// The same, and then carries the new styles into `store`'s boxes, marking what has to be
+    /// laid out again.
+    ///
+    /// What a frame does between its cascade and its layout, for a test that holds a box tree
+    /// across an edit.
+    pub(crate) fn edit_restyle_and_patch<R>(
+        &mut self,
+        store: &mut LayoutStore,
+        body: impl FnOnce(&mut zgui_dom::Edit<'_>) -> R,
+    ) -> R {
+        let filter = self.engine.filter();
+        let result = self
+            .document
+            .edit(&filter, body)
+            .expect("the document is not poisoned");
+        let pass = self.engine.restyle(&mut self.document, None);
+        zgui_layout::boxtree::patch::style::restyle(store, &self.document, pass.styled_nodes());
+        result
+    }
+
+    /// The same, and then brings `store`'s box tree into agreement with the document: splicing
+    /// what the edit added, removed or moved, carrying the new styles, and rewriting text.
+    ///
+    /// What a frame does between its cascade and its layout, for a test that holds a box tree
+    /// across a structural edit.
+    pub(crate) fn edit_and_sync_boxes<R>(
+        &mut self,
+        store: &mut LayoutStore,
+        body: impl FnOnce(&mut zgui_dom::Edit<'_>) -> R,
+    ) -> R {
+        let filter = self.engine.filter();
+        let result = self
+            .document
+            .edit(&filter, body)
+            .expect("the document is not poisoned");
+        let pass = self.engine.restyle(&mut self.document, None);
+        let root = self.document.root_index().expect("a root element");
+        let owed = zgui_layout::boxtree::retire(&mut self.document, root);
+        if !owed.is_empty()
+            && zgui_layout::boxtree::patch::rebuild(store, &self.document, &owed).is_none()
+        {
+            zgui_layout::boxtree::build(store, &self.document);
+        }
+        zgui_layout::boxtree::patch::style::restyle(store, &self.document, pass.styled_nodes());
+        if zgui_layout::boxtree::patch::retext(store, &self.document, root)
+            == zgui_layout::boxtree::patch::Retext::Rebuild
+        {
+            zgui_layout::boxtree::build(store, &self.document);
+        }
+        result
+    }
+
     /// The box tree for this document.
     pub(crate) fn box_tree(&self) -> LayoutStore {
         let mut store = LayoutStore::new(self.document.store().document());
@@ -209,7 +262,7 @@ pub(crate) struct Ask {
     /// The width the box was told it had, if it was told one.
     pub(crate) known_width: Option<f32>,
     /// The space it was told was available on the inline axis.
-    pub(crate) available_width: taffy::AvailableSpace,
+    pub(crate) available_width: cephal::AvailableSpace,
     /// Whether the answer was going to be kept.
     pub(crate) final_pass: bool,
 }
@@ -218,7 +271,7 @@ impl Ask {
     /// The definite width this ask offered, if it offered one.
     pub(crate) fn definite_width(&self) -> Option<f32> {
         match self.available_width {
-            taffy::AvailableSpace::Definite(width) => Some(width),
+            cephal::AvailableSpace::Definite(width) => Some(width),
             _ => None,
         }
     }
@@ -385,7 +438,7 @@ pub(crate) fn lay_out_at_scale(
     };
     let mut tree = LayoutTree::new(store, content, device);
     assert!(
-        tree.layout_root(taffy::Size { width, height }),
+        tree.layout_root(cephal::Size { width, height }),
         "the fixture generated no root box"
     );
 }
@@ -419,9 +472,21 @@ pub(crate) fn fragments(
     root: zgui_layout::BoxKey,
     dirty: &mut impl zgui_layout::fragment::diff::FrameDirty,
 ) {
+    fragments_after(frame, store, root, dirty, &zgui_scene::Placements::EMPTY);
+}
+
+/// [`fragments`], with `drawn` as the matrices the standing fragments were last published with.
+pub(crate) fn fragments_after(
+    frame: &mut Frame,
+    store: &mut LayoutStore,
+    root: zgui_layout::BoxKey,
+    dirty: &mut impl zgui_layout::fragment::diff::FrameDirty,
+    drawn: &zgui_scene::Placements,
+) {
     let mut tables = zgui_layout::fragment::build::Tables {
         clips: &mut frame.clips,
         spatial: &mut frame.spatial,
+        drawn,
         device: DeviceStyle::default(),
         scroll: &frame.scroll,
         placements: &[],

@@ -325,3 +325,242 @@ fn a_minted_clip_is_re_interned_where_the_chunk_replays() {
     assert_eq!(returned.len(), 1);
     assert_eq!(scene.clips.bounds(window), rect(0.0, 0.0, 30.0, 20.0));
 }
+
+#[test]
+fn a_capture_that_is_never_bound_leaves_its_primitives_transient() {
+    let (mut scene, fill) = scene();
+    // A fragment whose encoding was abandoned: captured, taken and never bound.
+    scene.begin_chunk_capture(ChunkPrims::default());
+    scene.push_quad(Quad::filled(rect(0.0, 0.0, 20.0, 20.0), fill));
+    let _ = scene.take_chunk_capture();
+    // The next fragment's encoding completes and is bound to its own revision.
+    scene.begin_chunk_capture(ChunkPrims::default());
+    scene.push_quad(Quad::filled(rect(40.0, 0.0, 20.0, 20.0), fill));
+    let _ = scene.take_chunk_capture();
+    scene.bind_capture(7);
+
+    let provenance = scene.provenance(crate::prim::PrimitiveKind::Quad);
+    assert!(
+        provenance[0].is_transient(),
+        "the abandoned fragment's quad was named after another chunk: {:?}",
+        provenance[0]
+    );
+    assert_eq!(provenance[1].revision, 7);
+    assert_eq!(provenance[1].index, 0);
+}
+
+/// One mark over a payload of three discs, at `x`.
+fn marks_at(x: f32, fill: PaintRef) -> (crate::MarkItem, std::sync::Arc<crate::MarkPayload>) {
+    let payload = crate::MarkPayload {
+        discs: vec![
+            [x + 4.0, 4.0, 3.0, 0.0],
+            [x + 10.0, 4.0, 3.0, 0.0],
+            [x + 16.0, 4.0, 3.0, 0.0],
+        ],
+        ..crate::MarkPayload::default()
+    };
+    let item = crate::MarkItem::new(rect(x + 1.0, 1.0, 18.0, 6.0), fill, payload.counts());
+    (item, std::sync::Arc::new(payload))
+}
+
+#[test]
+fn a_marks_capture_shares_its_payload() {
+    let (mut scene, fill) = scene();
+    let (item, payload) = marks_at(0.0, fill);
+    scene.begin_chunk_capture(ChunkPrims::default());
+    scene.push_marks(item, std::sync::Arc::clone(&payload));
+    let chunk = scene.take_chunk_capture();
+    assert_eq!(chunk.marks.len(), 1);
+    assert!(std::sync::Arc::ptr_eq(&chunk.mark_payloads[0], &payload));
+    assert!(std::sync::Arc::ptr_eq(
+        &scene.primitives.mark_payloads[0],
+        &payload
+    ));
+}
+
+#[test]
+fn marks_ink_reaches_the_chunk_ink() {
+    let (mut scene, fill) = scene();
+    let (item, payload) = marks_at(40.0, fill);
+    scene.begin_chunk_capture(ChunkPrims::default());
+    scene.push_marks(item, payload);
+    let chunk = scene.take_chunk_capture();
+    assert_eq!(chunk.ink, Some(rect(41.0, 1.0, 18.0, 6.0)));
+    assert!(chunk.carries_orders());
+}
+
+#[test]
+fn a_marks_chunk_replays_moved_with_its_payload_untouched() {
+    let (mut scene, fill) = scene();
+    let (item, payload) = marks_at(0.0, fill);
+    scene.begin_chunk_capture(ChunkPrims::default());
+    scene.push_marks(item, std::sync::Arc::clone(&payload));
+    let chunk = scene.take_chunk_capture();
+    scene.bind_capture(7);
+    scene.finish(&DamageSet::full());
+
+    scene.begin_frame(Size::new(400, 400));
+    let by = Size::new(DevicePx(5.0), DevicePx(7.0));
+    let replayed = scene.replay_chunk(&chunk, by, 7);
+    assert_eq!(replayed.len(), 1);
+    let [moved] = scene.primitives.marks.as_slice() else {
+        panic!("{} marks", scene.primitives.marks.len());
+    };
+    assert_eq!(moved.bounds, [6.0, 8.0, 18.0, 6.0]);
+    assert_eq!(moved.origin, [5.0, 7.0]);
+    assert_eq!(moved.paint_origin, [5.0, 7.0]);
+    assert!(
+        std::sync::Arc::ptr_eq(&scene.primitives.mark_payloads[0], &payload),
+        "the payload is shared, never translated"
+    );
+    assert_eq!(payload.discs[0], [4.0, 4.0, 3.0, 0.0]);
+    assert_eq!(scene.chunk_offsets().get(&7), Some(&[5.0, 7.0]));
+    let provenance = scene.provenance(crate::PrimitiveKind::Marks);
+    assert_eq!(
+        provenance,
+        &[crate::ChunkSlot {
+            revision: 7,
+            index: 0
+        }]
+    );
+}
+
+#[test]
+fn an_extracted_chunk_keeps_each_marks_payload() {
+    let (mut scene, fill) = scene();
+    let (item, payload) = marks_at(0.0, fill);
+    scene.push_marks(item, std::sync::Arc::clone(&payload));
+    let mut chunk = ChunkPrims::default();
+    scene.extract_chunk(0..1, &mut chunk);
+    assert_eq!(chunk.marks.len(), 1);
+    assert!(std::sync::Arc::ptr_eq(&chunk.mark_payloads[0], &payload));
+}
+
+/// A closed triangle inside `(x, y)` to `(x + side, y + side)`.
+fn triangle(x: f64, y: f64, side: f64) -> std::sync::Arc<kurbo::BezPath> {
+    let mut path = kurbo::BezPath::new();
+    path.move_to((x, y));
+    path.line_to((x + side, y));
+    path.line_to((x, y + side));
+    path.close_path();
+    std::sync::Arc::new(path)
+}
+
+#[test]
+fn a_moved_replay_translates_a_drawings_placement() {
+    let (mut scene, fill) = scene();
+    let path = triangle(20.0, 20.0, 10.0);
+    scene.begin_chunk_capture(ChunkPrims::default());
+    scene.push_vector(
+        crate::VectorItem::filled(crate::VectorId(1), std::sync::Arc::clone(&path), fill)
+            .placed(kurbo::Affine::scale(2.0)),
+    );
+    let chunk = scene.take_chunk_capture();
+    let encoded = chunk.vectors[0].local_ink;
+    scene.finish(&DamageSet::full());
+
+    scene.begin_frame(Size::new(400, 400));
+    let before = zgui_profile::counter::get(zgui_profile::Counter::VectorReplaysMoved);
+    scene.replay_chunk(&chunk, Size::new(DevicePx(13.0), DevicePx(-7.0)), 0);
+    let moved = zgui_profile::counter::get(zgui_profile::Counter::VectorReplaysMoved) - before;
+
+    let item = &scene.primitives.vectors[0];
+    assert!(
+        std::sync::Arc::ptr_eq(&item.path, &path),
+        "the path is the one the encoding drew"
+    );
+    assert_eq!(
+        item.placement,
+        kurbo::Affine::translate((13.0, -7.0)) * kurbo::Affine::scale(2.0)
+    );
+    assert_eq!(
+        item.local_ink.origin,
+        Point::new(
+            encoded.origin.x + DevicePx(13.0),
+            encoded.origin.y - DevicePx(7.0)
+        )
+    );
+    assert_eq!(item.local_ink.size, encoded.size);
+    if zgui_profile::COUNTERS_ENABLED {
+        assert_eq!(moved, 1, "one vector item moved");
+    }
+}
+
+#[test]
+fn a_chunks_ink_covers_its_drawings() {
+    let (mut scene, fill) = scene();
+    scene.begin_chunk_capture(ChunkPrims::default());
+    scene.push_quad(Quad::filled(rect(0.0, 0.0, 20.0, 20.0), fill));
+    scene.push_vector(crate::VectorItem::filled(
+        crate::VectorId(1),
+        triangle(0.0, 0.0, 50.0),
+        fill,
+    ));
+    let chunk = scene.take_chunk_capture();
+
+    let ink = chunk.ink.expect("the chunk puts ink somewhere");
+    assert!(
+        ink.contains_rect(chunk.vectors[0].local_ink),
+        "the chunk's ink {ink:?} leaves out its drawing"
+    );
+    assert_eq!(ink.right(), DevicePx(50.0));
+}
+
+#[test]
+fn an_extracted_chunk_keeps_its_drawings() {
+    let (mut scene, fill) = scene();
+    scene.push_quad(Quad::filled(rect(0.0, 0.0, 20.0, 20.0), fill));
+    scene.push_vector(crate::VectorItem::filled(
+        crate::VectorId(1),
+        triangle(0.0, 0.0, 30.0),
+        fill,
+    ));
+    let mut chunk = ChunkPrims::default();
+    scene.extract_chunk(0..scene.ops().len() as u32, &mut chunk);
+    assert_eq!(chunk.ops.len(), 2);
+    assert_eq!(chunk.vectors.len(), 1);
+    assert!(
+        chunk.orders[1] > chunk.orders[0],
+        "the drawing keeps its order above the quad it overlaps"
+    );
+    scene.finish(&DamageSet::full());
+
+    scene.begin_frame(Size::new(400, 400));
+    let replayed = scene.replay_chunk(&chunk, Size::new(DevicePx(0.0), DevicePx(0.0)), 0);
+    assert_eq!(replayed.len(), 2);
+    assert_eq!(scene.primitives.vectors.len(), 1);
+}
+
+/// A primitive pushed after a replayed drawing over only the part of the drawing that reaches past
+/// the rest of its chunk orders above the drawing.
+#[test]
+fn a_later_primitive_over_a_drawings_overflow_orders_above_it() {
+    let (mut scene, fill) = scene();
+    scene.begin_chunk_capture(ChunkPrims::default());
+    scene.push_quad(Quad::filled(rect(0.0, 0.0, 20.0, 20.0), fill));
+    // Reaches thirty pixels to the right of the box.
+    let mut path = kurbo::BezPath::new();
+    path.move_to((0.0, 0.0));
+    path.line_to((50.0, 0.0));
+    path.line_to((50.0, 20.0));
+    path.line_to((0.0, 20.0));
+    path.close_path();
+    scene.push_vector(crate::VectorItem::filled(
+        crate::VectorId(1),
+        std::sync::Arc::new(path),
+        fill,
+    ));
+    let chunk = scene.take_chunk_capture();
+    scene.finish(&DamageSet::full());
+
+    scene.begin_frame(Size::new(400, 400));
+    scene.replay_chunk(&chunk, Size::new(DevicePx(0.0), DevicePx(0.0)), 0);
+    let later = scene
+        .push_quad(Quad::filled(rect(35.0, 5.0, 10.0, 10.0), fill))
+        .expect("on the surface");
+    let drawing = scene.primitives.vectors[0].order;
+    assert!(
+        later > drawing,
+        "the later quad took {later}, under the drawing at {drawing} it covers"
+    );
+}

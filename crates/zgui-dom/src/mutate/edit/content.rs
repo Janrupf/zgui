@@ -113,13 +113,15 @@ impl Edit<'_> {
         }
         if custom && before != after {
             // The reference packs which implementation owns the box and two revisions; which of
-            // the three moved decides what is owed. Ownership appearing or disappearing changes
-            // what kind of box the element generates; a moved layout revision re-measures it; any
-            // movement repaints it.
+            // the three moved decides what is owed. Ownership appearing, disappearing or moving to
+            // another implementation rebuilds the box, which captured the token; a moved layout
+            // revision re-measures it; any movement repaints it.
             owed |= Dirty::REPAINT;
             match (&before, &after) {
                 (Some(PropValue::Integer(before)), Some(PropValue::Integer(after))) => {
-                    if zgui_vocab::prop::custom::relayouts(*before, *after) {
+                    if zgui_vocab::prop::custom::owner_changed(*before, *after) {
+                        owed |= Dirty::REBUILD_BOX | Dirty::RELAYOUT;
+                    } else if zgui_vocab::prop::custom::relayouts(*before, *after) {
                         owed |= Dirty::RELAYOUT;
                     }
                 }
@@ -233,6 +235,42 @@ mod tests {
             !owed.contains(Dirty::REBUILD_BOX),
             "an element that drew and still draws must not replace every box in the document"
         );
+    }
+
+    /// A custom element rebuilt in place gets a new implementation token. The box captured the old
+    /// one, so the new token owes a new box; a moved revision only re-measures.
+    #[test]
+    fn a_custom_element_with_a_new_token_owes_a_new_box() {
+        use zgui_vocab::prop::custom;
+
+        let mut document = Document::new();
+        let root = document.append(
+            document.document_index(),
+            NodeKind::Element,
+            ElementName::new("custom"),
+        );
+        let set = |document: &mut Document, value: i64| {
+            document
+                .edit(&EverythingMatters, |edit| {
+                    edit.set_property(
+                        root,
+                        zgui_vocab::PropKey::new(custom::ELEMENT),
+                        Some(zgui_vocab::PropValue::Integer(value)),
+                    );
+                })
+                .expect("not poisoned");
+            let owed = document.store().core(root).dirty().own();
+            document.store().core(root).dirty().clear_own(Dirty::all());
+            owed
+        };
+        set(&mut document, custom::reference(1, 0, 0));
+
+        let owed = set(&mut document, custom::reference(1, 1, 0));
+        assert!(owed.contains(Dirty::RELAYOUT | Dirty::REPAINT));
+        assert!(!owed.contains(Dirty::REBUILD_BOX));
+
+        let owed = set(&mut document, custom::reference(2, 0, 0));
+        assert!(owed.contains(Dirty::REBUILD_BOX | Dirty::RELAYOUT | Dirty::REPAINT));
     }
 
     /// A field's text changes on every keystroke and paints nothing by itself, so it must not.

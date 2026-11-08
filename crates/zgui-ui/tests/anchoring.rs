@@ -20,10 +20,11 @@ use zgui::geom::{Device, DevicePx, Point, Rect};
 use zgui::prelude::*;
 use zgui::{component, view};
 use zgui_ui::prelude::*;
+use zgui_ui::tooltip::{ARROW_REACH, DEFAULT_OFFSET};
 use zgui_ui_tokens::prelude::*;
 
 use crate::desktop::census::Seen;
-use crate::desktop::stage::{Stage, WIDTH};
+use crate::desktop::stage::{HEIGHT, Stage, WIDTH};
 
 /// The page the fixtures are laid out on.
 ///
@@ -38,6 +39,9 @@ const SHEET: &str = ":root { background-color: #ffffff; color: #101010; font-fam
                      .probe { align-self: flex-start }
                      .probe.at-right { align-self: flex-end }
                      .tall { height: 1200px; flex-shrink: 0 }
+                     .half { height: 340px; flex-shrink: 0 }
+                     .low { height: 760px; flex-shrink: 0 }
+                     .snug { padding-top: 4px }
                      .region { height: 220px; width: 340px; overflow: auto;
                                border: 1px solid #d0d0d0 }
                      .inside { height: 900px; flex-shrink: 0; padding: 24px; gap: 24px }";
@@ -60,6 +64,12 @@ const LIST: &str = "Pound sterlingEuro";
 
 /// How far a rectangle may be from where it belongs before the window looks wrong.
 const SLACK: f32 = 2.0;
+
+/// Long enough for a list's entrance to end, so its box is read where it rests.
+///
+/// The entrance slides the list towards its trigger, so a box read before it ends is off by the
+/// slide.
+const ENTERED: Duration = Duration::from_millis(400);
 
 /// A select whose trigger is shrink-wrapped, so the box saying [`TRIGGER`] is the trigger's box.
 #[component]
@@ -206,7 +216,7 @@ fn a_select_deep_in_a_page(density: f64) {
     );
 
     stage.click_saying(TRIGGER);
-    stage.settle();
+    stage.hold(ENTERED);
 
     assert_under(trigger, innermost_box_saying(&stage, LIST), density);
 }
@@ -233,7 +243,7 @@ fn a_select_at_the_top_of_a_page_opens_its_list_under_its_trigger() {
     let trigger = box_saying(&stage, TRIGGER);
 
     stage.click_saying(TRIGGER);
-    stage.settle();
+    stage.hold(ENTERED);
 
     assert_under(trigger, innermost_box_saying(&stage, LIST), DENSE);
 }
@@ -261,7 +271,7 @@ fn a_select_at_the_bottom_of_the_window_opens_its_list_above_its_trigger() {
     );
 
     stage.click_saying(TRIGGER);
-    stage.settle();
+    stage.hold(ENTERED);
 
     let list = innermost_box_saying(&stage, LIST);
     let wanted = GAP * DENSE as f32;
@@ -293,7 +303,7 @@ fn a_select_against_the_right_edge_shifts_its_list_back_inside_the_window() {
     );
 
     stage.click_saying(TRIGGER);
-    stage.settle();
+    stage.hold(ENTERED);
 
     let list = innermost_box_saying(&stage, LIST);
     assert!(
@@ -337,7 +347,7 @@ fn a_select_opened_after_the_page_has_scrolled_since_it_last_opened_follows_its_
         (400.0..600.0).contains(&rect.origin.y.0)
     });
     stage.click_saying(TRIGGER);
-    stage.settle();
+    stage.hold(ENTERED);
     assert_under(first, innermost_box_saying(&stage, LIST), DENSE);
     // The clock as well as the frames: a surface is kept mounted through its exit animation, so a
     // list that has been dismissed and not yet faded out is still a box in the window.
@@ -353,7 +363,7 @@ fn a_select_opened_after_the_page_has_scrolled_since_it_last_opened_follows_its_
     });
 
     stage.click_saying(TRIGGER);
-    stage.settle();
+    stage.hold(ENTERED);
 
     assert_under(trigger, innermost_box_saying(&stage, LIST), DENSE);
 }
@@ -379,7 +389,7 @@ fn a_select_inside_a_scrolled_region_opens_its_list_under_its_trigger() {
     );
 
     stage.click_saying(TRIGGER);
-    stage.settle();
+    stage.hold(ENTERED);
 
     assert_under(trigger, innermost_box_saying(&stage, LIST), DENSE);
 }
@@ -411,4 +421,290 @@ fn a_select_inside_a_dialog_opens_its_list_under_its_trigger() {
     stage.hold(Duration::from_millis(400));
 
     assert_under(trigger, innermost_box_saying(&stage, LIST), DENSE);
+}
+
+// ---- a tooltip keeps its arrow off the control it names -----------------------------------------
+
+/// What the tooltip in [`Named`] says, which is how its panel is found.
+const NAMED: &str = "Bold";
+
+/// What the tooltip's trigger says, which is how the trigger's box is found.
+const NAMES: &str = "B";
+
+/// A control with a tooltip, shrink-wrapped so the probe's box is the trigger's box.
+#[component]
+fn Named() -> impl IntoView {
+    view! {
+        row(class = "probe") {
+            Tooltip {
+                TooltipTrigger {control {{NAMES}}}
+                TooltipContent {{NAMED}}
+            }
+        }
+    }
+}
+
+/// The panel of the open tooltip that says `text`.
+///
+/// The largest box saying it that is not the overlay band. A tooltip's words are on the panel, on
+/// the positioner around it and on the run of text inside it, and the band the whole thing is
+/// portalled onto is the size of the window — so the panel is the largest of what is left.
+fn panel_saying(stage: &Stage, text: &str) -> Rect<DevicePx, Device> {
+    let band = WIDTH * HEIGHT / 4.0;
+    laid_out(stage, text)
+        .into_iter()
+        .filter(|seen| seen.area() < band)
+        .max_by(|one, two| one.area().total_cmp(&two.area()))
+        .and_then(|seen| seen.rect)
+        .unwrap_or_else(|| panic!("no panel says {text:?}"))
+}
+
+/// Raises the tooltip of a [`Named`] probe and hands back the trigger's box and the panel's.
+fn named(stage: &mut Stage) -> (Rect<DevicePx, Device>, Rect<DevicePx, Device>) {
+    let trigger = box_saying(stage, NAMES);
+    let at = Point::new(
+        DevicePx(trigger.origin.x.0 + trigger.size.width.0 / 2.0),
+        DevicePx(trigger.origin.y.0 + trigger.size.height.0 / 2.0),
+    );
+    stage.move_to(at);
+    stage.hold(Duration::from_millis(200));
+    (trigger, panel_saying(stage, NAMED))
+}
+
+#[test]
+fn a_tooltip_stands_far_enough_off_its_trigger_for_its_arrow() {
+    let mut stage = opened(1.0, || {
+        view! {
+            ThemeProvider {
+                column(class = "page") {text {"over it"}Named()text {"under it"}}
+            }
+        }
+    });
+
+    let (trigger, panel) = named(&mut stage);
+
+    let gap = trigger.origin.y.0 - (panel.origin.y.0 + panel.size.height.0);
+    assert!(
+        (gap - DEFAULT_OFFSET).abs() <= SLACK,
+        "the tooltip's bottom edge is {gap} device pixels above the trigger's top edge rather \
+         than {DEFAULT_OFFSET}; trigger {trigger:?}, tooltip {panel:?}"
+    );
+    assert!(
+        gap > ARROW_REACH,
+        "the arrow reaches {ARROW_REACH} device pixels out of a panel {gap} away, so its tip \
+         lies on the trigger"
+    );
+}
+
+#[test]
+fn a_tooltip_with_no_room_above_flips_below_its_trigger_and_keeps_the_gap() {
+    let mut stage = opened(1.0, || {
+        view! {
+            ThemeProvider {
+                column(class = "page", class = "snug") {Named()text {"under it"}}
+            }
+        }
+    });
+
+    let (trigger, panel) = named(&mut stage);
+
+    let gap = panel.origin.y.0 - (trigger.origin.y.0 + trigger.size.height.0);
+    assert!(
+        (gap - DEFAULT_OFFSET).abs() <= SLACK,
+        "there was no room above, so the tooltip's top edge belongs {DEFAULT_OFFSET} device \
+         pixels below the trigger's bottom edge rather than {gap}; trigger {trigger:?}, \
+         tooltip {panel:?}"
+    );
+}
+
+// ---- a menubar's menu --------------------------------------------------------------------------
+
+/// What the menubar's menu says, all of it, which is how its panel is found.
+const MENU: &str = "New windowClose every tab";
+
+#[test]
+fn a_menubar_menu_hangs_from_the_start_of_its_trigger() {
+    let mut stage = opened(1.0, || {
+        view! {
+            ThemeProvider {
+                column(class = "page") {
+                    row(class = "probe") {
+                        Menubar {
+                            MenubarMenu(value = "file") {
+                                MenubarTrigger {"File"}
+                                MenubarContent {
+                                    MenubarItem {"New window"}
+                                    MenubarItem {"Close every tab"}
+                                }
+                            }
+                            MenubarMenu(value = "edit") {
+                                MenubarTrigger {"Edit"}
+                                MenubarContent {MenubarItem {"Undo"}}
+                            }
+                        }
+                    }
+                    text {"under it"}
+                }
+            }
+        }
+    });
+    let trigger = box_saying(&stage, "File");
+
+    stage.click_saying("File");
+    stage.settle();
+
+    let menu = panel_saying(&stage, MENU);
+    assert!(
+        menu.size.width.0 > trigger.size.width.0 + 2.0 * SLACK,
+        "the menu is no wider than its trigger, so the fixture cannot tell start from centre; \
+         trigger {trigger:?}, menu {menu:?}"
+    );
+    let across = menu.origin.x.0 - trigger.origin.x.0;
+    assert!(
+        across.abs() <= SLACK,
+        "the menu's left edge is {across} device pixels from its trigger's; trigger {trigger:?}, \
+         menu {menu:?}"
+    );
+}
+
+// ---- a surface taller than the room in the window ----------------------------------------------
+
+/// How many rows the long lists below have: more than the window holds at any density here.
+const ROWS: usize = 30;
+
+/// The text of row `n`.
+fn row_text(n: usize) -> String {
+    format!("Row {n:02}")
+}
+
+/// What a long list says, all of it.
+fn long_list_text() -> String {
+    (1..=ROWS).map(row_text).collect()
+}
+
+/// A dropdown menu with [`ROWS`] items.
+#[component]
+fn LongMenu() -> impl IntoView {
+    view! {
+        row(class = "probe") {
+            DropdownMenu {
+                DropdownMenuTrigger {"Long menu"}
+                DropdownMenuContent {
+                    {(1..=ROWS)
+                        .map(|n| view! { MenuItem {{row_text(n)}} }.into_view())
+                        .collect::<Vec<_>>()}
+                }
+            }
+        }
+    }
+}
+
+/// A select with [`ROWS`] items, whose trigger says [`TRIGGER`].
+#[component]
+fn LongSelect() -> impl IntoView {
+    let value = RwSignal::new_local(String::new());
+    view! {
+        row(class = "probe") {
+            Select(value = value) {
+                SelectTrigger(a11y:label = "Row") {SelectValue(placeholder = TRIGGER)}
+                SelectContent {
+                    {(1..=ROWS)
+                        .map(|n| {
+                            view! { SelectItem(value = n.to_string()) {{row_text(n)}} }.into_view()
+                        })
+                        .collect::<Vec<_>>()}
+                }
+            }
+        }
+    }
+}
+
+/// Asserts that `panel` is inside the window, the padding kept at both ends, at `density`.
+fn assert_inside(panel: Rect<DevicePx, Device>, density: f64) {
+    let padding = 8.0 * density as f32;
+    let bottom = panel.origin.y.0 + panel.size.height.0;
+    assert!(
+        panel.origin.y.0 >= padding - SLACK && bottom <= HEIGHT - padding + SLACK,
+        "the list runs from {} to {bottom}, outside the {padding} device pixels the window keeps \
+         clear at either end: {panel:?}",
+        panel.origin.y.0
+    );
+}
+
+/// Turns the wheel over `panel` and asserts that its last row comes up.
+fn assert_scrolls(stage: &mut Stage, panel: Rect<DevicePx, Device>) {
+    let last = row_text(ROWS);
+    let before = box_saying(stage, &last);
+    stage.move_to(Point::new(
+        DevicePx(panel.origin.x.0 + panel.size.width.0 / 2.0),
+        DevicePx(panel.origin.y.0 + panel.size.height.0 / 2.0),
+    ));
+    for _ in 0..40 {
+        stage.wheel(3.0);
+    }
+    let after = box_saying(stage, &last);
+    assert!(
+        after.origin.y.0 < before.origin.y.0,
+        "the wheel over the list did not bring its last row up: {before:?} then {after:?}"
+    );
+    assert!(
+        after.origin.y.0 + after.size.height.0 <= panel.origin.y.0 + panel.size.height.0 + SLACK,
+        "the last row is still below the bottom of the list: {after:?} in {panel:?}"
+    );
+}
+
+#[test]
+fn a_long_dropdown_menu_in_the_middle_of_the_window_is_capped_to_the_window_and_scrolls() {
+    let mut stage = opened(DENSE, || {
+        view! {
+            ThemeProvider {
+                column(class = "page") {box(class = "half")LongMenu()text {"under it"}}
+            }
+        }
+    });
+    stage.click_saying("Long menu");
+    stage.settle();
+
+    let panel = panel_saying(&stage, &long_list_text());
+    assert_inside(panel, DENSE);
+    assert_scrolls(&mut stage, panel);
+}
+
+#[test]
+fn a_long_select_in_the_middle_of_the_window_is_capped_to_the_window_and_scrolls() {
+    let mut stage = opened(DENSE, || {
+        view! {
+            ThemeProvider {
+                column(class = "page") {box(class = "half")LongSelect()text {"under it"}}
+            }
+        }
+    });
+    stage.click_saying(TRIGGER);
+    stage.hold(ENTERED);
+
+    let panel = panel_saying(&stage, &long_list_text());
+    assert_inside(panel, DENSE);
+    assert_scrolls(&mut stage, panel);
+}
+
+#[test]
+fn a_long_select_near_the_bottom_of_the_window_opens_above_and_is_capped() {
+    let mut stage = opened(1.0, || {
+        view! {
+            ThemeProvider {
+                column(class = "page") {box(class = "low")LongSelect()text {"under it"}}
+            }
+        }
+    });
+    let trigger = box_saying(&stage, TRIGGER);
+    stage.click_saying(TRIGGER);
+    stage.hold(ENTERED);
+
+    let panel = panel_saying(&stage, &long_list_text());
+    assert_inside(panel, 1.0);
+    assert!(
+        panel.origin.y.0 + panel.size.height.0 <= trigger.origin.y.0,
+        "there is more room above, so the list opens above its trigger: {panel:?} against \
+         {trigger:?}"
+    );
 }

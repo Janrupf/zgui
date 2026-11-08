@@ -17,7 +17,9 @@ mod desktop;
 mod device;
 mod painted;
 
+use core::cell::Cell;
 use core::time::Duration;
+use std::rc::Rc;
 
 use zgui::geom::DevicePx;
 use zgui::view;
@@ -283,6 +285,41 @@ fn a_combobox_opens_when_its_field_is_asked_for_the_list_and_its_items_are_paint
 
     // A combobox is a field before it is a list: a press puts the caret in it, and what asks for
     // the list is asking for the list. That is the gesture, and it is the one measured here.
+    stage.press_named(zgui::vocab::NamedKey::ArrowDown);
+    stage.wait(SETTLED);
+    assert_painted(&stage, "United Kingdom");
+}
+
+#[test]
+fn picking_a_combobox_option_with_the_pointer_leaves_the_field_focused() {
+    let mut stage = staged!(|| AnyView::new(view! {
+        ThemeProvider {
+            column(class = "page") {
+                Combobox {
+                    ComboboxInput(placeholder = "Search countries", label = "Country")
+                    ComboboxContent {
+                        ComboboxItem(value = "gb") {"United Kingdom"}
+                        ComboboxItem(value = "ie") {"Ireland"}
+                    }
+                }
+            }
+        }
+    }));
+    stage.press_named(zgui::vocab::NamedKey::Tab);
+    let field = stage.focused().expect("tab reached the field");
+    stage.press_named(zgui::vocab::NamedKey::ArrowDown);
+    stage.wait(SETTLED);
+    assert_painted(&stage, "Ireland");
+
+    stage.click(aim(&stage, "Ireland"));
+    stage.wait(SETTLED);
+    assert_absent(&stage, "United Kingdom");
+    assert_eq!(
+        stage.focused(),
+        Some(field),
+        "the pick took focus off the field"
+    );
+
     stage.press_named(zgui::vocab::NamedKey::ArrowDown);
     stage.wait(SETTLED);
     assert_painted(&stage, "United Kingdom");
@@ -702,4 +739,106 @@ fn a_command_list_paints_its_items_without_being_opened() {
         }
     }));
     assert_painted(&stage, "New invoice");
+}
+
+#[test]
+fn picking_a_command_with_the_pointer_leaves_the_field_focused() {
+    let ran = Rc::new(Cell::new(false));
+    let told = Rc::clone(&ran);
+    let mut stage = staged!(move || {
+        let told = Rc::clone(&told);
+        AnyView::new(view! {
+            ThemeProvider {
+                column(class = "page") {
+                    Command {
+                        CommandInput(placeholder = "Type a command…", label = "Command")
+                        CommandList {
+                            CommandItem(value = "invoice.new", text = "New invoice") {
+                                "New invoice"
+                            }
+                            CommandItem(
+                                value = "invoice.export",
+                                text = "Export invoices",
+                                on_select = zgui::reactive::UnsyncCallback::new(
+                                    move |()| told.set(true)
+                                )
+                            ) {
+                                "Export invoices"
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    });
+    stage.press_named(zgui::vocab::NamedKey::Tab);
+    let field = stage.focused().expect("tab reached the field");
+
+    stage.click(aim(&stage, "Export invoices"));
+    stage.wait(SETTLED);
+    assert!(ran.get(), "the press ran the command");
+    assert_eq!(
+        stage.focused(),
+        Some(field),
+        "the pick took focus off the field"
+    );
+}
+
+// ---- a caller's ref on the trigger -------------------------------------------------------------
+
+#[test]
+fn a_native_select_with_a_callers_ref_opens_and_closes_on_a_press() {
+    let made = Rc::new(Cell::new(None));
+    let keep = Rc::clone(&made);
+    let mut stage = staged!(move || {
+        let field = zgui::prelude::NodeRef::new();
+        keep.set(Some(field));
+        AnyView::new(view! {
+            ThemeProvider {
+                column(class = "page") {
+                    NativeSelect(node_ref = field, placeholder = "Choose a reason", a11y:label = "Reason") {
+                        NativeSelectOption(value = "price") {"Too expensive"}
+                        NativeSelectOption(value = "use") {"Not used enough"}
+                    }
+                }
+            }
+        })
+    });
+    let field = made.get().expect("the view was built");
+    assert!(field.get().is_some(), "the caller's ref is bound");
+
+    stage.click(aim(&stage, "Choose a reason"));
+    stage.wait(SETTLED);
+    assert_painted(&stage, "Not used enough");
+
+    stage.click(aim(&stage, "Choose a reason"));
+    stage.wait(SETTLED);
+    assert_absent(&stage, "Not used enough");
+}
+
+#[test]
+fn a_date_picker_with_a_callers_ref_opens_and_closes_on_a_press() {
+    let made = Rc::new(Cell::new(None));
+    let keep = Rc::clone(&made);
+    let mut stage = staged!(move || {
+        let field = zgui::prelude::NodeRef::new();
+        keep.set(Some(field));
+        AnyView::new(view! {
+            ThemeProvider {
+                column(class = "page") {
+                    DatePicker(node_ref = field, label = "Day", placeholder = "Pick a day")
+                }
+            }
+        })
+    });
+    let field = made.get().expect("the view was built");
+    assert!(field.get().is_some(), "the caller's ref is bound");
+
+    stage.click(aim(&stage, "Pick a day"));
+    stage.wait(SETTLED);
+    assert_painted(&stage, "Su");
+
+    stage.click(aim(&stage, "Pick a day"));
+    stage.wait(SETTLED);
+    assert_absent(&stage, "Su");
 }

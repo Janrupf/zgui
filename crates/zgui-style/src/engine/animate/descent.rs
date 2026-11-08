@@ -8,9 +8,10 @@
 //! never restyles, and the hint it is still carrying is what the *ordinary* traversal then refuses
 //! to process.
 //!
-//! Raising the flag is therefore part of asking for an animation restyle, not a separate step a
-//! caller may forget. It is cleared by the traversal that reads it, which is what makes storing it
-//! safe: one storage, one retirement, inside one traversal.
+//! The restyle raises the flag from every element marked since the last restyle, from where the
+//! element stands at that moment, so an element a view moved in between is reached in its new
+//! place. It is cleared by the traversal that reads it, which is what makes storing it safe: one
+//! storage, one retirement, inside one traversal.
 
 use style::dom::TNode;
 use zgui_dom::Node;
@@ -26,6 +27,16 @@ pub fn raise_to_root(node: Node<'_>) {
         element.note_animation_work_below();
         ancestor = element.traversal_parent();
     }
+}
+
+/// The element at the top of `node`'s chain of traversal parents: the root for a node in the
+/// document, the top of the fragment for a node taken out of it.
+pub fn top_of(node: Node<'_>) -> Option<zgui_dom::NodeIndex> {
+    let mut top = node.as_element()?;
+    while let Some(parent) = top.traversal_parent() {
+        top = parent;
+    }
+    Some(top.index())
 }
 
 /// Forgets that an animation-only restyle is pending below `element`.

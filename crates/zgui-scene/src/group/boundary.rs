@@ -22,7 +22,7 @@ use crate::spatial::SpatialId;
 pub struct GroupBoundary {
     /// Where this draws in the painting order.
     pub order: DrawOrder,
-    /// What the group writes.
+    /// What the group writes, in the coordinates of [`GroupBoundary::transform`].
     pub bounds: Rect<DevicePx, Device>,
     /// What the group **reads**, which is [`GroupBoundary::bounds`] inflated by the filter chain's
     /// kernel support.

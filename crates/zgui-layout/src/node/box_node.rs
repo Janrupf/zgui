@@ -1,10 +1,11 @@
 //! One box of the box tree.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use zgui_css::ComputedStyle;
 use zgui_dom::NodeKey;
 use zgui_dom::side::BoxKey;
 
-use crate::node::grid_names::GridNames;
 use crate::node::kind::{BoxKind, FormattingContext, PaintedContent, PseudoKind};
 
 /// One box in the box tree.
@@ -60,8 +61,59 @@ pub struct BoxNode {
     pub text: Option<Box<str>>,
     /// What this box's own fragment paints. Rare payloads live in sparse store columns.
     pub painted: PaintedContent,
-    /// The grid line and area names, if this box is a grid container that names any.
-    pub grid: Option<Box<GridNames>>,
+    /// On a box of an inline formatting context: whether an atomic inline in its content sizes
+    /// its block axis with a percentage.
+    ///
+    /// Such a percentage resolves against the block size of the context root's containing block,
+    /// so the root keeps that size in its layout question. The box tree keeps it current when it
+    /// builds and patches boxes.
+    pub atomic_percent_block: bool,
+    /// Whether the children are known to paint in layout order.
+    ///
+    /// See [`LayoutOrderMemo`].
+    pub(crate) layout_order: LayoutOrderMemo,
+}
+
+/// A remembered "yes" from
+/// [`children_in_layout_order`](crate::fragment::stacking::children_in_layout_order).
+///
+/// The store clears it on each write that can change the answer: a write through
+/// [`LayoutStore::get_mut`](crate::tree::store::LayoutStore::get_mut) to the box or to one of its
+/// children, a removed child, a changed out-of-flow record, and a child style that changes
+/// [`sort_inputs`](crate::fragment::stacking::sort_inputs). Only an answer that reads nothing but
+/// the box and its children is kept. A child whose parent is another box, or an absolute or fixed
+/// child with an out-of-flow record, keeps the memo clear.
+///
+/// A removed box must leave its parent's child list in the same write phase: after
+/// [`LayoutStore::recycle`](crate::tree::store::LayoutStore::recycle) its record is gone and its
+/// key sorts differently.
+///
+/// Atomic, so a reader that holds the store shared can record the answer. Each write that clears
+/// it holds the store exclusively. A copy of the box starts clear.
+#[derive(Debug, Default)]
+pub(crate) struct LayoutOrderMemo(AtomicBool);
+
+impl LayoutOrderMemo {
+    /// Whether a "yes" is held.
+    pub(crate) fn known(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Holds a "yes".
+    pub(crate) fn remember(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// Drops the held answer.
+    pub(crate) fn clear(&mut self) {
+        *self.0.get_mut() = false;
+    }
+}
+
+impl Clone for LayoutOrderMemo {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
 }
 
 impl BoxNode {
@@ -80,7 +132,8 @@ impl BoxNode {
             block_level: false,
             text: None,
             painted: PaintedContent::Box,
-            grid: None,
+            atomic_percent_block: false,
+            layout_order: LayoutOrderMemo::default(),
         }
     }
 
@@ -110,8 +163,15 @@ impl BoxNode {
         self.children.is_empty() && self.paint_children.is_empty()
     }
 
-    /// The grid line and area names this box carries, if it carries any.
-    pub fn grid_names(&self) -> Option<&GridNames> {
-        self.grid.as_deref()
+    /// Whether this is a nested inline box: a box inside an inline formatting context that is
+    /// not an atomic inline.
+    ///
+    /// Such a box has no rectangle of its own size. The lines it is on paint its parts.
+    pub fn is_nested_inline(&self) -> bool {
+        self.parent_fc == FormattingContext::Inline
+            && !matches!(
+                self.fc,
+                FormattingContext::Atomic | FormattingContext::Replaced | FormattingContext::Custom
+            )
     }
 }

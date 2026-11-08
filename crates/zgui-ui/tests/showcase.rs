@@ -20,12 +20,10 @@
 //! panel — which is a second thing that can go wrong between the claim and the picture — a section
 //! is drawn at once onto a surface tall enough to hold it.
 //!
-//! Two things make that a claim rather than an arrangement, and both are checked instead of
-//! assumed. A page can grow past the surface, and a region below the last row reads back as the
-//! colour of nothing; [`on_surface`] refuses one. And a frame can plan more vector passes than the
-//! rasteriser has scratch layers to keep apart, at which point it loses its vector content whole;
-//! [`Part`] is why one section is mounted at a time rather than the whole gallery. Both failures
-//! look, pixel for pixel, exactly like the failures this file exists to catch, so neither is left
+//! That is a claim rather than an arrangement, because it is checked instead of assumed. A page can
+//! grow past the surface, and a region below the last row reads back as the colour of nothing;
+//! [`on_surface`] refuses one, and [`Part`] mounts one section at a time so each fits. That failure
+//! looks, pixel for pixel, exactly like the failures this file exists to catch, so it is not left
 //! to be discovered as one.
 
 mod desktop;
@@ -56,7 +54,7 @@ use zgui_ui_tokens::prelude::{ColorScheme, ThemeProviderProps};
 use crate::desktop::census::Census;
 use crate::desktop::grab::{self, Grab};
 use crate::device::Log;
-use crate::device::frame::Frame;
+use crate::device::frame::{Drawing, Frame};
 use crate::section::{ArtworkProps, StyledTextProps, SvgProps};
 
 /// How wide the surface is drawn, in device pixels.
@@ -190,6 +188,22 @@ struct Opened {
     frames: Vec<Frame>,
     /// Each region of [`Part::regions`] that was found, by name.
     regions: Vec<(String, Rect<DevicePx, Device>)>,
+    /// The smallest node saying each region's name, where it is not the region itself. See
+    /// [`drawn_extent`].
+    captions: Vec<(String, Rect<DevicePx, Device>)>,
+    /// The box of every element in the document.
+    boxes: Vec<Rect<DevicePx, Device>>,
+}
+
+/// Where things were laid out, read while the window was open.
+#[derive(Default)]
+struct Found {
+    /// See [`Opened::regions`].
+    regions: Vec<(String, Rect<DevicePx, Device>)>,
+    /// See [`Opened::captions`].
+    captions: Vec<(String, Rect<DevicePx, Device>)>,
+    /// See [`Opened::boxes`].
+    boxes: Vec<Rect<DevicePx, Device>>,
 }
 
 /// One section's run, or nothing on a machine with no graphics device.
@@ -208,7 +222,7 @@ macro_rules! opened {
 /// Drives the application over buffers until it settles, and records where the regions are.
 fn buffers(
     part: Part,
-    regions: &Mutex<Vec<(String, Rect<DevicePx, Device>)>>,
+    found: &Mutex<Found>,
 ) -> impl FnOnce(Box<dyn AppHandler>) -> Result<(), PlatformError> + '_ {
     move |handler| {
         let mut harness = zgui_platform_headless::Harness::new(handler);
@@ -220,19 +234,27 @@ fn buffers(
         // Read while the window is still open: the document goes with it.
         if let Some(handles) = grab::taken() {
             let census = Census::take(&handles);
-            let mut found = regions.lock().unwrap_or_else(|held| held.into_inner());
+            let mut found = found.lock().unwrap_or_else(|held| held.into_inner());
             for name in part.regions() {
                 if let Some(rect) = census.outermost(name).and_then(|node| node.rect) {
                     on_surface(name, rect);
-                    found.push(((*name).to_owned(), rect));
+                    found.regions.push(((*name).to_owned(), rect));
+                    // The smallest node saying the name. In a region of a drawing and its
+                    // caption, that is the caption.
+                    if let Some(caption) = census.control(name).and_then(|node| node.rect)
+                        && caption != rect
+                    {
+                        found.captions.push(((*name).to_owned(), caption));
+                    }
                 }
             }
             for title in part.panels() {
                 if let Some(rect) = census.panel(title).and_then(|node| node.rect) {
                     on_surface(title, rect);
-                    found.push(((*title).to_owned(), rect));
+                    found.regions.push(((*title).to_owned(), rect));
                 }
             }
+            found.boxes = census.nodes.iter().filter_map(|node| node.rect).collect();
         }
         harness.shut_down();
         Ok(())
@@ -274,27 +296,28 @@ fn run(part: Part) -> Option<&'static Opened> {
             let _guard = device::device_lock();
             grab::forget();
             let log: Log = Arc::new(Mutex::new(Vec::new()));
-            let regions = Mutex::new(Vec::new());
+            let found = Mutex::new(Found::default());
             zgui::app()
                 .with_title("gallery")
                 .with_size(WIDTH, HEIGHT)
                 .with_stylesheet(crate::shell::SHEET)
                 .with_renderer(Box::new(device::factory(&log)))
-                .run_on(buffers(part, &regions), move || (Grab, part.view()))
+                .run_on(buffers(part, &found), move || (Grab, part.view()))
                 .expect("the gallery ran");
             let frames = core::mem::take(&mut *log.lock().unwrap_or_else(|held| held.into_inner()));
             assert!(!frames.is_empty(), "the gallery drew no frame at all");
+            let found = found.into_inner().unwrap_or_else(|held| held.into_inner());
             Some(Opened {
                 frames,
-                regions: regions
-                    .into_inner()
-                    .unwrap_or_else(|held| held.into_inner()),
+                regions: found.regions,
+                captions: found.captions,
+                boxes: found.boxes,
             })
         })
         .as_ref()
 }
 
-/// The last frame that held any vector content at all.
+/// The last frame that drew anything.
 ///
 /// Not simply the last frame: once the page has settled the application draws frames that damage
 /// nothing, and their display lists are empty, so every question asked of one comes back the same
@@ -304,8 +327,17 @@ fn settled(opened: &Opened) -> &Frame {
         .frames
         .iter()
         .rev()
-        .find(|frame| !frame.drawings.is_empty())
-        .expect("some frame of the gallery held a drawing")
+        .find(|frame| {
+            !frame.quads.is_empty() || !frame.glyphs.is_empty() || !frame.drawings.is_empty()
+        })
+        .expect("some frame of the gallery drew something")
+}
+
+/// The shapes of the drawings inside the region named `name`.
+///
+/// Every shape a drawing can arrive as, less the quads that are an element's background.
+fn drawn(frame: &Frame, opened: &Opened, name: &str) -> Vec<Drawing> {
+    frame.shapes_in(region(opened, name), &opened.boxes)
 }
 
 /// Where the region named `name` ended up.
@@ -423,14 +455,22 @@ fn run_size(frame: &Frame, opened: &Opened, name: &str) -> (f32, f32) {
     (extent.2 - extent.0, extent.3 - extent.1)
 }
 
-/// The rectangle every drawing inside `rect` covers between them, in whole pixels.
+/// The rectangle the drawings inside the region named `name` cover between them.
 ///
-/// Only the *vector* items, which is what a promoted run and a vector document both produce. Small
-/// upright labels are served from the glyph atlas and are not drawings, so a caption under a cell
-/// cannot widen the answer.
-fn drawn_extent(frame: &Frame, rect: Rect<DevicePx, Device>) -> Option<(f32, f32, f32, f32)> {
+/// The shapes of [`drawn`] outside the region's caption, so the caption under a cell cannot widen
+/// the answer. The caption is removed by its own box, because a glyph can arrive as a coverage
+/// sprite exactly as a small drawing can.
+fn drawn_extent(frame: &Frame, opened: &Opened, name: &str) -> Option<(f32, f32, f32, f32)> {
+    let caption = opened
+        .captions
+        .iter()
+        .find(|(found, _)| found == name)
+        .map(|(_, caption)| *caption);
     let mut found: Option<(f32, f32, f32, f32)> = None;
-    for drawing in frame.drawings.iter().filter(|item| within(rect, item.ink)) {
+    for drawing in drawn(frame, opened, name)
+        .into_iter()
+        .filter(|shape| caption.is_none_or(|caption| !within(caption, shape.ink)))
+    {
         let ink = drawing.ink;
         let next = (
             ink.origin.x.0,
@@ -457,9 +497,12 @@ fn drawn_extent(frame: &Frame, rect: Rect<DevicePx, Device>) -> Option<(f32, f32
 ///
 /// Panics when nothing was drawn there, which is the answer these assertions exist to notice.
 fn drawn_size(frame: &Frame, opened: &Opened, name: &str) -> (f32, f32) {
-    let rect = region(opened, name);
-    let extent = drawn_extent(frame, rect)
-        .unwrap_or_else(|| panic!("no drawing at all landed inside the {name:?} region {rect:?}"));
+    let extent = drawn_extent(frame, opened, name).unwrap_or_else(|| {
+        panic!(
+            "no drawing at all landed inside the {name:?} region {:?}",
+            region(opened, name)
+        )
+    });
     (extent.2 - extent.0, extent.3 - extent.1)
 }
 
@@ -484,7 +527,7 @@ fn every_drawing_in_the_new_panels_marks_the_pixels_it_claimed() {
         for name in part.regions() {
             let rect = region(opened, name);
             let behind = background(frame, rect);
-            for drawing in frame.drawings.iter().filter(|item| within(rect, item.ink)) {
+            for drawing in drawn(frame, opened, name) {
                 counted += 1;
                 if !marks_its_rectangle(frame, drawing.ink, behind) {
                     blank.push((*name, drawing.order, drawing.ink));
@@ -727,8 +770,7 @@ fn a_colour_asset_and_a_monochrome_one_side_by_side_answer_their_context_differe
 fn a_document_with_a_ramp_and_a_clip_draws_the_ramp_and_only_inside_the_clip() {
     let opened = opened!(Part::Svg);
     let frame = settled(opened);
-    let rect = region(opened, "facet on rose");
-    let ink = drawn_extent(frame, rect).expect("the facet drew something");
+    let ink = drawn_extent(frame, opened, "facet on rose").expect("the facet drew something");
 
     // The ramp runs from the top-left corner of the document to the bottom-right, so across the
     // middle of the drawing red falls and blue rises. Sampling that rather than looking for the
@@ -839,8 +881,8 @@ fn a_documents_own_aspect_rule_decides_what_shape_its_contents_come_out() {
     );
 
     // Further left: the two differ by where the square sits, which is what `xMin` says.
-    let met = drawn_extent(frame, region(opened, "aspect xMidYMid meet")).expect("meet drew");
-    let left = drawn_extent(frame, region(opened, "aspect xMinYMid meet")).expect("left drew");
+    let met = drawn_extent(frame, opened, "aspect xMidYMid meet").expect("meet drew");
+    let left = drawn_extent(frame, opened, "aspect xMinYMid meet").expect("left drew");
     let met_offset = met.0 - region(opened, "aspect xMidYMid meet").origin.x.0;
     let left_offset = left.0 - region(opened, "aspect xMinYMid meet").origin.x.0;
     assert!(

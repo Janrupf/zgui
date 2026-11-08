@@ -1,13 +1,14 @@
 //! Where a palette's commands are shown, and the dialog one usually lives in.
 
 use zgui::prelude::*;
-use zgui::view::ClassName;
+use zgui::view::{AttrName, ClassName};
 use zgui::{component, view};
 
 use crate::command::CommandProps;
 use crate::command::SHEET;
 use crate::command::style::CommandStyle;
 use crate::dialog::{DialogContentProps, DialogTitleProps};
+use crate::listbox::ListboxGroup;
 use crate::menu::MenuLabelProps;
 use crate::overlay::{OverlayState, SurfaceLabels};
 use zgui_ui_primitives::Binding;
@@ -90,12 +91,18 @@ pub fn CommandGroup(
 ) -> impl IntoView {
     install_stylesheet(SHEET, CommandStyle::CSS);
     let heading = label.clone();
-    let mut semantics = A11yBinding::new(Role::Group);
+    // A group with no command left after the filter hides with its heading. Its commands stay
+    // built, so each one comes back the moment the filter lets it.
+    let group = ListboxGroup::new().provide();
+    let mut semantics = A11yBinding::new(Role::Group).hidden(move || group.is_empty());
     if let Some(text) = label {
         semantics = semantics.label(text);
     }
     let own = Attrs::new()
         .class_toggle(ClassName::new("zui-command__group"), true)
+        .attribute(AttrName::new("hidden"), move || {
+            group.is_empty().then(|| "true".to_owned())
+        })
         .a11y_from(semantics);
 
     view! {

@@ -35,6 +35,11 @@
 //! has none of them. A build needs neither the library nor its headers, and a display whose
 //! machine has no `libgbm` falls back to copying each frame.
 
+// Every item here calls into libgbm over a file descriptor, and `std::os::fd` exists only on a
+// Unix host, so on any other platform this crate is empty and `cargo check --workspace` passes on
+// a machine this code could never run on. It is gated whole rather than item by item, as
+// `zgui-drm` and `zgui-evdev` are, because those are split into modules and this is one file.
+#![cfg(target_os = "linux")]
 #![deny(missing_docs)]
 // This crate is on the unsafe ledger's allowlist for one reason: libgbm is opened at run time and
 // every call into it is a call through a pointer resolved here. A build that linked it would stop a

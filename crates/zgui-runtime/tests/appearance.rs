@@ -77,6 +77,8 @@ struct Frame {
     lines: Vec<Line>,
     /// The group markers it pushed.
     markers: Vec<Marker>,
+    /// The rectangle each outer shadow is cast from, as `[x, y, width, height]`.
+    shadows: Vec<[f32; 4]>,
 }
 
 /// The frames a run produced, in order.
@@ -129,6 +131,12 @@ impl Renderer for Recorder {
                     bounds: line.bounds,
                     style: line.style,
                 })
+                .collect(),
+            shadows: scene
+                .primitives
+                .shadows
+                .iter()
+                .map(|shadow| shadow.element_bounds)
                 .collect(),
             markers: scene
                 .primitives
@@ -330,8 +338,10 @@ fn every_line_of_text_inside_a_decorated_box_is_decorated() {
     );
     // A strike sits inside the line box it crosses rather than under it, which is what says the
     // line was placed against the text rather than at some fixed offset from the box.
+    // Primitives are recorded in their own space, which the poison test mode moves.
+    let top = line.bounds[1] - zgui_scene::spatial::poison::origin();
     assert!(
-        line.bounds[1] > 0.0 && line.bounds[1] < 24.0,
+        top > 0.0 && top < 24.0,
         "the strike is not inside the line box it crosses: {line:?}"
     );
 }
@@ -403,5 +413,68 @@ fn a_wave_is_given_a_band_it_can_have_a_shape_in() {
         wavy.bounds[3] >= solid.bounds[3] * 3.0,
         "the band is three strokes tall, which is what the shader's wave and its doubled line are \
          written against: {wavy:?}"
+    );
+}
+
+/// The sheet the nested inline case is styled by: a paragraph away from the window's corner, and a
+/// box inside its text with a shadow and an outline.
+const NESTED_CSS: &str = "root { display: block; width: 400px; height: 300px }
+     .para { display: block; margin-left: 100px; margin-top: 60px }
+     .hot { box-shadow: 0 0 0 3px #ff00ff; outline: 2px solid #00ff00 }";
+
+#[test]
+fn a_nested_inline_box_draws_its_shadow_and_outline_around_its_text() {
+    // The box has no rectangle of its own size, so a shadow or an outline drawn from its own
+    // fragment lands at the start of the paragraph's content, around nothing.
+    let drawn = frames(NESTED_CSS, |cx: &mut BuildCx<'_>| {
+        Box::new(
+            zgui_elements::column()
+                .class("root")
+                .child(
+                    zgui_elements::text()
+                        .class("para")
+                        .child(|| "aa ")
+                        .child(zgui_elements::text().class("hot").child(|| "bbbb")),
+                )
+                .into_view()
+                .build(cx),
+        )
+    });
+    let first = &drawn[0];
+
+    assert!(
+        first
+            .shadows
+            .iter()
+            .all(|bounds| bounds[2] > 0.0 && bounds[3] > 0.0),
+        "a shadow is cast from a rectangle with no extent: {:?}",
+        first.shadows
+    );
+    assert_eq!(first.shadows.len(), 1, "{:?}", first.shadows);
+    let text = first.shadows[0];
+    assert!(
+        text[0] > 100.0,
+        "the shadow is cast from the box's text, past `aa `: {text:?}"
+    );
+
+    let outlines: Vec<_> = first
+        .quads
+        .iter()
+        .filter(|quad| quad.fill.is_none() && quad.bounds[2] > 0.0)
+        .filter(|quad| quad.bounds[0] < text[0] && quad.bounds[0] + quad.bounds[2] > text[0])
+        .collect();
+    assert!(
+        first.quads.iter().all(|quad| !(quad.bounds[0] < 100.0
+            && quad.bounds[0] + quad.bounds[2] <= 104.0
+            && quad.bounds[1] < 64.0
+            && quad.fill.is_none())),
+        "an outline is drawn at the start of the paragraph: {:?}",
+        first.quads
+    );
+    assert_eq!(
+        outlines.len(),
+        1,
+        "one outline around the box's text: {:?}",
+        first.quads
     );
 }

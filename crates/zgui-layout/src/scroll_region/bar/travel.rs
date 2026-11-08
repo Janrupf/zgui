@@ -21,12 +21,14 @@ pub const MIN_THUMB: f32 = 20.0;
 pub struct Travel {
     /// Where the range begins, in the same space as the track.
     pub start: f32,
-    /// How long it is: the part of the track the content box spans.
+    /// How long it is: the track less the corner where the two gutters meet.
     pub length: f32,
     /// How long the thumb itself is.
     pub thumb: f32,
     /// The largest offset the content can be scrolled to.
     pub limit: f32,
+    /// How far one screenful is: the visible extent of the content box.
+    pub page: f32,
 }
 
 impl Travel {
@@ -67,24 +69,32 @@ impl Travel {
 }
 
 /// The range the thumb on `axis` moves in.
+///
+/// The thumb shows the visible part of the scrollport, the range less the corner, against the
+/// range plus the limit. Without padding the range is the content box's extent, and the thumb is
+/// the visible fraction of the content.
 pub fn of(port: &Scrollport, axis: Axis) -> Travel {
     let track = super::place::track(port, axis);
     let (start, length) = match axis {
-        Axis::Vertical => (track.top().0, port.visible(axis)),
-        Axis::Horizontal => (track.left().0, port.visible(axis)),
+        Axis::Vertical => (
+            track.top().0,
+            track.size.height.0 - port.thickness(Axis::Horizontal),
+        ),
+        Axis::Horizontal => (track.left().0, track.size.width.0),
     };
-    let reach = port.reach(axis);
-    let visible = port.visible(axis);
-    let thumb = if reach <= 0.0 || visible >= reach {
+    let length = length.max(0.0);
+    let limit = port.limit(axis);
+    let thumb = if length <= 0.0 || limit <= 0.0 {
         length
     } else {
-        (length * (visible / reach)).clamp(MIN_THUMB.min(length), length)
+        (length * (length / (length + limit))).clamp(MIN_THUMB.min(length), length)
     };
     Travel {
         start,
         length,
         thumb,
-        limit: (reach - visible).max(0.0),
+        limit,
+        page: port.visible(axis),
     }
 }
 

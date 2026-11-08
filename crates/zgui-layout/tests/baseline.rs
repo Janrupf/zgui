@@ -65,15 +65,10 @@ fn flex_containers_propagate_a_baseline_unaided() {
 }
 
 #[test]
-fn block_containers_need_our_fill_in() {
-    // A block container reports no baseline at all, so one is filled in from its first in-flow
-    // child. Without it, a baseline-aligned row of block-level items aligns on the bottom margin
-    // edge instead, which is a different number by more than a pixel.
-    //
-    // This is a separate test from the flex one on purpose. A single test that switched the
-    // fill-in off would be circular: the fill-in overwrites, so switching it off destroys the flex
-    // container's real baseline rather than revealing an absent one, and the flex case then looks
-    // as though it needed what it does not.
+fn a_block_container_takes_its_first_in_flow_childs_baseline() {
+    // A block container's baseline is its first in-flow child's. Without it, a baseline-aligned
+    // row of block-level items aligns on the bottom margin edge instead, which is a different
+    // number by more than a pixel.
     let fixture = fixture("block");
     let mut store = fixture.box_tree();
     let mut content = measurer();
@@ -84,7 +79,7 @@ fn block_containers_need_our_fill_in() {
         .layout_of(root)
         .expect("laid out")
         .first_baseline
-        .expect("a block container's baseline is filled in from its first in-flow child");
+        .expect("a block container's baseline comes from its first in-flow child");
 
     // It is the first child's baseline moved down by where that child sits, and the first child is
     // at the top, so the two agree exactly.

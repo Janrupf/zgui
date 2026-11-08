@@ -15,6 +15,7 @@ use kurbo::BezPath;
 use rustc_hash::FxHashMap;
 use skrifa::instance::{LocationRef, Size};
 use skrifa::outline::{DrawSettings, OutlinePen};
+use skrifa::raw::types::F2Dot14;
 use skrifa::{FontRef, GlyphId, MetadataProvider};
 use zgui_text::{GlyphOutline, OutlineKey};
 
@@ -40,7 +41,12 @@ pub(crate) struct Outlines {
 
 impl Outlines {
     /// The curves for `key`, extracting them from `font` if they are not held yet.
-    pub(crate) fn get(&self, font: &FontRef<'_>, key: &OutlineKey) -> Option<GlyphOutline> {
+    pub(crate) fn get(
+        &self,
+        font: &FontRef<'_>,
+        key: &OutlineKey,
+        coords: &[i16],
+    ) -> Option<GlyphOutline> {
         if let Some(held) = self
             .entries
             .lock()
@@ -49,7 +55,7 @@ impl Outlines {
         {
             return Some(Arc::clone(held));
         }
-        let path = Arc::new(extract(font, key)?);
+        let path = Arc::new(extract(font, key, coords)?);
         let mut entries = self
             .entries
             .lock()
@@ -63,7 +69,9 @@ impl Outlines {
 }
 
 /// Draws one glyph's curves into a path in device pixels, y downward, origin at the baseline.
-fn extract(font: &FontRef<'_>, key: &OutlineKey) -> Option<BezPath> {
+///
+/// `coords` is the variation instance's normalised location, empty for the default one.
+fn extract(font: &FontRef<'_>, key: &OutlineKey, coords: &[i16]) -> Option<BezPath> {
     let outlines = font.outline_glyphs();
     let glyph = outlines.get(GlyphId::new(u32::from(key.glyph)))?;
     let mut pen = Pen {
@@ -74,9 +82,10 @@ fn extract(font: &FontRef<'_>, key: &OutlineKey) -> Option<BezPath> {
         // this crate ever sees them in.
         shear: key.synthetic_slant().to_radians().tan(),
     };
+    let location: Vec<F2Dot14> = coords.iter().copied().map(F2Dot14::from_bits).collect();
     glyph
         .draw(
-            DrawSettings::unhinted(Size::new(key.size()), LocationRef::default()),
+            DrawSettings::unhinted(Size::new(key.size()), LocationRef::new(&location)),
             &mut pen,
         )
         .ok()?;

@@ -138,7 +138,10 @@ fn window_waiting(
                 zgui_elements::column()
                     .class("root")
                     .on(zgui_view::events::POINTER_MOVE, move |event| {
-                        seen.borrow_mut().push(event.position.x.0);
+                        // Moves held together arrive as the last one, with the rest as samples.
+                        let mut seen = seen.borrow_mut();
+                        seen.extend(event.coalesced().iter().map(|s| s.position.x.0));
+                        seen.push(event.position.x.0);
                     })
                     .into_view()
                     .build(cx),

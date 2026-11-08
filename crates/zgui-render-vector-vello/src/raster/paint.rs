@@ -56,6 +56,11 @@ pub fn of(reference: PaintRef, paints: &PaintTable) -> Option<Painted> {
             })
         }
         Paint::Image { .. } => None,
+        // Only a border stroke has one colour per side, and a path has no sides.
+        Paint::Sides(_) => entry.flat_color().map(|color| Painted {
+            brush: Brush::Solid(solid(color)),
+            transform: None,
+        }),
     }
 }
 

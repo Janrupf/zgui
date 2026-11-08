@@ -98,15 +98,9 @@ impl Measured {
 fn measure(interaction: impl FnOnce(&mut Gallery)) -> Measured {
     let mut gallery = Gallery::open();
     gallery.settle();
-    // One full repaint, measured before the interaction is: every count below is meaningful only
+    // The first paint, which placed every glyph on the page: every count below is meaningful only
     // beside it, since "no glyph was drawn" is also what a document with no text in it reports.
-    // A resize step is how a full repaint is asked for, and the step back restores the extent the
-    // interaction is then measured at.
-    counter::reset();
-    gallery.resize_step(1);
-    let document = counter::get(Counter::GlyphsPlaced);
-    gallery.resize_step(0);
-    gallery.settle();
+    let document = gallery.document_glyphs();
     counter::reset();
     let started = Instant::now();
     interaction(&mut gallery);
@@ -228,19 +222,21 @@ fn a_resize_repaints_the_whole_document_without_rasterising_it_again() {
     // glyphs that rasterise to nothing at all, the spaces, were rasterised again for ever because
     // nothing was ever inserted for them to be found.
     //
-    // A resize damages the whole surface by construction, so this is the case where a repaint of
-    // unchanged text is unavoidable and its cost has to be zero.
+    // A resize damages the whole surface by construction, so every step runs a frame. Text whose
+    // lines did not move is replayed from what the frame before placed, and what is placed again
+    // must already be in the atlas.
     let measured = measure(|gallery| {
         for step in 0..REPEATS {
             gallery.resize_step(step);
         }
     });
     measured.drew_text();
+    // The first step asks for the extent the measurement began at, so it is the one step that runs
+    // no frame.
     assert!(
-        measured.placed >= measured.document * u64::try_from(REPEATS / 2).expect("it fits"),
-        "a resize damages the whole surface, so every step places the whole document's glyphs          again; {} placed over {REPEATS} steps of a {} glyph document is not that",
-        measured.placed,
-        measured.document
+        measured.frames >= u64::try_from(REPEATS - 1).expect("it fits"),
+        "{} frames over {REPEATS} resize steps; a step that changed the width ran no frame",
+        measured.frames
     );
     // Not zero: a step changes the width, so a line breaks in a new place and a few glyphs land at
     // a subpixel phase nothing has drawn them at yet. What must never come back is the whole

@@ -21,15 +21,14 @@
 //! perfectly damaged rectangle. A counter going from `1` to `7` is the whole failure: same width,
 //! same line, same everything the geometry can see, and the old digit back on the screen.
 //!
-//! # Why a chunk with a vector item in it replays only in place
+//! # How a chunk with a vector item in it replays
 //!
 //! A record's chunk is captured at the pushes, before the clip cull, so it is the fragment's
 //! complete painting: a row arriving at the edge of a scroll port replays the whole of itself and
 //! the cull admits the part that has come into view. A **vector item** replays too — re-pushed
-//! into the frame's pass planning exactly as a fresh emission pushes it — with one restriction:
-//! only where the fragment has not moved. Its curves are placed in device coordinates and shared
-//! by pointer with the rasteriser's encoding cache, so translating them means copying the path,
-//! and a moved drawing is encoded at its new position instead.
+//! into the frame's pass planning exactly as a fresh emission pushes it. Its path is in path space
+//! and shared by pointer with the rasteriser's encoding cache, so a moved drawing replays with its
+//! placement moved and the rasteriser keeps its encoding.
 //!
 //! # The invariant a replay depends on
 //!
@@ -66,13 +65,14 @@ pub struct Painted {
     pub clip: ClipId,
     /// The coordinate system it is drawn in.
     pub transform: SpatialId,
-    /// A fingerprint of the matrix that coordinate system resolved to.
+    /// A fingerprint of what the matrix that coordinate system resolved to does to shapes.
     ///
     /// The name above is structural: it is the same name on the first frame of a movement and on
     /// the last, which is what makes moving something a write rather than a new identity. It is
     /// therefore not enough on its own to decide whether a recorded range may be replayed, because
-    /// a range is a set of instances that were encoded against a particular matrix. This is the
-    /// part of the comparison that a movement moves.
+    /// a range is a set of instances that were encoded against a particular scale and turn. The
+    /// translation is left out: the renderer places the instances through the matrix, so a range
+    /// replays under any translation of the space it was recorded in.
     pub transform_hash: u64,
     /// The revision of what a custom element paints, and zero for every other kind.
     ///
@@ -123,6 +123,10 @@ pub struct Painted {
     /// The lowered style is *shared* and does not move while an animation runs, so without this the
     /// first frame of every animation is replayed for the whole of its length: the animation ticks,
     /// the damage is right, and the picture does not change.
+    ///
+    /// A box whose animated colours are drawn through slots it owns holds which slots instead, see
+    /// [`OwnedPaints::signature`](crate::OwnedPaints::signature). The animation stage rewrites
+    /// those slots, so the replay draws the colour of this frame.
     pub anim: u64,
     /// The bits of the alpha folded into every colour this fragment is emitted with.
     ///
@@ -137,6 +141,21 @@ pub struct Painted {
     /// not `Eq`. Two alphas that differ only in the sign of a zero compare unequal here, and the
     /// cost of that is one re-encoded fragment.
     pub alpha: u32,
+    /// Whether a run in the fragment keeps per-channel coverage.
+    ///
+    /// It does when the device can draw per-channel coverage, the target the fragment lands in is
+    /// opaque, and the transform moves the fragment by whole device pixels. An ancestor that turns
+    /// translucent opens a group target, and a pan by a fraction of a pixel moves only the
+    /// translation, so neither moves any other field here. A line encoded for one answer and
+    /// replayed under the other draws nothing on a transparent target, or coloured fringes off
+    /// the grid.
+    pub subpixel: bool,
+    /// A fingerprint of the corner radii the fragment was encoded with.
+    ///
+    /// The lowered style holds no radii, so a restyle that rounds or squares a corner and changes
+    /// nothing else moves no other field here. Without it, a box that squares one corner replays
+    /// the curve it had.
+    pub corners: u64,
     /// A fingerprint of the caret and the selection bands drawn with a line fragment, and zero
     /// for a fragment that is not a line.
     ///
@@ -145,6 +164,12 @@ pub struct Painted {
     /// frozen in whichever phase it was first encoded in — which looks exactly like no caret at
     /// all half the time, and like one that never blinks the other half.
     pub highlights: u64,
+    /// A fingerprint of the styles of the nested inline boxes a line paints, and zero for any
+    /// other fragment.
+    ///
+    /// Those boxes are below the line's own box, so nothing else here moves when one of them is
+    /// restyled. Without it, a chip that changes colour replays its old colour.
+    pub inline: u64,
 }
 
 /// What one fragment painted last time it was painted.
@@ -186,7 +211,52 @@ pub struct Record {
     /// counted repetitions would have to be given back exactly as many times and one miscount is
     /// either a tile that can never be freed or one freed while it is being drawn.
     pub resources: Vec<AtlasKey>,
+    /// The sixteenth-pixel phase a CPU layer sprite was rasterised for, when the chunk holds one.
+    ///
+    /// A replay moves the sprite by the fragment's movement. A movement by whole pixels keeps the
+    /// raster on the pixel grid it was made for, and a fractional one does not, so a different
+    /// phase encodes again.
+    pub layer_phase: Option<[u8; 2]>,
+    /// Whether the chunk draws a layer of another scale, stretched until the drawing settles.
+    ///
+    /// Never replayed: each frame that reaches it encodes it again, until the exact raster stands.
+    pub provisional: bool,
+    /// Whether the drawing fell back to its shapes for the layer budget or a demotion, and may
+    /// take a layer later.
+    pub promote: bool,
+    /// How many drawn replays a promotable record has had, saturating.
+    pub rasterised_frames: u8,
+    /// The number of the tiled source whose tiles the chunk draws.
+    ///
+    /// The tiles name their rasters and are placed every frame, so the record holds none of them.
+    /// It replays only while the source stands.
+    pub tiled: Option<u64>,
+    /// The region of the fragment's space whose prims a series cut to it draws, as the encoding
+    /// measured it.
+    ///
+    /// The record replays only while the region, moved as the fragment moved, holds what the
+    /// viewport shows of the fragment through its chain. A move or a wider clip can show prims the
+    /// cut left out.
+    pub window: Option<zgui_scene::kurbo::Rect>,
 }
+
+/// What the layer route did for one encoding.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LayerRecord {
+    /// The phase the walk read for the fragment, when the encoding pushed a layer sprite.
+    pub phase: Option<[u8; 2]>,
+    /// Whether the sprite stretches a raster of another scale or phase.
+    pub provisional: bool,
+    /// Whether the drawing fell back to its shapes for the budget or a demotion.
+    pub promote: bool,
+    /// The number of the tiled source whose tiles the encoding pushed.
+    pub tiled: Option<u64>,
+    /// The region of the fragment's space whose prims a series cut to it draws.
+    pub window: Option<zgui_scene::kurbo::Rect>,
+}
+
+/// How many drawn replays a promotable record waits before it encodes again.
+pub const PROMOTE_REPLAYS: u8 = 3;
 
 /// What one fragment's encoding produced, as the record is told it.
 ///
@@ -207,6 +277,8 @@ pub struct Encoding<'a> {
     /// a record is replayed until the fragment itself changes and the missing letter would never
     /// come back.
     pub complete: bool,
+    /// What the layer route did.
+    pub layer: LayerRecord,
 }
 
 /// What a fragment costs this frame.
@@ -381,6 +453,49 @@ impl PaintCache {
         freed
     }
 
+    /// The records not selected this frame that hold a resource `holds` names, coldest first, each
+    /// with the resources of those it holds.
+    pub fn cold_holding(&self, holds: &dyn Fn(AtlasKey) -> bool) -> Vec<(FragKey, Vec<AtlasKey>)> {
+        let mut cold: Vec<(u64, FragKey, Vec<AtlasKey>)> = self
+            .records
+            .iter()
+            .filter(|(_, record)| record.last_selected < self.epoch)
+            .filter_map(|(key, record)| {
+                let held: Vec<AtlasKey> = record
+                    .resources
+                    .iter()
+                    .copied()
+                    .filter(|resource| holds(*resource))
+                    .collect();
+                (!held.is_empty()).then_some((record.last_selected, *key, held))
+            })
+            .collect();
+        cold.sort_unstable_by_key(|(selected, _, _)| *selected);
+        cold.into_iter().map(|(_, key, held)| (key, held)).collect()
+    }
+
+    /// Drops the records of `keys`, releasing what they held, and reports how many went.
+    ///
+    /// A clean miss, as [`PaintCache::evict_cold`] is: the next frame that reaches one of the
+    /// fragments encodes it again.
+    pub fn evict(
+        &mut self,
+        keys: &[FragKey],
+        scene: &mut Scene,
+        owner: &dyn ResourceOwner,
+    ) -> usize {
+        let mut holds = TableHolds::default();
+        let mut evicted = 0;
+        for key in keys {
+            if let Some(record) = self.records.remove(key) {
+                counter::bump(Counter::ChunksEvicted);
+                self.drop_record(record, scene, owner, &mut holds);
+                evicted += 1;
+            }
+        }
+        evicted
+    }
+
     /// Notes every record's chunk into the scene again, for a renderer that lost its residence.
     ///
     /// A recovered device holds nothing: every replay would fall back to transient upload until
@@ -410,11 +525,29 @@ impl PaintCache {
     /// A record is replayable when the fragment is still drawing what it was drawing, the style,
     /// the chain and the transform are the ones it was recorded with, and the fragment is the
     /// same size. Anything else is encoded again.
-    pub fn reuse(&self, scene: &Scene, fragment: &Fragment, painted: Painted) -> Reuse {
+    ///
+    /// `phase` is the sixteenth-pixel phase of a drawing fragment's origin on the device. A record
+    /// holding a layer sprite replays only at the phase it was rasterised for. A provisional layer
+    /// never replays, and a promotable record encodes again after [`PROMOTE_REPLAYS`] drawn
+    /// replays. A record with a [window](Record::window) replays only while the window holds what
+    /// is shown.
+    pub fn reuse(
+        &self,
+        scene: &Scene,
+        fragment: &Fragment,
+        painted: Painted,
+        phase: Option<[u8; 2]>,
+    ) -> Reuse {
         let Some(record) = self.records.get(&fragment.key) else {
             return Reuse::Encode;
         };
         if record.painted != painted {
+            return Reuse::Encode;
+        }
+        if record.provisional
+            || record.layer_phase.is_some_and(|held| Some(held) != phase)
+            || (record.promote && record.rasterised_frames >= PROMOTE_REPLAYS)
+        {
             return Reuse::Encode;
         }
         if record.kind != fragment.kind {
@@ -430,11 +563,12 @@ impl PaintCache {
         if record.clip_hash != scene.clips.content_hash(painted.clip) {
             return Reuse::Encode;
         }
-        // A drawing's curves are placed in device coordinates and shared with the rasteriser's
-        // encoding cache, so a chunk holding a vector item replays only in place — a moved
-        // drawing is encoded at its new position. Everything else in the chunk translates.
-        if !record.prims.vectors.is_empty()
-            && record.border_box.origin != fragment.border_box.origin
+        let offset = Size::new(
+            DevicePx(fragment.border_box.origin.x.0 - record.border_box.origin.x.0),
+            DevicePx(fragment.border_box.origin.y.0 - record.border_box.origin.y.0),
+        );
+        if let Some(window) = record.window
+            && !holds_shown(scene, &painted, window, offset)
         {
             return Reuse::Encode;
         }
@@ -442,10 +576,22 @@ impl PaintCache {
             self.indices_still_resolve(scene, record),
             "a replayed range's clip or transform no longer resolves to what it was recorded with"
         );
-        Reuse::Replay(Size::new(
-            DevicePx(fragment.border_box.origin.x.0 - record.border_box.origin.x.0),
-            DevicePx(fragment.border_box.origin.y.0 - record.border_box.origin.y.0),
-        ))
+        Reuse::Replay(offset)
+    }
+
+    /// The animation signature `fragment`'s record was encoded under, if it has a record.
+    ///
+    /// What the animation stage reads to decide whether rewriting a box's owned slots is all a
+    /// frame owes the box: true only while every record of the box names those slots.
+    pub fn anim_signature(&self, fragment: FragKey) -> Option<u64> {
+        self.records
+            .get(&fragment)
+            .map(|record| record.painted.anim)
+    }
+
+    /// The number of the tiled source `fragment`'s record draws, if it draws one.
+    pub fn tiled(&self, fragment: FragKey) -> Option<u64> {
+        self.records.get(&fragment).and_then(|record| record.tiled)
     }
 
     /// The chunk recorded for `fragment` and its revision, for a caller that has already decided
@@ -477,6 +623,7 @@ impl PaintCache {
             chunk,
             resources,
             complete,
+            layer,
         } = encoding;
         if !complete {
             // Something the fragment draws had nowhere to go, so this painting is a letter short.
@@ -548,6 +695,12 @@ impl PaintCache {
                 clip_hash: scene.clips.content_hash(painted.clip),
                 last_selected: self.epoch,
                 resources: held,
+                layer_phase: layer.phase,
+                provisional: layer.provisional,
+                promote: layer.promote,
+                rasterised_frames: 0,
+                tiled: layer.tiled,
+                window: layer.window,
             },
         );
         release_tables(scene, &replaced_holds);
@@ -574,6 +727,9 @@ impl PaintCache {
             if record.last_selected != self.epoch {
                 record.last_selected = self.epoch;
                 self.selected_bytes += record.prims.bytes();
+            }
+            if record.promote {
+                record.rasterised_frames = record.rasterised_frames.saturating_add(1);
             }
         }
     }
@@ -624,6 +780,24 @@ impl PaintCache {
             .filter(|key| !owner.contains(*key))
             .collect()
     }
+}
+
+/// Whether `window`, moved by `offset`, holds what the viewport shows of the space `painted` is
+/// drawn in, through its chain. True when nothing is shown.
+fn holds_shown(
+    scene: &Scene,
+    painted: &Painted,
+    window: zgui_scene::kurbo::Rect,
+    offset: Size<DevicePx, Device>,
+) -> bool {
+    let Some(shown) = crate::emit::vector::shown(scene, painted.clip, painted.transform) else {
+        return true;
+    };
+    let (dx, dy) = (f64::from(offset.width.0), f64::from(offset.height.0));
+    window.x0 + dx <= shown.x0
+        && window.y0 + dy <= shown.y0
+        && window.x1 + dx >= shown.x1
+        && window.y1 + dy >= shown.y1
 }
 
 /// Gives up one hold on each table entry in `holds`.

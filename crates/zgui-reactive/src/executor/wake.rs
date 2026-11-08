@@ -5,7 +5,7 @@
 //! message. Without a second edge, a task woken by a worker thread, a resolved async value or a
 //! fired timer is marked ready and then waits for the user to move the mouse.
 //!
-//! So every spawned future is polled through a composite waker: waking it queues the task in
+//! So every spawned future is polled through a waker that does both: waking it queues the task in
 //! the pool *and* pings the [`FrameWaker`], which asks the platform for a redraw. The redraw
 //! runs the frame, the frame flushes the executor, and the task is polled.
 
@@ -29,8 +29,8 @@ pub trait FrameWaker: Send + Sync + 'static {
 
 /// Where wakes are sent on one UI thread.
 ///
-/// Shared by every composite waker built on that thread, so installing a waker after effects
-/// already exist still reaches them.
+/// Shared by every task waker built on that thread, so installing a waker after effects already
+/// exist still reaches them.
 #[derive(Default)]
 pub(crate) struct WakeTarget {
     /// The installed waker, if the platform has provided one yet.
@@ -60,8 +60,8 @@ impl WakeTarget {
 }
 
 thread_local! {
-    /// This thread's wake target. Created eagerly so composite wakers can hold it before a
-    /// platform waker exists.
+    /// This thread's wake target. Created eagerly so task wakers can hold it before a platform
+    /// waker exists.
     static TARGET: Arc<WakeTarget> = Arc::new(WakeTarget::default());
 }
 
@@ -71,10 +71,11 @@ thread_local! {
 /// from another thread is queued but nothing asks for the frame that would poll it — so an
 /// application that never calls this updates only when something else already caused a frame.
 ///
-/// Wakes raised *during* a flush are not forwarded; they are folded into
+/// Wakes raised *during* a flush are not forwarded: the flush polls what they woke before it
+/// returns, so an effect writing a signal costs nothing beyond the poll. A wake the flush could
+/// not service is folded into
 /// [`FlushOutcome::needs_another_frame`](crate::executor::FlushOutcome::needs_another_frame)
-/// instead, so an effect writing a signal costs one extra frame rather than a redraw request
-/// per write.
+/// instead, which is one frame rather than a redraw request per write.
 pub fn set_frame_waker(waker: Arc<dyn FrameWaker>) {
     TARGET.with(|target| target.set(waker));
 }

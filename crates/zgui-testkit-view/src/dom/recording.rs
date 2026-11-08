@@ -178,6 +178,10 @@ impl Dom for RecordingDom {
         });
     }
 
+    fn text_is(&self, node: NodeId, data: &str) -> bool {
+        self.tree.text_is(node, data)
+    }
+
     fn insert(&self, parent: NodeId, child: NodeId, before: Option<NodeId>) {
         self.tree.insert(parent, child, before);
         self.transcript.push(Op::Insert {
@@ -203,6 +207,9 @@ impl Dom for RecordingDom {
             name: name.as_str().to_owned(),
             value: value.map(str::to_owned),
         });
+        if name.as_str() == "secure" {
+            self.secure_changed(el);
+        }
     }
 
     fn set_classes(&self, el: NodeId, classes: &[ClassName]) {
@@ -335,6 +342,10 @@ impl Dom for RecordingDom {
 
     fn text_content(&self, node: NodeId) -> String {
         self.tree.text_content(node)
+    }
+
+    fn is_live(&self, node: NodeId) -> bool {
+        self.tree.is_live(node)
     }
 
     fn observe(&self, node: NodeId, what: Observed, sink: ObservationSink) -> ObservationHandle {

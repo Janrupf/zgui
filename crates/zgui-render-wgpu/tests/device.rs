@@ -6,7 +6,7 @@ use zgui_bits::DamageSet;
 use zgui_geom::{Scale, Size};
 use zgui_render::{RenderTarget, Renderer};
 use zgui_render_wgpu::wgpu;
-use zgui_render_wgpu::{Acquisition, Builder, SrgbTier};
+use zgui_render_wgpu::{Acquisition, Builder, GroupPool, GroupPrecision, SrgbTier};
 use zgui_scene::{BackdropFilter, Filter, GroupBoundary, Quad, Scene};
 
 use support::{SIDE, device_lock, opaque, plain_renderer, present, rect};
@@ -78,11 +78,11 @@ fn the_gl_backend_is_enumerated_and_its_outcome_is_reported_rather_than_assumed(
             );
             eprintln!("GL: opened and drew on {:?}", renderer.formats());
         }
+        // A machine with no GL driver at all enumerates no adapter, so there is nothing to name.
+        Err(failure) if failure.candidates.is_empty() => {
+            eprintln!("GL unavailable: this machine enumerates no GL adapter");
+        }
         Err(failure) => {
-            assert!(
-                !failure.candidates.is_empty(),
-                "a GL adapter that cannot be opened must still be named"
-            );
             for candidate in &failure.candidates {
                 eprintln!("GL unavailable: {}: {}", candidate.name, candidate.reason);
             }
@@ -313,10 +313,55 @@ fn what_the_renderer_holds_is_reported_in_the_parts_a_budget_is_written_against(
 }
 
 #[test]
+fn a_small_renderer_reserves_small_memory_blocks() {
+    let Some(renderer) = plain_renderer() else {
+        return;
+    };
+    // Only a backend with a block allocator gives a report.
+    let Some(report) = renderer.gpu().device().generate_allocator_report() else {
+        return;
+    };
+    // With wgpu's default hints, the first blocks are 128 MiB and 64 MiB.
+    assert!(
+        report.total_reserved_bytes <= 32 << 20,
+        "a renderer that holds a few textures reserves {} bytes in {} blocks",
+        report.total_reserved_bytes,
+        report.blocks.len()
+    );
+}
+
+#[test]
+fn a_default_device_asks_for_no_timestamp_queries_and_times_nothing() {
+    if zgui_render_wgpu::gpu::timing::requested() {
+        eprintln!("skipped: GPU pass timing was asked for through the environment");
+        return;
+    }
+    let Some(mut renderer) = plain_renderer() else {
+        return;
+    };
+    assert!(
+        !renderer
+            .gpu()
+            .device()
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY),
+        "timestamp queries are asked for only when timing is on"
+    );
+    assert!(!renderer.gpu_timing_enabled());
+    assert_eq!(renderer.gpu_timed_frames(), None);
+    let mut scene = Scene::new();
+    scene.begin_frame(Size::new(SIDE, SIDE));
+    scene.finish(&DamageSet::full());
+    present(&mut renderer, &scene);
+    assert!(renderer.take_gpu_timings().is_empty());
+}
+
+#[test]
 fn a_lost_device_is_rebuilt_and_the_frame_after_it_draws_the_same_pixels() {
     let Some(mut renderer) = plain_renderer() else {
         return;
     };
+    renderer.set_group_precision(GroupPrecision::High);
     let mut scene = Scene::new();
     scene.begin_frame(Size::new(SIDE, SIDE));
     let fill = scene
@@ -348,6 +393,11 @@ fn a_lost_device_is_rebuilt_and_the_frame_after_it_draws_the_same_pixels() {
         renderer.memory().atlases,
         0,
         "nothing a device held survives it"
+    );
+    assert_eq!(
+        renderer.group_precision(),
+        GroupPrecision::High,
+        "the group precision is a setting, and settings survive"
     );
 
     let after = present(&mut renderer, &scene);
@@ -409,7 +459,8 @@ fn two_hundred_frames_of_nested_groups_and_backdrops_hold_the_same_device_memory
     for step in 0..5 {
         renderer.draw(&scene(step), &DamageSet::full());
     }
-    let settled = renderer.memory().total();
+    let held = |memory: zgui_render::MemoryReport| memory.targets + memory.atlases + memory.scratch;
+    let settled = held(renderer.memory());
     assert!(
         renderer.groups().peak() >= 4,
         "four levels were open at once, and the pool lent {}",
@@ -418,13 +469,61 @@ fn two_hundred_frames_of_nested_groups_and_backdrops_hold_the_same_device_memory
     for step in 5..200 {
         renderer.draw(&scene(step), &DamageSet::full());
     }
-    // The bound is one-sided because a leak shows as growth. Memory can also shrink: the upload
-    // belt sheds a transient high-water staging chunk after a quiet period, and whether the early
-    // frames raised that mark depends on the driver's completion timing.
+    // The bound is one-sided because a leak shows as growth. The buffers are left out: the upload
+    // belt keeps staging chunks up to a high-water mark that rises and falls with the driver's
+    // completion timing, so in an optimised build it can sit above its early value without any
+    // leak.
     assert!(
-        renderer.memory().total() <= settled,
+        held(renderer.memory()) <= settled,
         "a hundred and ninety-five more frames allocated nothing: {} <= {settled}",
-        renderer.memory().total()
+        held(renderer.memory())
     );
     assert_eq!(renderer.groups().lent(), 0, "and every lease came back");
+}
+
+#[test]
+fn sibling_backdrops_return_their_captures_before_the_next_one_is_taken() {
+    // A backdrop copies what is beneath it and filters the copy. Each copy is a full-surface target,
+    // so a copy held to the end of the frame makes the pool grow with the number of backdrops. At
+    // the budget the pool then degrades every later target to half resolution.
+    let Some(mut renderer) = plain_renderer() else {
+        return;
+    };
+    let allocated = GroupPool::new(Size::new(SIDE, SIDE), 0)
+        .allocated_extent(zgui_render_wgpu::TargetScale::Full);
+    let one_full = u64::from(GroupPool::FORMAT.block_copy_size(None).unwrap_or(8))
+        * allocated.width as u64
+        * allocated.height as u64;
+    renderer.set_group_budget(4 * one_full);
+
+    let mut scene = Scene::new();
+    scene.begin_frame(Size::new(SIDE, SIDE));
+    let white = scene
+        .paints
+        .add(zgui_scene::Paint::Solid(opaque(255, 255, 255)));
+    scene.push_quad(Quad::filled(
+        rect(0.0, 0.0, SIDE as f32, SIDE as f32),
+        white,
+    ));
+    for index in 0..12 {
+        let (column, row) = ((index % 4) as f32, (index / 4) as f32);
+        scene.push_backdrop(BackdropFilter::new(
+            rect(4.0 + column * 30.0, 4.0 + row * 40.0, 24.0, 24.0),
+            [Filter::Blur(2.0)].into_iter().collect(),
+        ));
+    }
+    scene.finish(&DamageSet::full());
+    present(&mut renderer, &scene);
+
+    assert!(
+        renderer.groups().peak() <= 3,
+        "a copy and the two blur targets are all one backdrop needs at once, and the pool lent {}",
+        renderer.groups().peak()
+    );
+    assert_eq!(
+        renderer.groups().degraded(),
+        0,
+        "and no lease was reduced to half resolution"
+    );
+    assert_eq!(renderer.groups().lent(), 0);
 }

@@ -3,7 +3,7 @@
 mod support;
 
 use zgui_bits::DamageSet;
-use zgui_geom::Size;
+use zgui_geom::{Point, Rect, Size};
 use zgui_render_wgpu::{GroupPool, TargetScale, wgpu};
 use zgui_scene::{Filter, GroupBoundary, Quad, Scene};
 
@@ -317,4 +317,229 @@ fn an_empty_group_composites_nothing_rather_than_what_the_pool_last_held() {
         [255, 255, 255, 255],
         "the empty group put the last lease's content on the page"
     );
+}
+
+/// A group whose opacity and position moved twenty times composites exactly as a renderer that
+/// only ever saw the last step does.
+///
+/// Every step is a whole frame: full damage, a fresh target lease, one composite. Nothing about
+/// the pool, the plan or the composite may carry the earlier steps into the last one — a target
+/// lent at a lower resolution because an earlier frame filled the budget, a sample taken through
+/// a filtering sampler where none was needed — so the pixels of the two are compared exactly.
+#[test]
+fn a_group_animated_over_twenty_frames_composites_as_a_fresh_renderer_does() {
+    let Some(mut animated) = plain_renderer() else {
+        return;
+    };
+    let frame = |scene: &mut Scene, phase: f32| {
+        scene.begin_frame(Size::new(SIDE, SIDE));
+        quad(scene, (0.0, 0.0, SIDE as f32, SIDE as f32), [255; 3]);
+        let shift = -20.0 * phase;
+        grouped(
+            scene,
+            (40.0 + shift, 30.0, 41.0, 18.0),
+            0.4 + 0.6 * phase,
+            &[],
+            |scene| {
+                quad(scene, (40.0 + shift, 30.0, 41.0, 18.0), [40, 120, 200]);
+                quad(scene, (48.0 + shift, 36.0, 12.0, 6.0), [255, 255, 255]);
+            },
+        );
+        scene.finish(&DamageSet::full());
+    };
+    let mut scene = Scene::new();
+    let mut last = None;
+    for step in 0..=20 {
+        frame(&mut scene, 0.9 * step as f32 / 20.0);
+        last = Some(present(&mut animated, &scene));
+    }
+    let moved = last.expect("twenty-one frames were drawn");
+    drop(animated);
+
+    let Some(mut fresh) = plain_renderer() else {
+        return;
+    };
+    let mut once = Scene::new();
+    frame(&mut once, 0.9);
+    let built = present(&mut fresh, &once);
+    assert_eq!(
+        moved.max_difference(&built),
+        0,
+        "the animated renderer's last frame differs from a fresh renderer's only frame"
+    );
+    assert_eq!(fresh.groups().degraded(), 0);
+}
+
+/// The same twenty steps, each drawn over the damage the step actually produced: where the
+/// group was and where it is now, and nothing else.
+///
+/// This is the shape an animated badge has in a real frame. The composed target keeps every
+/// pixel outside the damage, and the group's target is lent again from the pool with whatever
+/// the last step left in it — so a composite that read outside the damage, or a target region
+/// that was not cleared before it was drawn into, is what this finds.
+#[test]
+fn a_group_animated_under_partial_damage_composites_as_a_fresh_renderer_does() {
+    let Some(mut animated) = plain_renderer() else {
+        return;
+    };
+    let bounds = |phase: f32| (40.0 - 20.0 * phase, 30.0, 41.0, 18.0);
+    let frame = |scene: &mut Scene, phase: f32, damage: &DamageSet| {
+        scene.begin_frame(Size::new(SIDE, SIDE));
+        quad(scene, (0.0, 0.0, SIDE as f32, SIDE as f32), [255; 3]);
+        let at = bounds(phase);
+        grouped(scene, at, 0.4 + 0.6 * phase, &[], |scene| {
+            quad(scene, at, [40, 120, 200]);
+            quad(scene, (at.0 + 8.0, at.1 + 6.0, 12.0, 6.0), [255, 255, 255]);
+        });
+        scene.finish(damage);
+    };
+    let damage_of = |from: f32, to: f32| {
+        let mut damage = DamageSet::new();
+        for phase in [from, to] {
+            let (x, y, w, h) = bounds(phase);
+            let corner: zgui_geom::Rect<i32, zgui_geom::Device> = zgui_geom::Rect::new(
+                zgui_geom::Point::new(x.floor() as i32, y.floor() as i32),
+                Size::new(w.ceil() as i32 + 1, h.ceil() as i32 + 1),
+            );
+            damage.absorb(corner);
+        }
+        damage
+    };
+    let mut scene = Scene::new();
+    frame(&mut scene, 0.0, &DamageSet::full());
+    let mut last = present(&mut animated, &scene);
+    for step in 1..=20 {
+        let (from, to) = (0.9 * (step - 1) as f32 / 20.0, 0.9 * step as f32 / 20.0);
+        frame(&mut scene, to, &damage_of(from, to));
+        last = present(&mut animated, &scene);
+    }
+    drop(animated);
+
+    let Some(mut fresh) = plain_renderer() else {
+        return;
+    };
+    let mut once = Scene::new();
+    frame(&mut once, 0.9, &DamageSet::full());
+    let built = present(&mut fresh, &once);
+    assert_eq!(
+        last.max_difference(&built),
+        0,
+        "the animated renderer's last frame differs from a fresh renderer's only frame"
+    );
+}
+
+#[test]
+fn a_half_resolution_group_ending_on_an_odd_pixel_keeps_its_last_row_and_column() {
+    // A group from x = 32 to x = 95 ends half way through a half-resolution texel. That texel holds
+    // the group's last column, and the pass that fills the target has to reach it.
+    let Some(mut renderer) = plain_renderer() else {
+        return;
+    };
+    let mut scene = Scene::new();
+    scene.begin_frame(Size::new(SIDE, SIDE));
+    quad(&mut scene, (0.0, 0.0, SIDE as f32, SIDE as f32), [255; 3]);
+    grouped(&mut scene, (32.0, 32.0, 63.0, 63.0), 1.0, &[], |scene| {
+        quad(scene, (32.0, 32.0, 63.0, 63.0), [0, 0, 0]);
+    });
+    scene.finish(&DamageSet::full());
+
+    let allocated: Size<i32, zgui_geom::Device> = Size::new(256, 256);
+    let one_half_res = u64::from(GroupPool::FORMAT.block_copy_size(None).unwrap_or(8))
+        * TargetScale::Half.extent(allocated).width as u64
+        * TargetScale::Half.extent(allocated).height as u64;
+    renderer.set_group_budget(one_half_res);
+    let reduced = present(&mut renderer, &scene);
+    assert_eq!(
+        renderer.groups().degraded(),
+        1,
+        "the group is at half resolution"
+    );
+
+    let column = reduced.rgba(94, 64)[0];
+    let row = reduced.rgba(64, 94)[0];
+    assert!(
+        column < 128 && row < 128,
+        "the last column and row of a black group are mostly black: {column} and {row}"
+    );
+}
+
+#[test]
+fn a_pool_at_its_budget_degrades_what_is_lent_at_once_and_trims_at_the_end_of_the_frame() {
+    // A target this frame lent and returned stays resident, because the plan still names it. The
+    // budget limits what is lent at once, and the end of the frame frees targets until the pool is
+    // within the budget again.
+    let Some(renderer) = plain_renderer() else {
+        return;
+    };
+    let gpu = std::sync::Arc::clone(renderer.gpu());
+    let region = Size::new(SIDE, SIDE);
+    let allocated = GroupPool::new(region, 0).allocated_extent(TargetScale::Full);
+    let one_full = u64::from(GroupPool::FORMAT.block_copy_size(None).unwrap_or(8))
+        * allocated.width as u64
+        * allocated.height as u64;
+    let mut pool = GroupPool::new(region, one_full + one_full / 4);
+    let other = wgpu::TextureFormat::Bgra8Unorm;
+
+    let copy = pool
+        .acquire(&gpu, TargetScale::Full, other)
+        .expect("one copy target fits");
+    pool.release(copy);
+    let group = pool
+        .acquire(&gpu, TargetScale::Full, GroupPool::FORMAT)
+        .expect("one target lent at a time fits");
+    assert_eq!(group.scale(), TargetScale::Full);
+    assert_eq!(pool.degraded(), 0);
+    assert!(
+        pool.bytes() > pool.budget(),
+        "this frame lent the copy target, and its plan still names it, so it stays resident"
+    );
+    let degraded = pool
+        .acquire(&gpu, TargetScale::Full, GroupPool::FORMAT)
+        .expect("a half-resolution target fits next to the lent one");
+    assert_eq!(degraded.scale(), TargetScale::Half);
+    assert_eq!(pool.degraded(), 1);
+    assert!(
+        pool.acquire_exact(&gpu, TargetScale::Full, GroupPool::FORMAT)
+            .is_none(),
+        "an exact lease never degrades, and the lent targets fill the budget"
+    );
+
+    pool.release_all();
+    assert!(pool.bytes() <= pool.budget(), "the end of the frame trims");
+    let full = pool
+        .acquire(&gpu, TargetScale::Full, GroupPool::FORMAT)
+        .expect("a full-resolution target fits in the next frame");
+    assert_eq!(full.scale(), TargetScale::Full);
+    assert_eq!(pool.degraded(), 1, "and this lease was not reduced");
+    assert!(pool.bytes() <= pool.budget());
+}
+
+#[test]
+fn leases_of_growing_regions_in_one_frame_neither_degrade_nor_lose_a_capture() {
+    // Each lease is returned before the next is taken, so each fits the budget on its own. Each
+    // is too large for the target before it, so the frame holds all of them.
+    let Some(renderer) = plain_renderer() else {
+        return;
+    };
+    let gpu = std::sync::Arc::clone(renderer.gpu());
+    let side = |length: i32| Rect::new(Point::new(0, 0), Size::new(length, length));
+    let one = |length: u64| {
+        u64::from(GroupPool::FORMAT.block_copy_size(None).unwrap_or(8)) * length * length
+    };
+    let mut pool = GroupPool::new(Size::new(1024, 1024), one(1024) * 3 / 2);
+    for length in [250, 500, 750] {
+        let slot = pool
+            .acquire_covering(&gpu, TargetScale::Full, GroupPool::FORMAT, side(length))
+            .expect("one lease at a time fits");
+        pool.release(slot);
+    }
+    let capture = pool
+        .acquire_exact_covering(&gpu, TargetScale::Full, GroupPool::FORMAT, side(1000))
+        .expect("a capture is not lost to the targets returned earlier in the frame");
+    assert_eq!(capture.scale(), TargetScale::Full);
+    assert_eq!(pool.degraded(), 0);
+    assert!(pool.bytes() > pool.budget());
+
+    pool.release_all();
+    assert!(pool.bytes() <= pool.budget(), "the end of the frame trims");
 }

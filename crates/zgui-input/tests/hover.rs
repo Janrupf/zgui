@@ -63,12 +63,14 @@ fn hover_on_one_row_restyles_the_row_and_its_ancestors_only() {
     // over all of them. What that *costs* is a different number: this sheet mentions `:hover` on
     // rows alone, so the writes on the root, the table and the cell match no selector, take the
     // document's cheap path, and never reach the style engine at all. What is styled is the row
-    // and what inherits from it. The case below is the same move over a sheet that styles every
+    // alone: `background-color` is not inherited, so the cell below it has nothing to take from
+    // it. The case below is the same move over a sheet that styles every
     // element on the path, where the cost is the whole path — between them they pin both halves:
     // the bit goes up the chain, and paying for it depends on whether a rule asked.
     assert_eq!(
-        restyled, 2,
-        "the hovered row and its cell — and none of the 999 rows that were not hovered"
+        restyled, 1,
+        "the hovered row — and none of the 999 rows that were not hovered, nor its cell, which \
+         inherits nothing that changed"
     );
     assert_eq!(after.nodes_relaid_out, 0, "a hover is not a layout");
     assert_eq!(after.text_shaped, 0, "nor a reshape");
@@ -144,9 +146,9 @@ fn moving_between_two_rows_restyles_the_two_and_not_their_shared_ancestors() {
     let restyled = session.fixture.restyle();
     assert_eq!(path.len(), 4, "root, table, row, cell");
     assert_eq!(
-        restyled, 4,
-        "the row and cell that were left, and the row and cell that were entered — and neither \
-         the table nor the root, which the pointer never left"
+        restyled, 2,
+        "the row that was left and the row that was entered — and neither the table nor the root, \
+         which the pointer never left, nor the cells, which inherit nothing that changed"
     );
     assert_eq!(counter::get(Counter::NodesRelaidOut), 0);
 }

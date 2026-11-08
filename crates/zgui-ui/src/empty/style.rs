@@ -12,7 +12,9 @@ style! { pub EmptyStyle =>
         justify-content: center;
         gap: var(--zui-space-xl);
         padding: var(--zui-space-xl);
+        border-width: 0;
         border-style: dashed;
+        border-color: var(--zui-color-border);
         border-radius: var(--zui-radius-lg);
         text-align: center;
     }"

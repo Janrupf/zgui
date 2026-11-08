@@ -11,7 +11,8 @@ pub static PROBES: &[Probe] = &[
     Probe::new("_webkit_text_security", "-webkit-text-security: disc"),
     Probe::new("caret_color", "caret-color: rgb(3, 5, 7)"),
     Probe::new("color", "color: rgb(3, 5, 7)"),
-    Probe::new("color_scheme", "color-scheme: dark"),
+    // Read by a scroll container alone, for the paint of its bars.
+    Probe::in_context("color_scheme", "overflow: auto", "color-scheme: dark"),
     Probe::new("cursor", "cursor: pointer"),
     Probe::new("direction", "direction: rtl"),
     Probe::new("font_family", r#"font-family: "Nonesuch", monospace"#),

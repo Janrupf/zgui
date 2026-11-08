@@ -31,6 +31,7 @@ pub fn plan(
         output.to_unit(),
         builder.extent_of(blurred.target),
         blurred.target.scale(),
+        blurred.target.origin(),
         zgui_scene::ClipId::ROOT.0,
     )
     .as_shadow(color, offset);

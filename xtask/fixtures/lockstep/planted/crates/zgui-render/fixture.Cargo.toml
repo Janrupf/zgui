@@ -1,0 +1,9 @@
+[package]
+name = "zgui-render"
+version.workspace = true
+edition = "2024"
+
+# PLANTED VIOLATION: a development dependency with a version stays in the published manifest, so
+# the member it names has to be published.
+[dev-dependencies]
+zgui-platform-drm = { path = "../zgui-platform-drm", version = "0.1.0" }

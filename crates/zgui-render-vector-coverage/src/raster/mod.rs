@@ -10,8 +10,8 @@ use std::sync::Arc;
 use kurbo::Affine;
 use zgui_geom::{Device, Matrix4, Rect};
 use zgui_render::{
-    Layering, MemoryReport, VectorError, VectorFrame, VectorPass, VectorPlan, VectorRaster,
-    VectorTarget,
+    Capacity, Layering, MemoryReport, VectorError, VectorFrame, VectorPass, VectorPlan,
+    VectorRaster, VectorTarget,
 };
 use zgui_render_wgpu::Gpu;
 use zgui_render_wgpu::buffer::upload::UploadBelt;
@@ -122,10 +122,14 @@ pub struct CoverageRaster {
     /// allocating one while the card is drawing waits for the card. The belt writes through chunks
     /// it already holds.
     uploader: UploadBelt,
-    /// What the last frame cost and could not do.
+    /// What the last frame cost and could not do, over every round it rasterised.
     last: Rasterised,
     /// How many layers the last frame's passes needed.
     depth: u32,
+    /// How many rounds the last frame's passes needed.
+    rounds: usize,
+    /// How much scratch one round may hold.
+    capacity: Capacity,
 }
 
 /// Where one item's bands are, and what they cover.
@@ -203,20 +207,43 @@ impl CoverageRaster {
             gpu: Arc::clone(gpu),
             last: Rasterised::default(),
             depth: 0,
+            rounds: 0,
+            capacity: Capacity::DEFAULT,
+        }
+    }
+
+    /// This rasteriser with `capacity` of scratch per round.
+    ///
+    /// The layers are clamped to [`Scratch::MAX_LAYERS`].
+    #[must_use]
+    pub fn with_capacity(self, capacity: Capacity) -> Self {
+        Self {
+            capacity: Capacity {
+                layers: capacity.layers.clamp(1, Scratch::MAX_LAYERS),
+                ..capacity
+            },
+            ..self
         }
     }
 
     /// What the last frame cost, and what it could not do.
+    ///
+    /// A round that a frame rasterises again counts again.
     pub fn last_frame(&self) -> Rasterised {
         self.last
     }
 
-    /// How many scratch layers the last frame's passes needed.
+    /// How many scratch layers the last frame's passes needed in its fullest round.
     ///
-    /// The frame's own demand, which is what says how much of it overlapped — not how many layers
-    /// are allocated, which never falls below a floor and follows the demand down only slowly.
+    /// The frame's own demand, which follows the area of its passes. The allocated layers
+    /// ([`layers`](Self::layers)) never fall below a floor and follow the demand down slowly.
     pub fn depth(&self) -> u32 {
         self.depth
+    }
+
+    /// How many rounds the last frame's passes needed.
+    pub fn rounds(&self) -> usize {
+        self.rounds
     }
 
     /// How many scratch layers are allocated, in each of the two textures.
@@ -240,9 +267,7 @@ impl CoverageRaster {
         // The *layer's* extent, because the attachment a draw is mapped onto is the whole layer.
         let (layer_width, layer_height) = self.scratch.extent();
         let extent = [layer_width as f32, layer_height as f32, 0.0, 0.0];
-        // Nothing at all: a layer is in the surface's own coordinates, which is what lets two passes
-        // that do not meet on the screen share it. An outline is already in device space and stays
-        // there.
+        // From the pass's region on the surface to its bin in the layer.
         let shift = Affine::translate((
             f64::from(pass.raster_region.origin.x - pass.region.origin.x),
             f64::from(pass.raster_region.origin.y - pass.region.origin.y),
@@ -262,24 +287,27 @@ impl CoverageRaster {
                 self.last.unclippable += 1;
                 continue;
             };
-            // The residual is a clip chain, so it is already in device space and the layer is too:
-            // it is placed unchanged, never through the item's own transform.
+            // The residual is a clip chain in device space, so it moves into the bin with the pass
+            // and never goes through the item's own transform.
             let clip_first = self.runs.len();
             for shape in &shapes {
                 let start = self.outlines.len();
-                geometry::flatten(shape, shift, &mut self.outlines);
+                geometry::flatten(shape, shift, geometry::TOLERANCE, &mut self.outlines);
                 self.runs.push(Run::new(start, self.outlines.len() - start));
                 self.last.segments += (self.outlines.len() - start) as u32;
                 self.last.clip_layers += 1;
             }
 
-            let placement = shift * self.transform_of(item, frame);
-            // The item's own shape clips are in the item's own space, so unlike the residual they
-            // go through the item's transform: a clipped drawing that is rotated has its clip
-            // rotated with it.
+            let placement = shift * self.transform_of(item, frame) * item.placement;
+            // A path in path space flattened to a tenth of a device pixel, however far the
+            // placement scales it.
+            let tolerance = geometry::tolerance(placement);
+            // The item's own shape clips are in the item's path space, so unlike the residual
+            // they go through the item's placement and transform: a clipped drawing that is
+            // rotated has its clip rotated with it.
             for clip in &item.clips {
                 let start = self.outlines.len();
-                geometry::flatten(&clip.path, placement, &mut self.outlines);
+                geometry::flatten(&clip.path, placement, tolerance, &mut self.outlines);
                 self.runs.push(Run::of(
                     start,
                     self.outlines.len() - start,
@@ -290,14 +318,18 @@ impl CoverageRaster {
             }
             let clip_count = self.runs.len() - clip_first;
 
-            // The ink is recorded relative to its pass's region and the layer is in device
-            // coordinates, so the two are added back together here.
-            let bounds = [
+            // The ink is recorded relative to its pass's region, and the bin is where that region
+            // is in the layer. A pixel of slack on each side, except past the edge of a clamped
+            // pass: the pass beside it in the layer starts there.
+            let mut bounds = [
                 (origin.x + planned.ink.origin.x) as f32 - 1.0,
                 (origin.y + planned.ink.origin.y) as f32 - 1.0,
                 planned.ink.size.width as f32 + 2.0,
                 planned.ink.size.height as f32 + 2.0,
             ];
+            if pass.clamped {
+                bounds = clamped(bounds, pass.raster_region);
+            }
             let mut painted = false;
             if let Some(color) = flat(item.fill, frame.paints) {
                 let _reused = Self::outline_of(
@@ -306,6 +338,7 @@ impl CoverageRaster {
                     item,
                     None,
                     placement,
+                    tolerance,
                     self.frames,
                 );
                 let band = self.band(bounds);
@@ -332,6 +365,7 @@ impl CoverageRaster {
                     item,
                     Some(&stroke.style),
                     placement,
+                    tolerance,
                     self.frames,
                 );
                 let band = self.band(bounds);
@@ -369,6 +403,7 @@ impl CoverageRaster {
         item: &VectorItem,
         stroke: Option<&kurbo::Stroke>,
         placement: Affine,
+        tolerance: f64,
         frame: u64,
     ) -> bool {
         let key = OutlineKey {
@@ -388,9 +423,15 @@ impl CoverageRaster {
         }
         match stroke {
             Some(style) => {
-                geometry::flatten_stroke(&item.path, style, Affine::new(placement), into);
+                geometry::flatten_stroke(
+                    &item.path,
+                    style,
+                    Affine::new(placement),
+                    tolerance,
+                    into,
+                );
             }
-            None => geometry::flatten(&item.path, Affine::new(placement), into),
+            None => geometry::flatten(&item.path, Affine::new(placement), tolerance, into),
         }
         held.insert(
             key,
@@ -420,7 +461,7 @@ impl CoverageRaster {
         /// How often the sweep runs.
         const EVERY: u64 = 64;
 
-        if self.frames % EVERY != 0 {
+        if !self.frames.is_multiple_of(EVERY) {
             return;
         }
         let frames = self.frames;
@@ -514,16 +555,16 @@ impl CoverageRaster {
         affine_of(matrix)
     }
 
-    /// Sorts the passes that were given a layer into the layer each one went into.
-    fn group(&mut self, passes: &[VectorPass]) {
+    /// Sorts the passes of one round into the layer each one went into.
+    fn group(&mut self, plan: &VectorPlan, round: core::ops::Range<usize>) {
         let layers = (self.scratch.layers() as usize).max(1);
         for bucket in &mut self.layered {
             bucket.clear();
         }
         self.layered.resize_with(layers, Vec::new);
-        for (index, pass) in passes.iter().enumerate() {
-            if let Some(bucket) = self.layered.get_mut(pass.target.0 as usize) {
-                bucket.push(index);
+        for (span, index) in round.enumerate() {
+            if let Some(bucket) = self.layered.get_mut(plan.passes[index].target.0 as usize) {
+                bucket.push(span);
             }
         }
     }
@@ -531,7 +572,7 @@ impl CoverageRaster {
     /// Records every pass of the frame into one encoder and submits it.
     ///
     /// One accumulation pass and one resolve per *layer*, not per pass: the passes sharing a layer
-    /// are disjoint on the surface, so their outlines accumulate side by side and one draw converts
+    /// have bins that do not meet, so their outlines accumulate side by side and one draw converts
     /// the whole layer into what a composite reads. Resolving per pass would convert the same layer
     /// once per pass in it, and every conversion after the first would read what the one before it
     /// had already written.
@@ -614,37 +655,41 @@ impl VectorRaster for CoverageRaster {
         if passes.is_empty() {
             return VectorPlan::empty();
         }
+        // A frame plans once and can prepare a round more than once, so the frame starts here.
+        self.last = Rasterised::default();
         let mut plan = VectorPlan::resourcing(passes);
-        // Layers are shared by passes that do not meet on the surface: every pass is rasterised
-        // before any of them is composited, so a layer holds its passes' coverage until their
-        // composites have read it, and passes that do not overlap in device coordinates do not
-        // overlap in a layer that is in device coordinates either.
+        // Each pass gets a bin of its own size in some layer, so passes share a layer whatever they
+        // cover on the surface. A frame larger than one scratch is cut into rounds, and each round
+        // is rasterised after the composites of the round before it have read the layers.
         self.regions.clear();
         self.regions
             .extend(passes.passes.iter().map(|planned| planned.region));
-        let layering = Layering::of(&self.regions, Scratch::MAX_LAYERS);
-        let (packed, width, height) = layering.compact(&self.regions);
+        let layering = Layering::of(&self.regions, self.capacity);
         self.depth = layering.layers();
+        self.rounds = layering.rounds();
         for (index, planned) in passes.passes.iter().enumerate() {
+            let Some(placement) = layering.placement(index) else {
+                continue;
+            };
             plan.passes.push(VectorPass {
                 region: planned.region,
-                raster_region: packed[index],
-                target: layering.target(index),
+                raster_region: placement.bin,
+                target: placement.target,
+                round: placement.round,
                 items: planned.items.clone(),
                 clip: planned.clip,
                 instanced: planned.instanced,
+                clamped: planned.clamped || planned.overhangs,
             });
         }
-        // The far corner of the surface anything is drawn at, not the largest region: a layer holds
-        // device pixels where they belong, so it has to reach as far as the furthest of them.
+        let (width, height) = layering.extent();
         self.scratch
             .ensure(&self.gpu, width, height, layering.layers());
         plan
     }
 
-    fn clear_targets(&mut self, plan: &VectorPlan) {
-        let mut layers: Vec<u32> = plan
-            .passes
+    fn clear_targets(&mut self, plan: &VectorPlan, round: usize) {
+        let mut layers: Vec<u32> = plan.passes[plan.round(round)]
             .iter()
             .filter(|pass| pass.target != VectorTarget::NONE)
             .map(|pass| pass.target.0 as u32)
@@ -666,23 +711,15 @@ impl VectorRaster for CoverageRaster {
         if frame.is_empty() {
             return Ok(());
         }
-        // The passes that were given a layer are a prefix, so the ones that were not are exactly the
-        // tail a shortened plan drops — and a composite is named by its index, so it has to be a
-        // tail and not a scattering.
-        let prepared = frame
-            .plan
-            .passes
-            .iter()
-            .position(|pass| pass.target == VectorTarget::NONE)
-            .unwrap_or(frame.plan.passes.len());
+        let round = frame.passes();
         {
             let _stage = tracing::debug_span!("cov.collect").entered();
-            for index in 0..prepared {
+            for index in round.clone() {
                 let pass = frame.plan.passes[index].clone();
                 let span = self.collect(frame, &pass);
                 self.spans.push(span);
             }
-            self.group(&frame.plan.passes[..prepared]);
+            self.group(frame.plan, round);
         }
         let mut encoder =
             self.gpu
@@ -730,21 +767,6 @@ impl VectorRaster for CoverageRaster {
                 "vector items left undrawn because a residual clip had no shape to apply"
             );
         }
-        if prepared < frame.plan.passes.len() {
-            // More passes stacked over one point than there are layers to keep them apart. Reporting
-            // it is what makes this frame's vector content missing rather than jumbled: the
-            // alternative is two overlapping passes on one layer, and then one composite draws the
-            // other's outlines.
-            return Err(VectorError::OutOfCapacity {
-                detail: format!(
-                    "a frame planned {} passes and {} of them could be given one of {} layers",
-                    frame.plan.passes.len(),
-                    prepared,
-                    Scratch::MAX_LAYERS
-                ),
-                prepared,
-            });
-        }
         Ok(())
     }
 
@@ -786,6 +808,15 @@ impl VectorSource for CoverageRaster {
     fn view(&self, target: VectorTarget) -> Option<&wgpu::TextureView> {
         self.scratch.straight(target.0 as u32)
     }
+}
+
+/// `bounds`, as x, y, width and height, kept inside `region`.
+fn clamped(bounds: [f32; 4], region: Rect<i32, Device>) -> [f32; 4] {
+    let left = bounds[0].max(region.left() as f32);
+    let top = bounds[1].max(region.top() as f32);
+    let right = (bounds[0] + bounds[2]).min(region.right() as f32);
+    let bottom = (bounds[1] + bounds[3]).min(region.bottom() as f32);
+    [left, top, (right - left).max(0.0), (bottom - top).max(0.0)]
 }
 
 /// Opens a render pass that keeps what the attachment already holds.
@@ -850,7 +881,7 @@ mod outlines {
     use kurbo::{Affine, BezPath, Stroke};
     use zgui_scene::{PaintRef, VectorId, VectorItem};
 
-    use super::{CoverageRaster, Flattened, OutlineKey, Segment};
+    use super::{CoverageRaster, Flattened, OutlineKey, Segment, geometry};
 
     /// A path with curves in it, so that flattening has something to do.
     fn item(id: u32) -> VectorItem {
@@ -870,7 +901,7 @@ mod outlines {
         stroke: Option<&Stroke>,
         placement: Affine,
     ) -> bool {
-        CoverageRaster::outline_of(into, held, item, stroke, placement, 1)
+        CoverageRaster::outline_of(into, held, item, stroke, placement, geometry::TOLERANCE, 1)
     }
 
     #[test]

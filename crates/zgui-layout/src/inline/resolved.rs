@@ -12,6 +12,7 @@ use zgui_text::{ParagraphKey, TextMap};
 use crate::fragment::ParagraphId;
 use crate::inline::ellipsis::EllipsisSource;
 use crate::inline::lines::LineBox;
+use crate::inline::slices::InlineSlice;
 
 /// Where one atomic inline ended up inside its context.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -53,9 +54,26 @@ pub struct InlineResolution {
     /// is why they are held here: their glyphs have to stay alive for exactly as long as the lines
     /// that name them.
     pub ellipsis: EllipsisSource,
+    /// Where each nested inline box lands on each line, ordered by line and then by tree order.
+    ///
+    /// Empty for a context that holds no nested inline box.
+    pub slices: Vec<InlineSlice>,
+    /// The request the lines were broken under, which the shaped form is put back on after a
+    /// probe moves it.
+    pub(crate) kept: crate::inline::kept::KeptBreak,
 }
 
 impl InlineResolution {
+    /// The capacity of the vectors this resolution holds, in bytes.
+    ///
+    /// The text map and the source list are shared, and are left out.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        use core::mem::size_of;
+        self.lines.capacity() * size_of::<LineBox>()
+            + self.placements.capacity() * size_of::<Placement>()
+            + self.slices.capacity() * size_of::<InlineSlice>()
+    }
+
     /// Every paragraph this resolution names: the lines' own, and the marks that cut them.
     ///
     /// What the store retains and releases. A mark is a shaped paragraph like any other and is
@@ -63,6 +81,11 @@ impl InlineResolution {
     /// drawn with an ellipsis that had been thrown away.
     pub fn paragraphs(&self) -> impl Iterator<Item = ParagraphId> + '_ {
         core::iter::once(self.paragraph).chain(self.ellipsis.paragraphs())
+    }
+
+    /// The parts of nested inline boxes on one line, in tree order.
+    pub fn slices_on(&self, line: usize) -> &[InlineSlice] {
+        crate::inline::slices::on_line(&self.slices, line)
     }
 
     /// The baseline a parent aligns this context's first line against.

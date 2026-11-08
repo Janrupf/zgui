@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use zgui_bits::DamageSet;
 use zgui_color::Color;
-use zgui_geom::{Device, Scale, Size};
+use zgui_geom::{Device, Point, Rect, Scale, Size};
 use zgui_render::{FrameOutcome, RenderTarget, Renderer, SkipReason};
 use zgui_render_wgpu::renderer::readback;
 use zgui_render_wgpu::target::swapchain::Supplied;
@@ -492,136 +492,96 @@ fn a_supplied_renderer_cannot_rebuild_itself_after_a_loss() {
     );
 }
 
-/// A peer that copies between the supplied textures with the renderer's own device.
+/// Where the square every rotation assertion reads sits, in device pixels.
 ///
-/// Standing in for a display card that can copy between its own buffers. What it does is what a
-/// real one does — the same rectangles, from the same buffer, to the same buffer — so a set repaired
-/// through it has to come out holding exactly what a set sent the whole debt holds. That is the
-/// property under test, and it needs no second device to state.
-#[derive(Debug)]
-struct SameDevice {
-    /// The device the copies are made on.
-    gpu: Arc<Gpu>,
-    /// The textures, in the order the renderer knows them by.
-    textures: Vec<wgpu::Texture>,
-}
+/// Around the centre, so [`centre`] reads it, and well inside the surface, so the background is
+/// still visible at a corner.
+const SQUARE: (f32, f32, f32, f32) = (48.0, 48.0, 32.0, 32.0);
 
-impl zgui_render_wgpu::target::swapchain::PeerCopy for SameDevice {
-    fn copy(&mut self, from: usize, to: usize, rects: &[zgui_geom::Rect<i32, Device>]) -> bool {
-        let mut encoder =
-            self.gpu
-                .device()
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("peer"),
-                });
-        for rect in rects {
-            let origin = wgpu::Origin3d {
-                x: rect.origin.x as u32,
-                y: rect.origin.y as u32,
-                z: 0,
-            };
-            let at = |texture| wgpu::TexelCopyTextureInfo {
-                texture,
-                mip_level: 0,
-                origin,
-                aspect: wgpu::TextureAspect::All,
-            };
-            encoder.copy_texture_to_texture(
-                at(&self.textures[from]),
-                at(&self.textures[to]),
-                wgpu::Extent3d {
-                    width: rect.size.width as u32,
-                    height: rect.size.height as u32,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
-        self.gpu.queue().submit([encoder.finish()]);
-        true
-    }
-}
-
-/// A damage set holding one rectangle.
-fn damaged(x: i32, y: i32, width: i32, height: i32) -> DamageSet {
-    let mut set = DamageSet::new();
-    set.absorb(zgui_geom::Rect::new(
-        zgui_geom::Point::new(x, y),
-        Size::new(width, height),
+/// The damage naming the square alone, which is what makes a frame here a partial redraw.
+fn square_damage() -> DamageSet {
+    let mut damage = DamageSet::new();
+    damage.absorb(Rect::new(
+        Point::new(SQUARE.0 as i32, SQUARE.1 as i32),
+        Size::new(SQUARE.2 as i32, SQUARE.3 as i32),
     ));
-    set
+    damage
+}
+
+/// A dark background with one square of `colour` on it, declared against `damage`.
+fn square_on_background(colour: Color, damage: &DamageSet) -> Scene {
+    let mut scene = Scene::new();
+    scene.begin_frame(extent());
+    let back = scene
+        .paints
+        .add(zgui_scene::Paint::Solid(opaque(20, 20, 20)));
+    let front = scene.paints.add(zgui_scene::Paint::Solid(colour));
+    scene.push_quad(Quad::filled(rect(0.0, 0.0, SIDE as f32, SIDE as f32), back));
+    scene.push_quad(Quad::filled(
+        rect(SQUARE.0, SQUARE.1, SQUARE.2, SQUARE.3),
+        front,
+    ));
+    scene.finish(damage);
+    scene
 }
 
 #[test]
-fn a_buffer_repaired_from_its_donor_holds_what_one_sent_the_whole_debt_holds() {
-    // The arithmetic in `Supplied::owed`, stated as the only thing that matters about it: a set
-    // that repairs and a set that does not must end up holding the same pixels. Every frame here
-    // damages part of the target and lands on a different buffer, so each buffer is owed something
-    // different by the time it comes round again — which is the case the split exists for, and the
-    // case that a wrong donor or a missed rectangle shows up in as a stale patch.
+fn a_rotating_set_brings_each_buffer_up_to_date_before_this_frame_goes_on_it() {
+    // Every other assertion in this file draws whole frames, so none of them exercises the debt a
+    // rotated buffer carries. A frame writes the rectangles it drew **and** the ones drawn while
+    // this buffer was not the one being written. A buffer given only the rectangles of the frame
+    // in front of it holds a picture that is part this frame and part as many frames old as the
+    // set is deep — which on a display is a corner of the screen that stopped updating.
     let _device = device_lock();
     let graphics = SharedGraphics::new();
-    let Some(gpu) = open(&graphics) else {
+    let Some((mut renderer, textures)) = supplied(&graphics, 3) else {
         return;
     };
-    // The stand-in copies with this device, so its textures are copied *into* — which a real
-    // scanout buffer is not, because a real peer writes them through its own driver and not through
-    // wgpu at all. So the usage is the harness's need and nothing the renderer asks for.
-    let make = || -> Vec<wgpu::Texture> {
-        (0..3)
-            .map(|_| {
-                described(&gpu, |descriptor| {
-                    descriptor.usage |= wgpu::TextureUsages::COPY_DST;
-                })
-            })
-            .collect()
-    };
-    let (plain_textures, repaired_textures) = (make(), make());
-    let mut plain = graphics
-        .renderer_supplied(target(), plain_textures.clone())
-        .expect("a device is open and the textures agree about everything");
-    let mut repaired = graphics
-        .renderer_supplied(target(), repaired_textures.clone())
-        .expect("a device is open and the textures agree about everything");
-    assert!(
-        repaired.attach_peer_copy(Box::new(SameDevice {
-            gpu,
-            textures: repaired_textures.clone(),
-        })),
-        "a supplied presentation takes a copier"
-    );
 
-    // Colours that cannot be confused, over rectangles that overlap each other partly, so a buffer
-    // that missed one is a buffer holding the wrong colour somewhere.
-    let quarter = SIDE / 4;
-    let frames = [
-        (opaque(255, 0, 0), damaged(0, 0, SIDE, SIDE)),
-        (opaque(0, 255, 0), damaged(0, 0, quarter * 2, quarter * 2)),
-        (
-            opaque(0, 0, 255),
-            damaged(quarter, quarter, quarter * 2, quarter * 2),
-        ),
-        (
-            opaque(255, 255, 0),
-            damaged(quarter * 2, 0, quarter * 2, SIDE),
-        ),
-        (opaque(0, 255, 255), damaged(0, quarter * 2, SIDE, quarter)),
-        (opaque(255, 0, 255), damaged(quarter, 0, quarter, SIDE)),
-        (opaque(128, 128, 128), damaged(0, 0, quarter, quarter)),
+    // The square's colour says which step a buffer's picture is from, and the damage names only
+    // the square, so every frame leaves the other two buffers one step further behind.
+    let steps: [[u8; 3]; 7] = [
+        [255, 0, 0],
+        [0, 255, 0],
+        [0, 0, 255],
+        [255, 255, 0],
+        [0, 255, 255],
+        [255, 0, 255],
+        [90, 90, 200],
     ];
-    for (frame, (colour, damage)) in frames.iter().enumerate() {
-        let slot = frame % 3;
-        let scene = filled(*colour);
-        assert!(plain.present_into(slot));
-        let _ = plain.draw(&scene, damage);
-        assert!(repaired.present_into(slot));
-        let _ = repaired.draw(&scene, damage);
-    }
+    let damage = square_damage();
+    for (step, bytes) in steps.iter().enumerate() {
+        let colour = opaque(bytes[0], bytes[1], bytes[2]);
+        let slot = step % textures.len();
+        assert!(renderer.present_into(slot), "slot {slot} of three exists");
+        let outcome = renderer.draw(&square_on_background(colour, &damage), &damage);
+        assert!(
+            outcome.stats().is_some(),
+            "step {step} composed nothing and reported {outcome:?}"
+        );
+        // Checked once the renderer has stopped widening frames for reasons of its own: the first
+        // frame redraws everything whatever it was handed, and this assertion is worth nothing
+        // unless the frames under it really are partial.
+        if step == 3 {
+            assert!(
+                renderer.composed_rects().len() == 1
+                    && renderer.composed_rects()[0].size.width < SIDE,
+                "this assertion needs a partial redraw, and the frame reported {:?}",
+                renderer.composed_rects()
+            );
+        }
 
-    for slot in 0..3 {
+        let pixels = read(&renderer, &textures[slot]);
         assert_eq!(
-            read(&plain, &plain_textures[slot]).bytes(),
-            read(&repaired, &repaired_textures[slot]).bytes(),
-            "buffer {slot} came out different when its debt was repaired from a donor"
+            centre(&pixels),
+            [bytes[0], bytes[1], bytes[2], 255],
+            "step {step}: buffer {slot} did not get this frame's square"
+        );
+        assert_eq!(
+            pixels.rgba(2, 2),
+            [20, 20, 20, 255],
+            "step {step}: buffer {slot} never received the background, which only the debt it was \
+             owed can have written"
         );
     }
 }

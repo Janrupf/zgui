@@ -14,7 +14,7 @@ use std::sync::Arc;
 use zgui_platform::Surface;
 use zgui_platform_headless::Harness;
 use zgui_render::{RenderTarget, Renderer};
-use zgui_runtime::{App, AppError, Runtime};
+use zgui_runtime::{App, AppError, MAINTENANCE_DELAY, Runtime};
 use zgui_view::{Anchor, BuildCx};
 
 /// Builds an application whose window holds `view`, with the capture renderer under it.
@@ -88,10 +88,33 @@ where
         .expect("the reactive runtime installs")
 }
 
+/// Runs the idle maintenance wake that the last normal frame armed, if the loop parks on it.
+///
+/// The parked deadline must be no further than [`MAINTENANCE_DELAY`] away. Reaching it must build
+/// no frame and leave no deadline, so a test that then expects a silent loop still catches a spin.
+pub fn cross_maintenance(harness: &mut Harness<Runtime>) {
+    let Some(deadline) = harness.parked_deadline() else {
+        return;
+    };
+    let wait = deadline.saturating_duration_since(harness.now());
+    assert!(
+        wait <= MAINTENANCE_DELAY,
+        "the loop parks {wait:?} out, later than the maintenance wake"
+    );
+    harness.advance(wait);
+    assert_eq!(harness.pump(), 0, "the maintenance wake built a frame");
+    assert_eq!(
+        harness.parked_deadline(),
+        None,
+        "a deadline is still parked after the maintenance wake"
+    );
+}
+
 /// The first line fragment in the window's layout, with the box it belongs to.
 ///
 /// Read out of the fragment tree rather than assumed, because *where layout said* is the thing a
-/// glyph assertion is testing against: a constant would be asserting the test's arithmetic.
+/// glyph assertion is testing against: a constant would be asserting the test's arithmetic. In the
+/// line's own space, which is the space its primitives are pushed in.
 pub fn first_line_box(
     window: &zgui_runtime::Window,
 ) -> zgui_geom::Rect<zgui_geom::DevicePx, zgui_geom::Device> {
@@ -110,6 +133,38 @@ pub fn first_line_box(
         }
     }
     panic!("the document produced no line fragment at all");
+}
+
+/// [`first_line_box`] in device pixels, through the line's anchor: where a pointer aims at it.
+pub fn first_line_on_device(
+    window: &zgui_runtime::Window,
+) -> zgui_geom::Rect<zgui_geom::DevicePx, zgui_geom::Device> {
+    *lines_on_device(window)
+        .first()
+        .expect("the document produced no line fragment at all")
+}
+
+/// [`line_boxes`] in device pixels, through each line's anchor.
+pub fn lines_on_device(
+    window: &zgui_runtime::Window,
+) -> Vec<zgui_geom::Rect<zgui_geom::DevicePx, zgui_geom::Device>> {
+    let layout = window.layout().borrow();
+    let placements = window.placements();
+    let mut found = Vec::new();
+    for key in layout.keys() {
+        for frag in layout.fragments_of_box(key) {
+            let Some(fragment) = layout.fragment(*frag) else {
+                continue;
+            };
+            if matches!(
+                fragment.kind,
+                zgui_layout::fragment::FragmentKind::Line { .. }
+            ) {
+                found.push(fragment.on_device(fragment.border_box, &placements));
+            }
+        }
+    }
+    found
 }
 
 /// A renderer that records the display list instead of drawing it.
@@ -181,6 +236,48 @@ pub fn replay_a11y(harness: &zgui_platform_headless::Harness<zgui_runtime::Runti
         tree.update_and_process_changes(update, &mut Silent);
         read(tree.state().root());
     }
+}
+
+/// A consumer's copy of the tree, built from every update the window's surface was handed.
+///
+/// What an assistive technology holds after applying the whole sequence, which is the thing a
+/// claim about where a node *is* has to be checked against: a rectangle is stated relative to the
+/// nearest transform above it, and only the consumer composes them.
+pub fn a11y_tree(
+    harness: &zgui_platform_headless::Harness<zgui_runtime::Runtime>,
+) -> accesskit_consumer::Tree {
+    struct Silent;
+    impl accesskit_consumer::TreeChangeHandler for Silent {
+        fn node_added(&mut self, _: &accesskit_consumer::Node<'_>) {}
+        fn node_updated(
+            &mut self,
+            _: &accesskit_consumer::Node<'_>,
+            _: &accesskit_consumer::Node<'_>,
+        ) {
+        }
+        fn focus_moved(
+            &mut self,
+            _: Option<&accesskit_consumer::Node<'_>>,
+            _: Option<&accesskit_consumer::Node<'_>>,
+        ) {
+        }
+        fn node_removed(&mut self, _: &accesskit_consumer::Node<'_>) {}
+    }
+    let log = harness
+        .platform()
+        .offscreens()
+        .first()
+        .expect("a surface was created")
+        .a11y_log();
+    let mut updates = log.into_iter();
+    let first = updates
+        .next()
+        .expect("the window published an accessibility update");
+    let mut tree = accesskit_consumer::Tree::new(first, true);
+    for update in updates {
+        tree.update_and_process_changes(update, &mut Silent);
+    }
+    tree
 }
 
 /// Every line fragment in the window's layout, in the order the tree reports them.

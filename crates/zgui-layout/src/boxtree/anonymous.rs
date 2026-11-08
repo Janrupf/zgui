@@ -98,6 +98,7 @@ fn flush(
     wrapper.children = taken.clone();
     wrapper.paint_children = taken.clone();
     wrapper.block_level = true;
+    wrapper.atomic_percent_block = crate::boxtree::percent::of_children(store, &taken);
     let key = store.insert(wrapper);
     for child in taken {
         if let Some(node) = store.get_mut(child) {

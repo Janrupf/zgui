@@ -5,7 +5,7 @@
 //! that is the whole reason the vocabulary is typed rather than a string and a bag of attributes.
 
 use zgui_interned::AttrName;
-use zgui_view::{IntoReactiveValue, PropKey, PropValue, UiState};
+use zgui_view::{IntoReactiveValue, PropKey, PropValue, ReactiveValue, UiState};
 
 use crate::element::Element;
 use crate::tag::{Control, Editor, Field, Image, Tag};
@@ -95,5 +95,31 @@ impl<T: Operable> Element<T> {
     #[must_use]
     pub fn disabled<M>(self, disabled: impl IntoReactiveValue<bool, M>) -> Self {
         self.state(UiState::DISABLED, disabled)
+    }
+}
+
+impl Element<Field> {
+    /// Whether the value is a secret, such as a password.
+    ///
+    /// A secure field shows one bullet per character. The document, the accessibility tree and
+    /// the clipboard get no part of the value: the value reaches the application only through
+    /// value events. Sets the attribute `secure` while on, so `field[secure]` matches.
+    ///
+    /// ```
+    /// zgui_elements::field().secure(true);
+    /// ```
+    ///
+    /// Only a single-line field takes a secret:
+    ///
+    /// ```compile_fail
+    /// zgui_elements::editor().secure(true);
+    /// ```
+    #[must_use]
+    pub fn secure<M>(self, on: impl IntoReactiveValue<bool, M>) -> Self {
+        let present = match on.into_reactive_value() {
+            ReactiveValue::Constant(on) => ReactiveValue::Constant(on.then(String::new)),
+            ReactiveValue::Dynamic(on) => ReactiveValue::derive(move || on().then(String::new)),
+        };
+        self.attribute(AttrName::new("secure"), present)
     }
 }

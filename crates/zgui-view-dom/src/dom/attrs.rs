@@ -32,6 +32,10 @@ impl Dom for DocumentDom {
         self.write_text(node, data);
     }
 
+    fn text_is(&self, node: NodeId, data: &str) -> bool {
+        self.holds_text(node, data)
+    }
+
     fn insert(&self, parent: NodeId, child: NodeId, before: Option<NodeId>) {
         self.link(parent, child, before);
     }
@@ -42,6 +46,10 @@ impl Dom for DocumentDom {
 
     fn parent(&self, node: NodeId) -> Option<NodeId> {
         self.parent_of(node)
+    }
+
+    fn is_live(&self, node: NodeId) -> bool {
+        self.live_index_of(node).is_some()
     }
 
     // Every writer from here down resolves through `live_index_of` and quietly does nothing when
@@ -170,7 +178,7 @@ impl Dom for DocumentDom {
         // The handler is released either way. That is the half that does not live in the document,
         // and skipping it for a departed node would leak the closure and everything it captured.
         if let Some(index) = self.live_index_of(el) {
-            self.edit(|edit| edit.remove_listener(index, id));
+            self.edit_unless_poisoned(|edit| edit.remove_listener(index, id));
         }
         self.handlers().borrow_mut().remove(id);
     }
@@ -274,6 +282,23 @@ mod tests {
     }
 
     #[test]
+    fn a_text_node_compares_its_text_without_a_batch() {
+        let document = Rc::new(RefCell::new(Document::new()));
+        let dom = DocumentDom::new(Rc::clone(&document));
+        let empty = dom.create_text("");
+        let text = dom.create_text("12");
+        let revision = dom.revision();
+
+        assert!(dom.text_is(empty, ""), "an absent text reads as empty");
+        assert!(dom.text_is(text, "12"));
+        assert!(!dom.text_is(text, "1"));
+        assert_eq!(dom.revision(), revision, "a comparison opens no batch");
+
+        let (stale, row) = stale_row();
+        assert!(!stale.text_is(row, ""), "a node that is gone holds nothing");
+    }
+
+    #[test]
     fn a_replaced_tag_is_born_replaced_and_its_attributes_are_heard() {
         // The two halves of the substrate outside content stands on: an `image` element carries
         // the replaced flag from creation — before any content exists for it — and a write to its
@@ -325,6 +350,78 @@ mod tests {
                 ("src".to_owned(), None),
             ],
             "the hook hears replaced elements only, removals included"
+        );
+    }
+
+    #[test]
+    fn a_watched_tag_is_heard_and_stays_out_of_the_replaced_names() {
+        let document = Rc::new(RefCell::new(Document::new()));
+        let dom = DocumentDom::new(Rc::clone(&document));
+        dom.watch_attributes_of(ElementName::new("field"));
+
+        let heard: Heard = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&heard);
+        dom.set_attribute_hook(Rc::new(move |_node, name, value| {
+            sink.borrow_mut()
+                .push((name.as_str().to_owned(), value.map(str::to_owned)));
+        }));
+
+        let field = dom.create_element(ElementName::new("field"));
+        let editor = dom.create_element(ElementName::new("editor"));
+        dom.insert(dom.root(field), field, None);
+        assert!(
+            !document
+                .borrow()
+                .store()
+                .core(dom.index_of(field))
+                .flags()
+                .contains(zgui_dom::node::flags::NodeFlags::IS_REPLACED),
+            "a watched name keeps its content in the document"
+        );
+
+        Dom::set_attribute(&dom, field, AttrName::new("secure"), Some(""));
+        Dom::set_attribute(&dom, editor, AttrName::new("secure"), Some(""));
+        Dom::set_attribute(&dom, field, AttrName::new("secure"), None);
+
+        assert_eq!(
+            heard.borrow().as_slice(),
+            &[
+                ("secure".to_owned(), Some(String::new())),
+                ("secure".to_owned(), None),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_teardown_on_a_poisoned_document_changes_nothing_and_panics_nowhere() {
+        // A batch that panicked poisons the document. The scopes it leaves behind still take their
+        // views down on the way out, and a second panic from a cleanup would abort the process.
+        let document = Rc::new(RefCell::new(Document::new()));
+        let dom = DocumentDom::new(Rc::clone(&document));
+        let row = dom.create_element(ElementName::new("row"));
+        dom.insert(dom.root(row), row, None);
+        let listener = dom.add_listener(
+            row,
+            zgui_vocab::EventKind::Click,
+            zgui_view::ListenerOptions::DEFAULT,
+            Rc::new(|_| {}),
+        );
+        assert_eq!(dom.handler_count(), 1);
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = document
+                .borrow()
+                .edit(&zgui_dom::EverythingMatters, |_| panic!("a batch panics"));
+        }));
+        assert!(unwound.is_err());
+        assert!(document.borrow().is_poisoned());
+
+        dom.remove_listener(row, listener);
+        dom.detach(row);
+        assert_eq!(
+            dom.handler_count(),
+            0,
+            "the handler is released all the same"
         );
     }
 }

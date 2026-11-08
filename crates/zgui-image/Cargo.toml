@@ -3,6 +3,13 @@ name = "zgui-image"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Raster image decoding for zgui"
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+include.workspace = true
 
 # L1 — contracts and pure data. Every dependency is inherited: `foo.workspace = true`.
 [dependencies]

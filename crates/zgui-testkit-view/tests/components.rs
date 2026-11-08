@@ -281,3 +281,53 @@ fn an_order_names_registrations_by_identity_so_a_swap_mid_dispatch_runs_nothing_
          run in its place"
     );
 }
+
+#[test]
+fn an_element_that_left_the_tree_reaches_nothing() {
+    let window = Window::open();
+    let button = window.dom.create_element(ElementName::new("control"));
+    window.dom.insert(window.root, button, None);
+    let clicks = Rc::new(Cell::new(0));
+    let count = Rc::clone(&clicks);
+    window.dom.add_listener(
+        button,
+        EventKind::Click,
+        ListenerOptions::DEFAULT,
+        Rc::new(move |_| count.set(count.get() + 1)),
+    );
+    window.dom.detach(button);
+
+    let delivered = window.dispatcher().send_to(
+        button,
+        EventKind::Click,
+        zgui_vocab::Payload::Pointer(zgui_vocab::PointerEvent::mouse(zgui_geom::Point::new(
+            zgui_geom::CssPx(0.0),
+            zgui_geom::CssPx(0.0),
+        ))),
+    );
+    assert!(delivered.ran.is_empty());
+    assert_eq!(
+        clicks.get(),
+        0,
+        "a click reached an element outside the tree"
+    );
+}
+
+#[test]
+fn a_caret_a_view_puts_in_a_field_is_where_the_next_key_lands() {
+    use zgui_view::ViewHost;
+    use zgui_vocab::Key;
+
+    let window = Window::open();
+    let field = window.dom.create_element(ElementName::new("field"));
+    window.dom.insert(window.root, field, None);
+
+    window.host.set_value(field, "resta");
+    window.frame();
+    window.host.set_selection(field, 2..2);
+    window.frame();
+    window.dispatcher().key(field, Key::Character("-".into()));
+
+    assert_eq!(window.dom.editing_selection(field), Some(3..3));
+    assert_eq!(window.dom.text_content(field), "re-sta");
+}

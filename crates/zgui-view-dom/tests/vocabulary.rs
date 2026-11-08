@@ -162,8 +162,17 @@ fn the_sheet_gives_every_name_in_the_vocabulary_a_layout_of_its_own() {
 /// The converse: the check above is only worth anything if it can fail.
 #[test]
 fn a_sheet_that_only_mentions_a_name_in_a_property_does_not_select_it() {
-    let selected = type_selectors("* { box-sizing: border-box } column { flex-direction: row }");
-    assert!(selected.contains(&"column".to_owned()));
+    let selected = type_selectors(
+        "* { box-sizing: border-box } /* a, 20, b */ column { flex-direction: row }",
+    );
+    assert!(
+        selected.contains(&"column".to_owned()),
+        "a comment before a rule hides the rule"
+    );
+    assert!(
+        !selected.contains(&"20".to_owned()),
+        "a comment is not a selector list"
+    );
     assert!(
         !selected.contains(&"box".to_owned()),
         "`box-sizing` is not a rule about `box`"
@@ -176,12 +185,22 @@ fn a_sheet_that_only_mentions_a_name_in_a_property_does_not_select_it() {
 
 /// Every bare element name `css` selects.
 ///
-/// A selector list is what sits before a `{`; a compound selector made only of identifier
-/// characters is a type selector and nothing else, which is exactly the form the vocabulary's
-/// layout defaults are written in.
+/// A selector list is what sits before a `{`, once comments are removed; a compound selector made
+/// only of identifier characters is a type selector and nothing else, which is exactly the form the
+/// vocabulary's layout defaults are written in.
 fn type_selectors(css: &str) -> Vec<String> {
-    let mut names = Vec::new();
+    let mut uncommented = String::with_capacity(css.len());
     let mut rest = css;
+    while let Some(open) = rest.find("/*") {
+        uncommented.push_str(&rest[..open]);
+        rest = rest[open..]
+            .find("*/")
+            .map_or("", |close| &rest[open + close + 2..]);
+    }
+    uncommented.push_str(rest);
+
+    let mut names = Vec::new();
+    let mut rest = uncommented.as_str();
     while let Some(brace) = rest.find('{') {
         let (prelude, tail) = rest.split_at(brace);
         let start = prelude.rfind('}').map_or(0, |end| end + 1);

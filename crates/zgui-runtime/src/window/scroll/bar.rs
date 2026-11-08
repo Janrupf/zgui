@@ -44,11 +44,7 @@ impl Window {
             Axis::Vertical => at.y.0,
             Axis::Horizontal => at.x.0,
         };
-        let by = if forward {
-            travel.length
-        } else {
-            -travel.length
-        };
+        let by = if forward { travel.page } else { -travel.page };
         self.scroll_along(container, axis, (held + by).clamp(0.0, travel.limit));
     }
 }

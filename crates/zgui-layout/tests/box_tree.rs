@@ -204,6 +204,52 @@ fn an_out_of_flow_box_is_a_layout_child_of_the_ancestor_that_positions_it() {
 }
 
 #[test]
+fn an_out_of_flow_box_with_no_positioned_ancestor_is_a_layout_child_of_the_root() {
+    // The root's box is the initial containing block. Laid out by the box it was written inside, a
+    // fixed box with `height: 100%` takes the height of that box rather than of the window.
+    let fixture = Fixture::new(
+        Element::new("root").children(vec![
+            Element::new("holder").children(vec![Element::new("floating").text("x")]),
+        ]),
+        "root { display: block; width: 200px }
+         holder { display: block }
+         floating { display: block; position: fixed; top: 0; left: 0 }",
+    );
+    let store = fixture.box_tree();
+    assert_invariants(&store);
+
+    let root = store.root().expect("a root");
+    let holder = store.node(root).children[0];
+    let floating = *store
+        .node(holder)
+        .paint_children
+        .iter()
+        .find(|&&child| store.node(child).source.is_some())
+        .expect("the out-of-flow box is painted where it was written");
+    assert!(
+        store.node(root).children.contains(&floating),
+        "the out-of-flow box is laid out by the root"
+    );
+    assert!(
+        !store.node(holder).children.contains(&floating),
+        "and not by the box it was written inside"
+    );
+}
+
+#[test]
+fn a_root_that_is_itself_out_of_flow_stays_the_root() {
+    let fixture = Fixture::new(
+        Element::new("root").children(vec![Element::new("a").text("one")]),
+        "root { display: block; width: 200px; position: fixed }
+         a { display: block }",
+    );
+    let store = fixture.box_tree();
+    assert_invariants(&store);
+    let root = store.root().expect("a root");
+    assert_eq!(store.node(root).parent, None, "nothing contains the root");
+}
+
+#[test]
 fn a_wrapped_inline_run_belongs_to_the_wrapper_and_not_to_the_block_it_was_written_in() {
     // The wrapper is what lays the run out and what establishes the formatting context it takes
     // part in. A run still pointing at the block above the wrapper would make every walk upwards

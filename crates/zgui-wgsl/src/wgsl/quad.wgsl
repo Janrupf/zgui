@@ -9,14 +9,6 @@
 // chain evaluated by a shared coverage function rather than four interpolated distances, and dotted
 // borders are a second style rather than an unimplemented one.
 
-// One paint per border side, in the order the widths are given.
-struct Strokes {
-    top: PaintRef,
-    right: PaintRef,
-    bottom: PaintRef,
-    left: PaintRef,
-}
-
 struct Quad {
     order: u32,
     style: u32,
@@ -24,7 +16,7 @@ struct Quad {
     radii: Radii,
     border: Edges,
     fill: PaintRef,
-    strokes: Strokes,
+    stroke: PaintRef,
     clip: u32,
     transform: u32,
     // The superellipse exponent the corners are cut with; two is the ellipse a corner radius has
@@ -37,9 +29,9 @@ struct Quad {
 
 @group(1) @binding(0) var quads: texture_2d<u32>;
 
-/// One quad, which spans 7 texels of the arena.
+/// One `Quad`, which the arena pads to 7 texels.
 fn load_quad(slot: u32) -> Quad {
-    let base = slot * 9u;
+    let base = slot * 7u;
     let t0 = textureLoad(quads, table_texel(base + 0u), 0);
     let t1 = textureLoad(quads, table_texel(base + 1u), 0);
     let t2 = textureLoad(quads, table_texel(base + 2u), 0);
@@ -47,8 +39,6 @@ fn load_quad(slot: u32) -> Quad {
     let t4 = textureLoad(quads, table_texel(base + 4u), 0);
     let t5 = textureLoad(quads, table_texel(base + 5u), 0);
     let t6 = textureLoad(quads, table_texel(base + 6u), 0);
-    let t7 = textureLoad(quads, table_texel(base + 7u), 0);
-    let t8 = textureLoad(quads, table_texel(base + 8u), 0);
     return Quad(
         t0.x,
         t0.y,
@@ -56,104 +46,38 @@ fn load_quad(slot: u32) -> Quad {
         Radii(bitcast<f32>(t1.z), bitcast<f32>(t1.w), bitcast<f32>(t2.x), bitcast<f32>(t2.y), bitcast<f32>(t2.z), bitcast<f32>(t2.w), bitcast<f32>(t3.x), bitcast<f32>(t3.y)),
         Edges(bitcast<f32>(t3.z), bitcast<f32>(t3.w), bitcast<f32>(t4.x), bitcast<f32>(t4.y)),
         PaintRef(t4.z, t4.w),
-        Strokes(
-            PaintRef(t5.x, t5.y),
-            PaintRef(t5.z, t5.w),
-            PaintRef(t6.x, t6.y),
-            PaintRef(t6.z, t6.w),
-        ),
-        t7.x,
-        t7.y,
-        bitcast<f32>(t7.z),
-        Vector2(bitcast<f32>(t7.w), bitcast<f32>(t8.x)),
+        PaintRef(t5.x, t5.y),
+        t5.z,
+        t5.w,
+        bitcast<f32>(t6.x),
+        Vector2(bitcast<f32>(t6.y), bitcast<f32>(t6.z)),
     );
-}
-
-
-// Which side owns the pixel at `corner_to_point`, as an index into `Strokes`.
-//
-// Where two sides meet they are divided by the diagonal running from the outer corner to the inner
-// one, which is the join CSS specifies and the one every engine draws. The test is which side's
-// edge is nearest *in units of that side's own width*: halfway along the diagonal the two distances
-// are equal fractions, and either answer paints the same colour when the two sides share one.
-//
-// On a box rounded to a full circle the four diagonals fall on 45 degrees, so each side owns a
-// quarter of the ring — which is exactly the arc a spinner leaves out.
-fn owning_side(center_to_point: vec2<f32>, half: vec2<f32>, border: Edges) -> u32 {
-    // Distance inwards from each outer edge.
-    let from_top = center_to_point.y + half.y;
-    let from_bottom = half.y - center_to_point.y;
-    let from_left = center_to_point.x + half.x;
-    let from_right = half.x - center_to_point.x;
-    // In units of the side's own width. A side of no width can never be nearest.
-    let vertical = select(
-        from_top / border.top,
-        from_bottom / border.bottom,
-        center_to_point.y > 0.0,
-    );
-    let horizontal = select(
-        from_left / border.left,
-        from_right / border.right,
-        center_to_point.x > 0.0,
-    );
-    let width_vertical = select(border.top, border.bottom, center_to_point.y > 0.0);
-    let width_horizontal = select(border.left, border.right, center_to_point.x > 0.0);
-    if width_horizontal <= 0.0 || (width_vertical > 0.0 && vertical <= horizontal) {
-        return select(0u, 2u, center_to_point.y > 0.0);
-    }
-    return select(3u, 1u, center_to_point.x > 0.0);
-}
-
-// The paint the owning side is drawn with.
-fn stroke_of(strokes: Strokes, side: u32) -> PaintRef {
-    if side == 0u {
-        return strokes.top;
-    }
-    if side == 1u {
-        return strokes.right;
-    }
-    if side == 2u {
-        return strokes.bottom;
-    }
-    return strokes.left;
 }
 
 const BORDER_SOLID: u32 = 0u;
 const BORDER_DASHED: u32 = 1u;
 const BORDER_DOTTED: u32 = 2u;
 
-// The record carried across, rather than fetched again on every fragment.
-//
-// A device with no storage buffers reads these tables out of textures, so the seven texels a quad
-// occupies are seven `textureLoad`s **per fragment** — for a record that is the same at every
-// fragment of the primitive. The vertex stage has already read it, and what the fragment stage
-// needs of it is twenty-four scalars, which is six slots. Even the narrowest device this pipeline
-// runs on has fifteen.
 struct QuadVarying {
     @builtin(position) position: vec4<f32>,
+    // The point, from the quad's origin in the space it was encoded in.
     @location(0) local: vec2<f32>,
-    @location(1) @interpolate(flat) bounds: vec4<f32>,
-    @location(2) @interpolate(flat) radii_low: vec4<f32>,
-    @location(3) @interpolate(flat) radii_high: vec4<f32>,
-    @location(4) @interpolate(flat) border: vec4<f32>,
-    @location(5) @interpolate(flat) paint_origin: vec2<f32>,
-    // style, clip, how many rounded tests the clip has, and the two paint references — all whole
-    // numbers, so they travel as such.
-    @location(6) @interpolate(flat) style_clip: vec4<u32>,
-    @location(7) @interpolate(flat) paints: vec4<u32>,
-    // The four border paints, two to a slot, in top, right, bottom, left order. Carried for the
-    // same reason the fill is: they belong to the primitive, and the fragment stage would otherwise
-    // read the quad's own texels again to reach whichever side owns the pixel.
-    @location(12) @interpolate(flat) strokes_near: vec4<u32>,
-    @location(13) @interpolate(flat) strokes_far: vec4<u32>,
+    // The quad's origin in that space.
+    @location(1) @interpolate(flat) origin: vec2<f32>,
+    // The record the fragment stage used to read again, carried across instead.
+    @location(2) @interpolate(flat) v_bounds: vec4<f32>,
+    @location(3) @interpolate(flat) v_radii_lo: vec4<f32>,
+    @location(4) @interpolate(flat) v_radii_hi: vec4<f32>,
+    @location(5) @interpolate(flat) v_border: vec4<f32>,
+    @location(6) @interpolate(flat) v_origin_shape: vec4<f32>,
+    @location(7) @interpolate(flat) v_refs: vec4<u32>,
+    // The style, the clip, how many rounded tests the clip has, and the system it is measured in.
+    @location(8) @interpolate(flat) v_ids: vec4<u32>,
     // The clip's own box, and the fill's colour where the fill is one colour. Both are properties
-    // of the primitive rather than of the pixel, and both were being fetched per fragment: the box
-    // to reject a fragment outside the clip, the colour to shade every fragment inside it. Carrying
-    // them leaves the common case — an unclipped rectangle of one colour — reading no table at all.
-    @location(8) @interpolate(flat) clip_box: vec4<f32>,
-    @location(9) @interpolate(flat) fill_color: vec4<f32>,
-    @location(10) @interpolate(flat) shift: vec2<f32>,
-    @location(11) @interpolate(flat) shape: f32,
+    // of the primitive rather than of the pixel, and both were read at every fragment: the box to
+    // reject a fragment outside the clip, the colour to shade every fragment inside it.
+    @location(9) @interpolate(flat) v_clip_box: vec4<f32>,
+    @location(10) @interpolate(flat) v_fill: vec4<f32>,
 }
 
 @vertex
@@ -166,94 +90,80 @@ fn vs_quad(
     let local = inflated_corner(vertex, quad.bounds) + shift;
     var out: QuadVarying;
     out.position = to_clip_position(local, quad.transform);
-    out.local = local;
-    out.bounds = vec4<f32>(quad.bounds.x, quad.bounds.y, quad.bounds.w, quad.bounds.h);
-    out.radii_low = vec4<f32>(
-        quad.radii.tl_x, quad.radii.tl_y, quad.radii.tr_x, quad.radii.tr_y,
-    );
-    out.radii_high = vec4<f32>(
-        quad.radii.br_x, quad.radii.br_y, quad.radii.bl_x, quad.radii.bl_y,
-    );
-    out.border = vec4<f32>(
-        quad.border.top, quad.border.right, quad.border.bottom, quad.border.left,
-    );
-    out.paint_origin = vec2<f32>(quad.paint_origin.x, quad.paint_origin.y);
-    out.paints = vec4<u32>(
-        quad.fill.kind, quad.fill.index, quad.strokes.top.kind, quad.strokes.top.index,
-    );
-    out.strokes_near = vec4<u32>(
-        quad.strokes.top.kind, quad.strokes.top.index,
-        quad.strokes.right.kind, quad.strokes.right.index,
-    );
-    out.strokes_far = vec4<u32>(
-        quad.strokes.bottom.kind, quad.strokes.bottom.index,
-        quad.strokes.left.kind, quad.strokes.left.index,
-    );
-    let box = bitcast<vec4<f32>>(textureLoad(clips, table_texel(quad.clip * 11u + 0u), 0));
-    let rounded = textureLoad(clips, table_texel(quad.clip * 11u + 9u), 0).x;
-    out.clip_box = box;
-    out.style_clip = vec4<u32>(quad.style, quad.clip, rounded, 0u);
-    out.fill_color = select(
-        vec4<f32>(0.0),
-        bitcast<vec4<f32>>(textureLoad(paints, table_texel(quad.fill.index * 4u + 2u), 0)),
-        quad.fill.kind == PAINT_SOLID,
-    );
-    out.shift = shift;
-    out.shape = quad.shape;
+    out.local = inflated_offset(vertex, quad.bounds);
+    out.origin = bounds_origin(quad.bounds);
+    out.v_bounds = bounds_of(quad.bounds);
+    out.v_radii_lo = radii_lo(quad.radii);
+    out.v_radii_hi = radii_hi(quad.radii);
+    out.v_border = vec4<f32>(quad.border.top, quad.border.right, quad.border.bottom, quad.border.left);
+    out.v_origin_shape = vec4<f32>(quad.paint_origin.x, quad.paint_origin.y, quad.shape, 0.0);
+    out.v_refs = vec4<u32>(quad.fill.kind, quad.fill.index, quad.stroke.kind, quad.stroke.index);
+    out.v_ids = vec4<u32>(quad.style, quad.clip, clip_count(quad.clip), clip_space(quad.clip));
+    out.v_clip_box = bounds_of(clip_aabb(quad.clip));
+    var fill = vec4<f32>(0.0);
+    if quad.fill.kind == PAINT_SOLID {
+        fill = rgba_of(load_paint(quad.fill.index).color);
+    }
+    out.v_fill = fill;
     return out;
 }
 
 @fragment
 fn fs_quad(in: QuadVarying) -> @location(0) vec4<f32> {
-    // Rebuilt from what was carried across, so that nothing below has to change shape.
+    // How long one device pixel is in the primitive's own space. Read before any branch, because
+    // a derivative is only defined where every fragment of the quad takes it.
+    let unit = max(max(fwidth(in.local).x, fwidth(in.local).y), 1e-6);
     let quad = Quad(
         0u,
-        in.style_clip.x,
-        Bounds(in.bounds.x, in.bounds.y, in.bounds.z, in.bounds.w),
-        Radii(
-            in.radii_low.x, in.radii_low.y, in.radii_low.z, in.radii_low.w,
-            in.radii_high.x, in.radii_high.y, in.radii_high.z, in.radii_high.w,
-        ),
-        Edges(in.border.x, in.border.y, in.border.z, in.border.w),
-        PaintRef(in.paints.x, in.paints.y),
-        Strokes(
-            PaintRef(in.strokes_near.x, in.strokes_near.y),
-            PaintRef(in.strokes_near.z, in.strokes_near.w),
-            PaintRef(in.strokes_far.x, in.strokes_far.y),
-            PaintRef(in.strokes_far.z, in.strokes_far.w),
-        ),
-        in.style_clip.y,
+        in.v_ids.x,
+        bounds_from_vec4(in.v_bounds),
+        radii_from_vec4(in.v_radii_lo, in.v_radii_hi),
+        Edges(in.v_border.x, in.v_border.y, in.v_border.z, in.v_border.w),
+        PaintRef(in.v_refs.x, in.v_refs.y),
+        PaintRef(in.v_refs.z, in.v_refs.w),
+        in.v_ids.y,
         0u,
-        in.shape,
-        Vector2(in.paint_origin.x, in.paint_origin.y),
+        in.v_origin_shape.z,
+        Vector2(in.v_origin_shape.x, in.v_origin_shape.y),
     );
     // The clip is in device space, so it is evaluated at the real pixel; the shape is in the
     // primitive's own space, so it is evaluated at the point that maps to this pixel. The box and
-    // the count came across from the vertex stage; only a clip that has rounded tests reads the
-    // table here, and nearly none has.
+    // the count of rounded tests came across from the vertex stage, so an unclipped rectangle
+    // tests the box it was handed and reads no table here at all.
     let at = device_position(in.position.xy);
-    let box = in.clip_box;
-    if at.x < box.x || at.y < box.y || at.x > box.x + box.z || at.y > box.y + box.w {
+    if outside_bounds(at, bounds_from_vec4(in.v_clip_box)) {
         return vec4<f32>(0.0);
     }
-    let clip = clip_rounded_coverage(at, in.style_clip.y, in.style_clip.z);
+    var clip = 1.0;
+    if in.v_ids.w != NO_SPACE {
+        // A clip measured in a system of its own needs the kept part, which only the table holds.
+        // That reads the box a second time, which is the price of the case that has one.
+        clip = clip_coverage(at, quad.clip);
+    } else if in.v_ids.z > 0u {
+        clip = clip_rounded_coverage(at, quad.clip, in.v_ids.z);
+    }
     if clip <= 0.0 {
         return vec4<f32>(0.0);
     }
-    let point = in.local - in.shift;
+    let point = in.origin + in.local;
     let paint_origin = vec2<f32>(quad.paint_origin.x, quad.paint_origin.y);
-    let background = select(
-        paint_color(quad.fill, point, paint_origin),
-        in.fill_color,
-        quad.fill.kind == PAINT_SOLID,
-    );
+    // One colour came across with the vertices. A gradient still resolves per fragment, because
+    // that genuinely varies across the primitive.
+    var background = in.v_fill;
+    if quad.fill.kind != PAINT_SOLID {
+        background = paint_color(quad.fill, point, paint_origin);
+    }
 
     let size = bounds_size(quad.bounds);
     let half_size = size * 0.5;
-    let center_to_point = point - (bounds_origin(quad.bounds) + half_size);
+    let center_to_point = in.local - half_size;
 
-    // Half a pixel is the largest distance between a pixel's centre and an edge that covers it.
-    let antialias_threshold = 0.5;
+    // Half a device pixel is the largest distance between a pixel's centre and an edge that covers
+    // it. The distances below are in the primitive's own space, so under a scale the band is
+    // measured in that space and every coverage is divided by the length of one device pixel:
+    // the edge is smoothed across one pixel at every zoom, and never across more than the pixels
+    // its ink reaches.
+    let antialias_threshold = 0.5 * unit;
 
     let corner_to_point = abs(center_to_point) - half_size;
     let corner_radii = pick_corner_radii(center_to_point, quad.radii);
@@ -270,7 +180,7 @@ fn fs_quad(in: QuadVarying) -> @location(0) vec4<f32> {
         // the background unweighted here would paint a full-intensity ring one pixel outside every
         // plain rectangle in the frame.
         let square_sdf = max(corner_to_point.x, corner_to_point.y);
-        return background * saturate(antialias_threshold - square_sdf) * clip;
+        return background * saturate((antialias_threshold - square_sdf) / unit) * clip;
     }
 
     // The widths of the two nearest sides.
@@ -288,10 +198,16 @@ fn fs_quad(in: QuadVarying) -> @location(0) vec4<f32> {
     let corner_center_to_point = corner_to_point + corner_radii;
     let is_near_rounded_corner = corner_center_to_point.x >= 0.0 && corner_center_to_point.y >= 0.0;
     let straight_inner_corner_to_point = corner_to_point + reduced_border;
-    let is_beyond_inner_straight_border = straight_inner_corner_to_point.x > 0.0
-        || straight_inner_corner_to_point.y > 0.0;
-    let is_within_inner_straight_border = straight_inner_corner_to_point.x < -antialias_threshold
-        && straight_inner_corner_to_point.y < -antialias_threshold;
+    // Past the antialiasing band of a straight inner edge. The inner corner lies inside those
+    // edges, so a point this far beyond one is in the border whatever the corner's shape; nearer
+    // the edge, the curve of the inner corner decides.
+    let is_beyond_inner_straight_border = straight_inner_corner_to_point.x > antialias_threshold
+        || straight_inner_corner_to_point.y > antialias_threshold;
+    // Inside both the inner edges and the outer edge's antialiasing band. A zero-width side puts
+    // its inner edge outside the outer one, so the outer band is tested as well.
+    let is_within_inner_straight_border =
+        max(straight_inner_corner_to_point.x, corner_to_point.x) < -antialias_threshold
+        && max(straight_inner_corner_to_point.y, corner_to_point.y) < -antialias_threshold;
 
     if is_within_inner_straight_border && !is_near_rounded_corner {
         return background * clip;
@@ -321,16 +237,12 @@ fn fs_quad(in: QuadVarying) -> @location(0) vec4<f32> {
 
     var color = background;
     if border_sdf < antialias_threshold {
-        // Which side's colour this pixel takes. A side left unpainted — `border-top-color:
-        // transparent`, which is how a spinner is written — draws nothing at all here rather than
-        // blending a transparent colour, so the background shows through the gap and the ring can
-        // be seen to turn.
-        let side = owning_side(center_to_point, half_size, quad.border);
-        let stroke = stroke_of(quad.strokes, side);
-        if stroke.kind == PAINT_NONE {
-            return color * saturate(antialias_threshold - outer_sdf) * clip;
+        var border_color: vec4<f32>;
+        if quad.stroke.kind == PAINT_SIDES {
+            border_color = sides_color(quad.stroke, center_to_point, corner_to_point, border, unit);
+        } else {
+            border_color = paint_color(quad.stroke, point, paint_origin);
         }
-        var border_color = paint_color(stroke, point, paint_origin);
         let style = quad.style & 0xffu;
         if style != BORDER_SOLID {
             border_color *= dash_coverage(
@@ -346,10 +258,37 @@ fn fs_quad(in: QuadVarying) -> @location(0) vec4<f32> {
             );
         }
         let blended = over_premultiplied(background, border_color);
-        color = mix(background, blended, saturate(antialias_threshold - inner_sdf));
+        color = mix(background, blended, saturate((antialias_threshold - inner_sdf) / unit));
     }
 
-    return color * saturate(antialias_threshold - outer_sdf) * clip;
+    return color * saturate((antialias_threshold - outer_sdf) / unit) * clip;
+}
+
+// The colour of a border with one colour per side, at a point in the border.
+//
+// The sides meet on the line from the outer corner to the inner corner, as CSS draws them. A point
+// belongs to the vertical side when `dx * bw_y < dy * bw_x`, where `dx` and `dy` are its distances
+// in from the vertical and the horizontal edge and `bw` the two widths. A zero-width side never
+// wins. The two colours are blended over one pixel across the diagonal.
+fn sides_color(
+    reference: PaintRef,
+    center_to_point: vec2<f32>,
+    corner_to_point: vec2<f32>,
+    widths: vec2<f32>,
+    unit: f32,
+) -> vec4<f32> {
+    let paint = load_paint(reference.index);
+    let vertical = side_color(paint, select(1u, 3u, center_to_point.x < 0.0));
+    let horizontal = side_color(paint, select(2u, 0u, center_to_point.y < 0.0));
+    var toward_vertical = 0.0;
+    if widths.x > 0.0 && widths.y > 0.0 {
+        let inward = -corner_to_point;
+        let across = (inward.y * widths.x - inward.x * widths.y) / length(widths);
+        toward_vertical = saturate(0.5 + across / unit);
+    } else if widths.x > 0.0 {
+        toward_vertical = 1.0;
+    }
+    return mix(horizontal, vertical, toward_vertical);
 }
 
 // Premultiplied source-over.

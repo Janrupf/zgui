@@ -25,9 +25,9 @@ mod frozen;
 pub(crate) mod shift;
 
 use zgui_dom::NodeKey;
-use zgui_geom::{CssPx, Point, Scale};
+use zgui_geom::{CssPx, Point, Rect, Scale};
 use zgui_scroll::{Align, Behavior, Stretch};
-use zgui_vocab::{EventKind, Payload, ScrollDelta, ScrollPhase, Timestamp};
+use zgui_vocab::{EventKind, Payload, ScrollDelta, ScrollPhase, Timestamp, WheelEvent};
 
 use crate::window::Window;
 
@@ -59,47 +59,136 @@ impl Window {
     /// the applications beside this one move; and *how tall a line is* is the scrolled container's
     /// own. A constant standing in for any one of them is a wheel that feels wrong somewhere and is
     /// never obviously broken anywhere.
-    pub(crate) fn scroll_by(&mut self, container: NodeKey, delta: ScrollDelta, phase: ScrollPhase) {
+    ///
+    /// A touchpad gesture that reports its phases goes to [`zgui_scroll::Scroller::drag_by`]
+    /// instead: it latches to one container and holds its stretch while the fingers are down.
+    /// `at` is the event's own stamp, which the gesture measures its speed with.
+    pub(crate) fn scroll_by(
+        &mut self,
+        container: NodeKey,
+        delta: ScrollDelta,
+        phase: ScrollPhase,
+        at: Timestamp,
+    ) {
         let chain = self.scroll_chain(container);
         let Some(&innermost) = chain.first() else {
             return;
         };
-        let units = self.scroll_units(innermost);
-        let asked = self.asked_for(delta);
-        let moved_by =
-            zgui_input::normalize::scroll::to_device(asked, units, Scale::new(self.scale));
+        let moved_by = self.device_delta(innermost, delta);
         // A detent arrived whole and has to be carried; a continuous surface's deltas are already
         // a motion, and a second animation over them is what makes a trackpad feel like treacle.
         let settings = self.scroll_settings();
         let discrete = phase == ScrollPhase::Discrete;
         let travels = discrete && settings.wheel.framework_animates();
-        // Whether the end of the content may be pulled past. A detent has no gesture behind it to
-        // follow, so an edge that springs there bounces once per click at an end the person has
-        // already arrived at and is only pushing against.
-        let stretch = if if discrete {
-            settings.elastic.admits_a_detent()
-        } else {
-            settings.elastic.admits_a_gesture()
-        } {
-            Stretch::Permitted
-        } else {
-            Stretch::Refused
-        };
-        let touched = {
+        let stretch = self.stretch_for(phase);
+        let at = at.since_origin();
+        let (touched, returning) = {
             let layout = self.layout.borrow();
             let mut scroller = self.scroll.borrow_mut();
-            if travels {
-                scroller.glide_by(&layout, &chain, moved_by, stretch)
-            } else {
-                scroller.scroll_by(&layout, &chain, moved_by, stretch)
+            match phase {
+                ScrollPhase::Started => {
+                    scroller.touch(&chain);
+                    let touched = scroller.drag_by(&layout, &chain, moved_by, at, stretch);
+                    (touched, false)
+                }
+                ScrollPhase::Moved if scroller.is_touching() => {
+                    let touched = scroller.drag_by(&layout, &chain, moved_by, at, stretch);
+                    (touched, false)
+                }
+                ScrollPhase::Momentum => {
+                    let touched = scroller.coast_by(&layout, &chain, moved_by, at, stretch);
+                    (touched, false)
+                }
+                ScrollPhase::Ended if scroller.is_touching() => {
+                    let touched = scroller.drag_by(&layout, &chain, moved_by, at, stretch);
+                    (touched, !scroller.lift().is_empty())
+                }
+                _ => {
+                    let returning = discrete && !scroller.forget_gesture().is_empty();
+                    let touched = if travels {
+                        scroller.glide_by(&layout, &chain, moved_by, stretch)
+                    } else {
+                        scroller.scroll_by(&layout, &chain, moved_by, stretch)
+                    };
+                    (touched, returning)
+                }
             }
         };
         // A glide's own movement is reported by the frames that carry it, but the frame it was
         // asked in still has to be one of them, or the wheel does nothing until something else
-        // happens to wake the loop.
+        // happens to wake the loop. An edge that was let go also needs frames to return.
         self.mark_scrolled(&touched);
-        if travels {
+        if travels || returning {
             self.request_scroll_frame();
+        }
+    }
+
+    /// Carries out the part of a wheel event that does not depend on its default.
+    ///
+    /// The end of a gesture always lets go of its edges, even over nothing that scrolls or when a
+    /// listener refused the default: an edge held after the fingers lift stays stretched for ever.
+    /// When the default was `allowed` and found no container, a gesture that is latched keeps
+    /// moving its container, because the pointer may leave a container while a gesture moves it.
+    pub(crate) fn scroll_without_default(
+        &mut self,
+        wheel: &WheelEvent,
+        at: Timestamp,
+        allowed: bool,
+    ) {
+        let latched = self.scroll.borrow().latched();
+        match wheel.phase {
+            ScrollPhase::Ended if !self.scroll.borrow_mut().lift().is_empty() => {
+                self.request_scroll_frame();
+            }
+            ScrollPhase::Started if allowed => self.scroll.borrow_mut().touch(&[]),
+            ScrollPhase::Moved | ScrollPhase::Momentum if allowed => {
+                let Some(container) = latched else {
+                    return;
+                };
+                let moved_by = self.device_delta(container, wheel.delta);
+                let stretch = self.stretch_for(wheel.phase);
+                let at = at.since_origin();
+                let touched = {
+                    let layout = self.layout.borrow();
+                    let mut scroller = self.scroll.borrow_mut();
+                    if wheel.phase == ScrollPhase::Momentum {
+                        scroller.coast_by(&layout, &[container], moved_by, at, stretch)
+                    } else {
+                        scroller.drag_by(&layout, &[container], moved_by, at, stretch)
+                    }
+                };
+                self.mark_scrolled(&touched);
+            }
+            _ => {}
+        }
+    }
+
+    /// `delta` in device pixels, measured against the line height of `container`.
+    fn device_delta(
+        &mut self,
+        container: NodeKey,
+        delta: ScrollDelta,
+    ) -> zgui_geom::Size<zgui_geom::DevicePx, zgui_geom::Device> {
+        let units = self.scroll_units(container);
+        let asked = self.asked_for(delta);
+        zgui_input::normalize::scroll::to_device(asked, units, Scale::new(self.scale))
+    }
+
+    /// Whether a scroll in `phase` may pull the end of the content past its end.
+    ///
+    /// A detent has no gesture behind it to follow, so an edge that springs there bounces once per
+    /// click at an end the person has already arrived at and is only pushing against.
+    fn stretch_for(&self, phase: ScrollPhase) -> Stretch {
+        let elastic = self.scroll_settings().elastic;
+        let admitted = if phase == ScrollPhase::Discrete {
+            elastic.admits_a_detent()
+        } else {
+            elastic.admits_a_gesture()
+        };
+        if admitted {
+            Stretch::Permitted
+        } else {
+            Stretch::Refused
         }
     }
 
@@ -110,7 +199,28 @@ impl Window {
         }
     }
 
-    /// Carries out a scroll a view asked for.
+    /// Queues a scroll a view asked for, to be carried out after the next layout pass.
+    ///
+    /// The view that asks has often just added what it scrolls to, in the same flush: a row
+    /// appended to a log, a message to a thread. The layout that holds it does not exist yet, so
+    /// the request waits for [`Window::carry_out_owed_scrolls`], which runs between that layout
+    /// pass and the fragment pass that composes it.
+    pub(crate) fn owe_scroll(
+        &mut self,
+        node: zgui_view::NodeId,
+        target: zgui_view::ScrollTarget,
+        behavior: zgui_view::ScrollBehavior,
+    ) {
+        let Some(key) = zgui_view_dom::id::to_document(node) else {
+            return;
+        };
+        self.owed_scrolls.push((key, target, behavior));
+    }
+
+    /// Carries out a scroll at once, against the layout the window holds.
+    ///
+    /// For a request from outside a frame, such as an accessibility action, which names a node
+    /// the last frame laid out.
     pub(crate) fn carry_out_scroll(
         &mut self,
         node: zgui_view::NodeId,
@@ -124,6 +234,58 @@ impl Window {
             return;
         };
         self.place(container, to, translate(behavior));
+    }
+
+    /// Queues again the scrolls the last layout pass carried out, before a relayout in the same
+    /// frame.
+    ///
+    /// A surface that an observation delivery places and caps changes its geometry after the
+    /// first layout pass. A scroll into view measured against that first pass can then leave its
+    /// node outside the capped scrollport.
+    pub(crate) fn owe_carried_scrolls_again(&mut self) {
+        if self.carried_scrolls.is_empty() {
+            return;
+        }
+        let mut again = core::mem::take(&mut self.carried_scrolls);
+        again.extend(core::mem::take(&mut self.owed_scrolls));
+        self.owed_scrolls = again;
+    }
+
+    /// Forgets the scrolls carried out this frame, once no relayout of this frame can follow.
+    pub(crate) fn forget_carried_scrolls(&mut self) {
+        self.carried_scrolls.clear();
+    }
+
+    /// Whether a scroll a view asked for still waits for a layout pass.
+    pub(crate) fn owes_scrolls(&self) -> bool {
+        !self.owed_scrolls.is_empty()
+    }
+
+    /// Carries out every queued scroll against the layout pass that has just run.
+    ///
+    /// Called by [`Window::lay_out`] after the offsets are clamped to the new extents and before
+    /// the fragment pass, which composes what this moves. An instant scroll is therefore shown by
+    /// this frame and asks for no other; a smooth one asks for the frames its motion takes.
+    pub(crate) fn carry_out_owed_scrolls(&mut self) {
+        self.carried_scrolls.clear();
+        if self.owed_scrolls.is_empty() {
+            return;
+        }
+        for (node, target, behavior) in core::mem::take(&mut self.owed_scrolls) {
+            // A relative scroll moves again each time it is carried out.
+            if !matches!(target, zgui_view::ScrollTarget::By(_)) {
+                self.carried_scrolls.push((node, target, behavior));
+            }
+            let Some((container, to)) = self.destination(node, target) else {
+                continue;
+            };
+            let behavior = translate(behavior);
+            if behavior.animates() {
+                self.place(container, to, behavior);
+            } else {
+                self.place_in_frame(container, to);
+            }
+        }
     }
 
     /// Carries out what a touch gesture asked for.
@@ -332,6 +494,31 @@ impl Window {
         }
     }
 
+    /// Puts one container at an offset at once, from inside the frame that composes it.
+    ///
+    /// The same as [`Window::place`] with an instant behaviour, less the frame request: the
+    /// fragment pass of this frame is still to run, and it composes the mark.
+    fn place_in_frame(
+        &mut self,
+        container: NodeKey,
+        to: Point<zgui_geom::DevicePx, zgui_geom::Device>,
+    ) {
+        if self.is_frozen(container) {
+            return;
+        }
+        let before = self.scroll.borrow().offset_of(container);
+        let moved = {
+            let layout = self.layout.borrow();
+            self.scroll
+                .borrow_mut()
+                .scroll_to(&layout, container, to, Behavior::Instant)
+        };
+        if moved.is_some() && self.scroll.borrow().offset_of(container) != before {
+            let mut document = self.document.borrow_mut();
+            zgui_scroll::mark::scrolled(&mut document, &[container]);
+        }
+    }
+
     /// Advances every smooth scroll and every elastic edge, and marks what moved.
     ///
     /// A gap longer than [`PARKED_FOR`] intervals is spent on nothing rather than on the motion,
@@ -428,6 +615,7 @@ impl Window {
         }
         // A handler's writes have to settle in this frame, exactly as an observation delivery's do,
         // or a virtualised list renders the rows it had before the scroll for one frame.
+        self.gate.requests_serviced();
         zgui_reactive::flush();
         self.carry_out_commands(timestamp);
         self.restyle_and_relayout_after_delivery();
@@ -484,6 +672,11 @@ impl Window {
     }
 
     /// Which container brings `node` into view, and the offset that does it.
+    ///
+    /// Measured from the resolved layout, so a node laid out for the first time by this frame's
+    /// layout pass is found before the fragment pass has composed it. Sticky offsets and
+    /// transforms are ignored. A node placed by line layout, which has no origin of its own, is
+    /// measured from the fragments the last frame composed.
     fn aligned_offset(
         &self,
         node: NodeKey,
@@ -502,11 +695,22 @@ impl Window {
         let layout = self.layout.borrow();
         let target_box = *layout.boxes_of(node).first()?;
         let container_box = *layout.boxes_of(container).first()?;
-        let target = layout.fragments_of_box(target_box).first().copied()?;
-        let port = layout.fragments_of_box(container_box).first().copied()?;
-        let target = layout.fragment(target)?.border_box;
-        let port = layout.fragment(port)?.content_box;
         let at = self.scroll.borrow().offset_of(container);
+        let (target, port) = match zgui_layout::scroll_region::into_view::target_in(
+            &layout,
+            container_box,
+            target_box,
+        ) {
+            Some((target, size)) => (target, Rect::new(at, size)),
+            None => {
+                let target = layout.fragments_of_box(target_box).first().copied()?;
+                let port = layout.fragments_of_box(container_box).first().copied()?;
+                (
+                    layout.fragment(target)?.border_box,
+                    layout.fragment(port)?.content_box(),
+                )
+            }
+        };
         Some((
             container,
             zgui_scroll::into_view::offset_for(at, target, port, align),

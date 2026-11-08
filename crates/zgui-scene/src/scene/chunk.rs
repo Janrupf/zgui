@@ -17,8 +17,8 @@ use crate::id::{ClipId, PaintId};
 use crate::ops::PaintOp;
 use crate::paint::PaintRef;
 use crate::prim::{
-    ColorSprite, Decoration, ExternalQuad, MonoSprite, PrimitiveKind, Quad, ShadedQuad, Shadow,
-    SubpixelSprite,
+    ColorSprite, Decoration, ExternalQuad, MarkItem, MarkPayload, MonoSprite, PrimitiveKind, Quad,
+    ShadedQuad, Shadow, SubpixelSprite,
 };
 use crate::scene::Scene;
 use crate::spatial::SpatialId;
@@ -100,14 +100,25 @@ impl ChunkSlot {
     }
 }
 
-/// One chunk a renderer with persistent storage is told about this frame.
+/// One change to the chunks a renderer with persistent storage holds.
+///
+/// The notes form one log in note order. A renderer applies them in that order: notes stand
+/// across frames that never reach it, so one batch can insert a revision and then retire it.
 #[derive(Clone, Debug)]
-pub struct ChunkUpload {
-    /// The chunk's identity: the revision its encoding was stamped with, unique for the cache's
-    /// life.
-    pub revision: u64,
-    /// The bytes, at the position the fragment was encoded at.
-    pub prims: std::sync::Arc<ChunkPrims>,
+pub enum ChunkNote {
+    /// A chunk came into existence.
+    Inserted {
+        /// The chunk's identity: the revision its encoding was stamped with, unique for the
+        /// cache's life.
+        revision: u64,
+        /// The bytes, at the position the fragment was encoded at.
+        prims: std::sync::Arc<ChunkPrims>,
+    },
+    /// A chunk ceased to exist.
+    Retired {
+        /// The revision of the chunk.
+        revision: u64,
+    },
 }
 
 /// The primitives one encoding pushed, one array per kind, with the order they were pushed in.
@@ -132,6 +143,11 @@ pub struct ChunkPrims {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     /// Full-colour sprites.
     pub color_sprites: Vec<ColorSprite>,
+    /// Recognised shapes drawn from a shared payload.
+    pub marks: Vec<MarkItem>,
+    /// The payload of each mark, parallel to [`ChunkPrims::marks`], shared with every frame that
+    /// draws it.
+    pub mark_payloads: Vec<std::sync::Arc<MarkPayload>>,
     /// Textures the renderer did not draw.
     pub externals: Vec<ExternalQuad>,
     /// Filters over the composite beneath them.
@@ -160,9 +176,13 @@ pub struct ChunkPrims {
     pub span: DrawOrder,
     /// The rectangle the whole chunk puts ink in, in the coordinates it was recorded in.
     ///
-    /// `None` for a chunk with nothing in it. A replay asks the draw-order tree about this one
-    /// rectangle in place of asking about every primitive separately.
+    /// `None` for a chunk with nothing in it.
     pub ink: Option<Rect<DevicePx, Device>>,
+    /// The same ink split by the coordinate system each part was recorded in, by slot.
+    ///
+    /// A replay puts each part where its coordinate system now draws and asks the draw-order tree
+    /// about their union, in place of asking about every primitive separately.
+    pub ink_by_space: Vec<(u32, Rect<DevicePx, Device>)>,
     /// Clips the encoding minted for its own content, in mint order.
     ///
     /// A minted clip's rectangle is measured where the encoding drew, so a replay re-interns each
@@ -192,6 +212,12 @@ impl ChunkPrims {
             + self.mono_sprites.capacity() * size_of::<MonoSprite>()
             + self.subpixel_sprites.capacity() * size_of::<SubpixelSprite>()
             + self.color_sprites.capacity() * size_of::<ColorSprite>()
+            + self.marks.capacity() * size_of::<MarkItem>()
+            + self
+                .mark_payloads
+                .iter()
+                .map(|payload| payload.bytes())
+                .sum::<usize>()
             + self.externals.capacity() * size_of::<ExternalQuad>()
             + self.backdrops.capacity() * size_of::<BackdropFilter>()
             + self.vectors.capacity() * size_of::<VectorItem>()
@@ -218,6 +244,7 @@ impl ChunkPrims {
     pub(crate) fn settle_orders(&mut self) {
         self.span = 0;
         self.ink = None;
+        self.ink_by_space.clear();
         if self.orders.len() != self.ops.len() {
             self.orders.clear();
             return;
@@ -237,6 +264,11 @@ impl ChunkPrims {
                 Some(union) => union.union(bounds),
                 None => bounds,
             });
+            let slot = slot_of(self, op);
+            match self.ink_by_space.iter_mut().find(|(held, _)| *held == slot) {
+                Some((_, union)) => *union = union.union(bounds),
+                None => self.ink_by_space.push((slot, bounds)),
+            }
         }
     }
 
@@ -248,9 +280,7 @@ impl ChunkPrims {
         for quad in &self.quads {
             holds.clip(quad.clip);
             holds.paint(quad.fill);
-            for stroke in quad.strokes {
-                holds.paint(stroke);
-            }
+            holds.paint(quad.stroke);
         }
         // A shaded rectangle names everything a quad names and one thing more: the block its
         // effect is drawn with. Leaving that unheld is a replayed effect drawn with whatever
@@ -276,6 +306,10 @@ impl ChunkPrims {
         }
         for sprite in &self.color_sprites {
             holds.clip(sprite.clip);
+        }
+        for mark in &self.marks {
+            holds.clip(mark.clip);
+            holds.paint(mark.paint);
         }
         for external in &self.externals {
             holds.clips.push(external.clip);
@@ -310,6 +344,8 @@ impl ChunkPrims {
         self.mono_sprites.clear();
         self.subpixel_sprites.clear();
         self.color_sprites.clear();
+        self.marks.clear();
+        self.mark_payloads.clear();
         self.externals.clear();
         self.backdrops.clear();
         self.vectors.clear();
@@ -317,13 +353,14 @@ impl ChunkPrims {
         self.orders.clear();
         self.span = 0;
         self.ink = None;
+        self.ink_by_space.clear();
         self.minted.clear();
     }
 }
 
 /// The order one of the frame's own primitives was given, for an extraction to rebase.
 ///
-/// Zero for the kinds an extraction skips, which never reach [`ChunkPrims::ops`] at all.
+/// Zero for the group markers an extraction skips, which never reach [`ChunkPrims::ops`] at all.
 fn order_of(prims: &crate::scene::primitives::Primitives, op: PaintOp) -> DrawOrder {
     let index = op.index as usize;
     match op.kind {
@@ -337,9 +374,66 @@ fn order_of(prims: &crate::scene::primitives::Primitives, op: PaintOp) -> DrawOr
             .get(index)
             .map_or(0, |prim| prim.order),
         PrimitiveKind::ColorSprite => prims.color_sprites.get(index).map_or(0, |prim| prim.order),
+        PrimitiveKind::Marks => prims.marks.get(index).map_or(0, |prim| prim.order),
         PrimitiveKind::External => prims.externals.get(index).map_or(0, |prim| prim.order),
         PrimitiveKind::Backdrop => prims.backdrops.get(index).map_or(0, |prim| prim.order),
-        PrimitiveKind::Vector | PrimitiveKind::GroupStart | PrimitiveKind::GroupEnd => 0,
+        PrimitiveKind::Vector => prims.vectors.get(index).map_or(0, |prim| prim.order),
+        PrimitiveKind::GroupStart | PrimitiveKind::GroupEnd => 0,
+    }
+}
+
+/// The slot of the coordinate system one recorded operation draws under.
+fn slot_of(chunk: &ChunkPrims, op: PaintOp) -> u32 {
+    let index = op.index as usize;
+    let viewport = crate::spatial::SpatialId::VIEWPORT.index();
+    match op.kind {
+        PrimitiveKind::Quad => chunk
+            .quads
+            .get(index)
+            .map_or(viewport, |prim| prim.transform),
+        PrimitiveKind::Shaded => chunk
+            .shaded
+            .get(index)
+            .map_or(viewport, |prim| prim.transform),
+        PrimitiveKind::Shadow => chunk
+            .shadows
+            .get(index)
+            .map_or(viewport, |prim| prim.transform),
+        PrimitiveKind::Decoration => chunk
+            .decorations
+            .get(index)
+            .map_or(viewport, |prim| prim.transform),
+        PrimitiveKind::MonoSprite => chunk
+            .mono_sprites
+            .get(index)
+            .map_or(viewport, |prim| prim.transform),
+        PrimitiveKind::SubpixelSprite => chunk
+            .subpixel_sprites
+            .get(index)
+            .map_or(viewport, |prim| prim.transform),
+        PrimitiveKind::ColorSprite => chunk
+            .color_sprites
+            .get(index)
+            .map_or(viewport, |prim| prim.transform),
+        PrimitiveKind::Marks => chunk
+            .marks
+            .get(index)
+            .map_or(viewport, |prim| prim.transform),
+        PrimitiveKind::External => chunk
+            .externals
+            .get(index)
+            .map_or(viewport, |prim| prim.transform.index()),
+        PrimitiveKind::Vector => chunk
+            .vectors
+            .get(index)
+            .and_then(|prim| prim.transform)
+            .map_or(viewport, crate::spatial::SpatialId::index),
+        PrimitiveKind::Backdrop => chunk
+            .backdrops
+            .get(index)
+            .and_then(|prim| prim.transform)
+            .map_or(viewport, crate::spatial::SpatialId::index),
+        PrimitiveKind::GroupStart | PrimitiveKind::GroupEnd => viewport,
     }
 }
 
@@ -354,11 +448,13 @@ fn ink_of(chunk: &ChunkPrims, op: PaintOp) -> Option<Rect<DevicePx, Device>> {
         PrimitiveKind::MonoSprite => chunk.mono_sprites.get(index).map(MonoSprite::ink),
         PrimitiveKind::SubpixelSprite => chunk.subpixel_sprites.get(index).map(SubpixelSprite::ink),
         PrimitiveKind::ColorSprite => chunk.color_sprites.get(index).map(ColorSprite::ink),
+        PrimitiveKind::Marks => chunk.marks.get(index).map(MarkItem::ink),
         PrimitiveKind::External => chunk.externals.get(index).map(ExternalQuad::ink),
         PrimitiveKind::Backdrop => chunk.backdrops.get(index).map(|prim| prim.bounds),
-        // A vector item is rasterised elsewhere and composited back in, and a replay does not
-        // re-plan a pass for one; its extent is no part of what the block is asked about.
-        PrimitiveKind::Vector | PrimitiveKind::GroupStart | PrimitiveKind::GroupEnd => None,
+        // A drawing's ink can reach past everything else in its chunk, and a later primitive
+        // over that overflow has to order above it.
+        PrimitiveKind::Vector => chunk.vectors.get(index).map(|prim| prim.local_ink),
+        PrimitiveKind::GroupStart | PrimitiveKind::GroupEnd => None,
     }
 }
 
@@ -390,6 +486,7 @@ pub(crate) fn provenance_lane_of(kind: PrimitiveKind) -> Option<usize> {
         PrimitiveKind::SubpixelSprite => 4,
         PrimitiveKind::ColorSprite => 5,
         PrimitiveKind::Shaded => 6,
+        PrimitiveKind::Marks => 7,
         _ => return None,
     })
 }
@@ -426,6 +523,10 @@ impl Scene {
         );
         recycled.clear();
         self.capture_order.clear();
+        // A capture that was taken and never bound leaves its primitives transient, which is only
+        // true while its stamps are gone: the next binding would otherwise name them after a
+        // different chunk, and the renderer would draw them from that chunk's bytes.
+        self.capture_stamped.clear();
         self.capture = Some(recycled);
     }
 
@@ -480,22 +581,19 @@ impl Scene {
 
     /// Notes a chunk a renderer with persistent storage should hold, until the notes are cleared.
     pub fn note_chunk_inserted(&mut self, revision: u64, prims: std::sync::Arc<ChunkPrims>) {
-        self.chunk_inserted.push(ChunkUpload { revision, prims });
+        self.chunk_notes
+            .push(ChunkNote::Inserted { revision, prims });
     }
 
     /// Notes a chunk that ceased to exist, until the notes are cleared.
     pub fn note_chunk_retired(&mut self, revision: u64) {
-        self.chunk_retired.push(revision);
+        self.chunk_notes.push(ChunkNote::Retired { revision });
     }
 
-    /// The chunks noted since the notes were last cleared, in note order.
-    pub fn chunk_inserted(&self) -> &[ChunkUpload] {
-        &self.chunk_inserted
-    }
-
-    /// The revisions dropped since the notes were last cleared, in note order.
-    pub fn chunk_retired(&self) -> &[u64] {
-        &self.chunk_retired
+    /// The chunk insertions and retirements noted since the notes were last cleared, in note
+    /// order.
+    pub fn chunk_notes(&self) -> &[ChunkNote] {
+        &self.chunk_notes
     }
 
     /// How far each chunk replayed away from where it was encoded this frame, by revision.
@@ -503,23 +601,21 @@ impl Scene {
         &self.chunk_offsets
     }
 
-    /// Empties both chunk-note lists.
+    /// Empties the chunk-note log.
     ///
     /// The runtime calls this once a draw has consumed them — after the outcome retired the
     /// frame's damage, so a skipped frame's notes stand for the next drawn one, and an eviction
     /// after the draw lands in the notes the following draw consumes.
     pub fn clear_chunk_notes(&mut self) {
-        self.chunk_inserted.clear();
-        self.chunk_retired.clear();
+        self.chunk_notes.clear();
     }
 
     /// Copies the operations in `range` of this frame's log into `chunk`, re-based so every
     /// entry indexes the chunk's own arrays.
     ///
     /// This runs before [`Scene::finish`]: the log indices are as pushed, and the sort rewrites
-    /// them. Vector items and group markers are left out, because a replay skips them — a chunk
-    /// holds exactly what a replay re-emits, so what a replay cannot reproduce is counted by
-    /// [`Scene::unreplayable`] at the pushes instead.
+    /// them. Group markers are left out, because a replay skips them: a chunk holds exactly what a
+    /// replay re-emits.
     pub fn extract_chunk(&self, range: Range<u32>, chunk: &mut ChunkPrims) {
         debug_assert!(
             !self.finished,
@@ -557,13 +653,25 @@ impl Scene {
                     index,
                     &mut chunk.color_sprites,
                 ),
+                PrimitiveKind::Marks => {
+                    let at = copied(&self.primitives.marks, index, &mut chunk.marks);
+                    if at.is_some() {
+                        chunk
+                            .mark_payloads
+                            .push(std::sync::Arc::clone(&self.primitives.mark_payloads[index]));
+                    }
+                    at
+                }
                 PrimitiveKind::External => {
                     copied(&self.primitives.externals, index, &mut chunk.externals)
                 }
                 PrimitiveKind::Backdrop => {
                     copied(&self.primitives.backdrops, index, &mut chunk.backdrops)
                 }
-                PrimitiveKind::Vector | PrimitiveKind::GroupStart | PrimitiveKind::GroupEnd => None,
+                PrimitiveKind::Vector => {
+                    copied(&self.primitives.vectors, index, &mut chunk.vectors)
+                }
+                PrimitiveKind::GroupStart | PrimitiveKind::GroupEnd => None,
             };
             let Some(at) = at else {
                 continue;
@@ -587,10 +695,8 @@ impl Scene {
     ///
     /// Draw order is re-derived through the ordinary push path, the paints travel in the
     /// instances and are re-anchored rather than re-interned, and a vector item is re-pushed into
-    /// this frame's pass planning exactly as a fresh emission pushes it. One restriction: a
-    /// vector item replays only where `by` is zero, because its curves are placed in device
-    /// coordinates and shared with the rasteriser's encoding cache — translating them would mean
-    /// copying the path. The caller encodes a moved drawing instead.
+    /// this frame's pass planning exactly as a fresh emission pushes it. A moved vector item keeps
+    /// its path and moves its placement, so the rasteriser's encoding of the path stays valid.
     /// `source` is the chunk's revision, stamped as the provenance of every primitive a replay
     /// pushes — a renderer holding the chunk resident points those draws at its copy. A replay
     /// away from the encode position records its offset beside the stamp, and the renderer adds
@@ -641,17 +747,23 @@ impl Scene {
         // frame, and the largest thing inside that walk was re-inserting every primitive of every
         // replayed row to rediscover an order none of them had changed.
         let base = chunk.carries_orders().then(|| {
-            let ink = chunk
-                .ink
+            let placed = chunk
+                .ink_by_space
+                .iter()
+                .map(|&(slot, ink)| {
+                    let moved = Rect::new(
+                        zgui_geom::Point::new(
+                            DevicePx(ink.origin.x.0 + by.width.0),
+                            DevicePx(ink.origin.y.0 + by.height.0),
+                        ),
+                        ink.size,
+                    );
+                    self.on_device(slot, moved)
+                })
+                .reduce(Rect::union)
                 .expect("a chunk that carries orders carries its ink");
-            let moved = Rect::new(
-                zgui_geom::Point::new(
-                    DevicePx(ink.origin.x.0 + by.width.0),
-                    DevicePx(ink.origin.y.0 + by.height.0),
-                ),
-                ink.size,
-            );
-            self.order.insert_block(moved, chunk.span.saturating_sub(1))
+            self.order
+                .insert_block(placed, chunk.span.saturating_sub(1))
         });
         for (position, op) in chunk.ops.iter().enumerate() {
             let index = op.index as usize;
@@ -692,6 +804,7 @@ impl Scene {
                         continue;
                     };
                     translate(&mut shadow.bounds, by);
+                    translate(&mut shadow.shape_bounds, by);
                     translate(&mut shadow.element_bounds, by);
                     if self.push_shadow(shadow).is_some() && source != 0 {
                         self.stamp_replayed(PrimitiveKind::Shadow, source, op.index);
@@ -736,6 +849,26 @@ impl Scene {
                         self.stamp_replayed(PrimitiveKind::ColorSprite, source, op.index);
                     }
                 }
+                PrimitiveKind::Marks => {
+                    let (Some(mut mark), Some(payload)) = (
+                        chunk.marks.get(index).copied(),
+                        chunk.mark_payloads.get(index),
+                    ) else {
+                        continue;
+                    };
+                    // The payload stays where it was encoded: the item's origin carries the move.
+                    mark.reanchor(by);
+                    if mark.samples_its_paint() && (by.width.0 != 0.0 || by.height.0 != 0.0) {
+                        counter::bump(Counter::PaintsReanchored);
+                    }
+                    if self
+                        .push_marks(mark, std::sync::Arc::clone(payload))
+                        .is_some()
+                        && source != 0
+                    {
+                        self.stamp_replayed(PrimitiveKind::Marks, source, op.index);
+                    }
+                }
                 PrimitiveKind::External => {
                     let Some(mut external) = chunk.externals.get(index).copied() else {
                         continue;
@@ -752,18 +885,14 @@ impl Scene {
                     self.push_backdrop(backdrop);
                 }
                 PrimitiveKind::Vector => {
-                    let Some(item) = chunk.vectors.get(index) else {
+                    let Some(mut item) = chunk.vectors.get(index).cloned() else {
                         continue;
                     };
-                    debug_assert!(
-                        by.width.0 == 0.0 && by.height.0 == 0.0,
-                        "a moved drawing is encoded, never translated: the caller's reuse \
-                         decision guarantees a vector item only replays in place"
-                    );
-                    if by.width.0 != 0.0 || by.height.0 != 0.0 {
-                        continue;
+                    if !in_place {
+                        item.translate(by);
+                        counter::bump(Counter::VectorReplaysMoved);
                     }
-                    self.push_vector(item.clone());
+                    self.push_vector(item);
                 }
                 PrimitiveKind::GroupStart | PrimitiveKind::GroupEnd => {}
             }

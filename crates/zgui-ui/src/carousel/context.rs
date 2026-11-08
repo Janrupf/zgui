@@ -2,7 +2,7 @@
 
 use zgui::geom::{Device, DevicePx, Rect};
 use zgui::prelude::*;
-use zgui::reactive::{LocalStorage, RwSignal};
+use zgui::reactive::{LocalStorage, Memo, RwSignal};
 use zgui_ui_primitives::{Controllable, Orientation};
 
 /// One slide, as the carousel knows it.
@@ -25,6 +25,13 @@ impl CarouselSlot {
         self.id
     }
 
+    /// Where this slide's box is in the window, along `orientation`, as its leading and trailing
+    /// edges. `None` until the slide has been laid out.
+    fn span(self, orientation: Orientation) -> Option<(f32, f32)> {
+        let box_ = self.geometry.get()?;
+        Some(along(box_, orientation))
+    }
+
     /// Where this slide's leading edge is in the window, along `orientation`.
     ///
     /// In the window rather than in the track, because that is the space geometry is observed in
@@ -43,6 +50,49 @@ impl CarouselSlot {
     }
 }
 
+/// The leading and trailing edges of `box_` along `orientation`.
+fn along(box_: Rect<DevicePx, Device>, orientation: Orientation) -> (f32, f32) {
+    match orientation {
+        Orientation::Vertical => (box_.origin.y.0, box_.origin.y.0 + box_.size.height.0),
+        _ => (box_.origin.x.0, box_.origin.x.0 + box_.size.width.0),
+    }
+}
+
+/// How far a track can travel, and the last slide a step can show.
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub struct Reach {
+    /// How far the track can travel before the last slide leaves the trailing edge, in device
+    /// pixels.
+    pub travel: f32,
+    /// The last slide a step can show, counted from zero.
+    pub last: usize,
+}
+
+/// How far a track `track` long can travel along slides that start `starts` from its own leading
+/// edge and end `end` from it, and the last slide a step can show.
+///
+/// The last slide a step shows is the first one whose start is at or past the full travel, so
+/// the last slide sits against the trailing edge and the viewport never shows empty space after
+/// it. When every slide fits, the first slide is the last one a step shows.
+///
+/// ```
+/// use zgui_ui::carousel::reach;
+///
+/// // Five slides of a third of a 300px track each.
+/// let starts = [0.0, 100.0, 200.0, 300.0, 400.0];
+/// let reach = reach(&starts, 500.0, 300.0);
+/// assert_eq!((reach.travel, reach.last), (200.0, 2));
+/// ```
+#[must_use]
+pub fn reach(starts: &[f32], end: f32, track: f32) -> Reach {
+    let travel = (end - track).max(0.0);
+    let last = starts
+        .iter()
+        .position(|start| *start >= travel - 0.5)
+        .unwrap_or_else(|| starts.len().saturating_sub(1));
+    Reach { travel, last }
+}
+
 /// What the slides and the arrows read to know where the carousel is.
 ///
 /// `Copy`, so a handler stores one without cloning, and reachable from any depth with
@@ -59,18 +109,45 @@ pub struct CarouselContext {
     orientation: Orientation,
     /// Whether stepping past the last slide goes back to the first.
     wrap: bool,
+    /// The track the slides sit on.
+    track: NodeRef,
+    /// The track's box in the window, as of the last completed layout.
+    track_box: Signal<Option<Rect<DevicePx, Device>>, LocalStorage>,
+    /// How far the track can travel and the last slide a step shows. `None` before layout.
+    reach: Memo<Option<Reach>>,
 }
 
 impl CarouselContext {
     /// Wires a carousel up from what it was told about its own index.
     #[must_use]
     pub fn new(index: Controllable<usize>, orientation: Orientation, wrap: bool) -> Self {
+        let slots: RwSignal<Vec<CarouselSlot>, LocalStorage> = RwSignal::new_local(Vec::new());
+        let track = NodeRef::new();
+        let measured = track.observe_border_box();
+        // Recomputed whenever a slide or the track moves, which is every frame of a step. The
+        // answer only changes when the sizes do, so nothing downstream reruns with it.
+        let reach = Memo::new(move |_| {
+            let (from, to) = along(measured.get()?, orientation);
+            slots.with(|slots| {
+                let mut starts = Vec::with_capacity(slots.len());
+                let mut end = 0.0_f32;
+                for slot in slots {
+                    let (start, stop) = slot.span(orientation)?;
+                    starts.push(start - from);
+                    end = end.max(stop - from);
+                }
+                Some(reach(&starts, end, to - from))
+            })
+        });
         Self {
             index,
-            slots: RwSignal::new_local(Vec::new()),
+            slots,
             next: RwSignal::new_local(1),
             orientation,
             wrap,
+            track,
+            track_box: measured,
+            reach,
         }
     }
 
@@ -104,41 +181,73 @@ impl CarouselContext {
         self.orientation
     }
 
+    /// The track the slides sit on, which the carousel measures.
+    #[must_use]
+    pub fn track(self) -> NodeRef {
+        self.track
+    }
+
+    /// The track's box in the window, as of the last completed layout.
+    #[must_use]
+    pub fn track_box(self) -> Signal<Option<Rect<DevicePx, Device>>, LocalStorage> {
+        self.track_box
+    }
+
+    /// How far the track can travel and the last slide a step shows, once laid out.
+    #[must_use]
+    pub fn reach(self) -> Option<Reach> {
+        self.reach.get()
+    }
+
+    /// The last slide a step can show: the one that puts the last slide against the trailing edge.
+    /// Before layout, the last slide.
+    #[must_use]
+    pub fn last_index(self) -> usize {
+        self.reach
+            .get()
+            .map_or_else(|| self.count().saturating_sub(1), |reach| reach.last)
+    }
+
     /// Whether there is a slide before this one to go to.
     #[must_use]
     pub fn has_previous(self) -> bool {
-        self.wrap || self.index() > 0
+        self.wrap || self.index().min(self.last_index()) > 0
     }
 
     /// Whether there is a slide after this one to go to.
     #[must_use]
     pub fn has_next(self) -> bool {
-        let count = self.count();
-        self.wrap || (count > 0 && self.index() + 1 < count)
+        self.wrap || (self.count() > 0 && self.index() < self.last_index())
     }
 
     /// Shows the slide before this one, wrapping when the carousel was told to.
     pub fn previous(self) {
-        let count = self.count();
-        if count == 0 {
+        if self.count() == 0 {
             return;
         }
-        let at = self.index.get_untracked();
+        let last = self.reach.get_untracked().map_or_else(
+            || self.slots.with_untracked(Vec::len).saturating_sub(1),
+            |reach| reach.last,
+        );
+        let at = self.index.get_untracked().min(last);
         if at > 0 {
             self.index.set(at - 1);
         } else if self.wrap {
-            self.index.set(count - 1);
+            self.index.set(last);
         }
     }
 
     /// Shows the slide after this one, wrapping when the carousel was told to.
     pub fn next(self) {
-        let count = self.count();
-        if count == 0 {
+        if self.count() == 0 {
             return;
         }
-        let at = self.index.get_untracked();
-        if at + 1 < count {
+        let last = self.reach.get_untracked().map_or_else(
+            || self.slots.with_untracked(Vec::len).saturating_sub(1),
+            |reach| reach.last,
+        );
+        let at = self.index.get_untracked().min(last);
+        if at < last {
             self.index.set(at + 1);
         } else if self.wrap {
             self.index.set(0);
@@ -189,5 +298,54 @@ impl CarouselContext {
         let at = self.index();
         let slot = self.slots.with(|slots| slots.get(at).copied())?;
         slot.start(self.orientation)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reach;
+
+    #[test]
+    fn a_track_of_thirds_stops_where_the_last_slide_meets_the_trailing_edge() {
+        let starts = [0.0, 112.0, 224.0, 336.0, 448.0];
+        let found = reach(&starts, 560.0, 336.0);
+        assert_eq!(found.travel, 224.0);
+        assert_eq!(found.last, 2);
+    }
+
+    #[test]
+    fn slides_that_all_fit_leave_nowhere_to_go() {
+        let found = reach(&[0.0, 112.0, 224.0], 336.0, 336.0);
+        assert_eq!((found.travel, found.last), (0.0, 0));
+    }
+
+    #[test]
+    fn slides_as_wide_as_the_track_are_each_a_step() {
+        let found = reach(&[0.0, 336.0, 672.0], 1008.0, 336.0);
+        assert_eq!((found.travel, found.last), (672.0, 2));
+    }
+
+    #[test]
+    fn slides_wider_than_the_track_keep_the_last_one_reachable() {
+        let found = reach(&[0.0, 400.0, 640.0], 1040.0, 336.0);
+        assert_eq!(
+            found.last, 2,
+            "the last slide starts short of the full travel"
+        );
+    }
+
+    #[test]
+    fn a_rounding_error_does_not_cost_a_step() {
+        let found = reach(&[0.0, 112.0, 223.7, 336.0], 448.0, 224.0);
+        assert_eq!(
+            found.last, 2,
+            "a start within half a pixel of the travel is the last"
+        );
+    }
+
+    #[test]
+    fn no_slides_is_no_travel() {
+        let found = reach(&[], 0.0, 300.0);
+        assert_eq!((found.travel, found.last), (0.0, 0));
     }
 }

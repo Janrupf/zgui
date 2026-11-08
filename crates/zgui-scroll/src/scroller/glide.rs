@@ -43,17 +43,17 @@ impl Scroller {
         stretch: Stretch,
     ) -> SmallVec<[NodeKey; 2]> {
         let mut moved: SmallVec<[NodeKey; 2]> = SmallVec::new();
-        let mut left = delta;
-        if chain::negligible(left) {
+        if chain::negligible(delta) {
             return moved;
         }
-        for (depth, container) in chain.iter().copied().enumerate() {
+        let mut left = self.unwind(store, chain, delta, &mut moved);
+        for container in chain.iter().copied() {
             let at = self.offset_of(container);
             // Where this container is *going*, not where it is. A detent that arrives mid-flight
             // adds to the previous one's destination; one that arrives with nothing running adds to
             // the offset itself, which is the same thing with nothing in flight.
             let heading = self.heading_of(container).unwrap_or(at);
-            let share = chain::absorb(heading, self.limit_for(store, container), left);
+            let share = chain::absorb(heading, self.hand_limit_for(store, container), left);
             left = share.left;
             if !chain::negligible(share.taken) {
                 let to = Point::new(
@@ -62,17 +62,12 @@ impl Scroller {
                 );
                 self.aim(container, at, to);
             }
-            let outermost = depth + 1 == chain.len();
-            if outermost && stretch.is_permitted() && !chain::negligible(left) {
-                let edge = self.overscroll_of(container).pulled_by(left);
-                if edge != self.overscroll_of(container) {
-                    self.displace(container, edge);
-                    moved.push(container);
-                }
-            }
             if chain::negligible(left) {
                 break;
             }
+        }
+        if stretch.is_permitted() && !chain::negligible(left) {
+            moved.extend(self.stretch_past_end(store, chain, left));
         }
         moved
     }

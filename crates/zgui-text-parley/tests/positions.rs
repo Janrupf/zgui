@@ -148,3 +148,43 @@ fn the_phase_in_a_key_comes_from_the_glyph_position() {
          being taken from something other than the position: {phases:?}"
     );
 }
+
+/// A run reports where its text starts in the caller's string, with the direction mark left out.
+///
+/// Two zero-width inline boxes stand for a span's edges around `beta`, and a run starts at each.
+#[test]
+fn a_run_reports_where_its_text_starts() {
+    let (_, mut shaper) = support::shaper(Controls::Mark);
+    let fixture = support::Fixture::new("alpha beta gamma", Direction::LeftToRight);
+    let edge = |id: u64, offset: usize| zgui_text::InlineBoxGeometry {
+        id,
+        offset,
+        width: zgui_geom::CssPx(0.0),
+        height: zgui_geom::CssPx(0.0),
+        ascent: zgui_geom::CssPx(0.0),
+        shift: zgui_geom::CssPx(0.0),
+    };
+    let boxes = [edge(0, 6), edge(1, 10)];
+    let content = zgui_text::ParagraphContent {
+        boxes: &boxes,
+        ..fixture.content()
+    };
+    let shaped = shaper.shape(&content);
+    let mut starts = Vec::new();
+    shaper.visit_line(&shaped, 0, &mut |run: ShapedRun<'_>| {
+        starts.push(run.text_start);
+    });
+    // The engine may split runs further, at word boundaries.
+    assert!(
+        starts.windows(2).all(|pair| pair[0] <= pair[1]),
+        "runs come in text order: {starts:?}"
+    );
+    assert!(
+        starts.contains(&6) && starts.contains(&10),
+        "a run starts at each edge: {starts:?}"
+    );
+    assert!(
+        !starts.contains(&3),
+        "the three bytes of the direction mark are not counted: {starts:?}"
+    );
+}

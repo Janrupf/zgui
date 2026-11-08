@@ -6,7 +6,7 @@ style! { pub NavigationMenuStyle =>
     ":scope {
         position: relative;
         display: flex;
-        flex: 1 1 auto;
+        flex: 0 1 auto;
         max-width: max-content;
         align-items: center;
         justify-content: center;

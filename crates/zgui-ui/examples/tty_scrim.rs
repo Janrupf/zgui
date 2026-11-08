@@ -7,7 +7,7 @@
 //! the arrangement a person reports as "the modal makes it crawl".
 //!
 //! ```text
-//! cargo build -p zgui-ui --release --example tty_scrim --features zgui/drm
+//! cargo build -p zgui-ui --release --example tty_scrim --features drm
 //! ZGUI_LATENCY=/tmp/scrim.jsonl ./tty_scrim
 //! ```
 //!
@@ -16,8 +16,11 @@
 //! left in graphics mode with its keyboard turned off.
 
 use zgui::prelude::*;
+// `run_drm` is a trait method here: the console is a crate of its own rather than a feature of
+// the framework, so a program that wants the kernel's display names it.
 use zgui::reactive::{RenderEffect, RwSignal};
 use zgui::{component, view};
+use zgui_console::RunDrm;
 use zgui_ui::prelude::*;
 use zgui_ui_tokens::prelude::*;
 

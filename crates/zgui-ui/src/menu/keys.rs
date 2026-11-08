@@ -72,7 +72,7 @@ pub fn MenuTypeahead(
                 return;
             };
             group.set_active(found.id());
-            found.focus();
+            found.focus_and_reveal();
             ev.prevent_default();
             ev.stop_propagation();
         },

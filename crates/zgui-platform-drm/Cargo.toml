@@ -3,6 +3,11 @@ name = "zgui-platform-drm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "zgui platform backend for a bare Linux console (DRM/KMS)"
+repository.workspace = true
+homepage.workspace = true
+# Experimental: part of the console stack, kept in this repository and not published.
+publish = false
 
 # L2 — backends. Every dependency is inherited: `foo.workspace = true`.
 #
@@ -13,6 +18,20 @@ license.workspace = true
 # Everything is gated on Linux. The kernel interface exists nowhere else, so a macOS build of the
 # workspace compiles this crate as an empty one rather than failing on a header it cannot have.
 [target.'cfg(target_os = "linux")'.dependencies]
+# The allocator a buffer a display scans out of is made with, and the EGL and GL a second device
+# draws into it through. Only this crate names them, and only on the path that has no Vulkan.
+zgui-gbm = { path = "../zgui-gbm", version = "0.1.0" }
+# The copy between two scanout buffers, made on the display's own device so that each buffer has
+# exactly one writer and the two devices never contend for one.
+zgui-scanout = { path = "../zgui-scanout", version = "0.1.0" }
+# The damage set a scanout buffer's debt is kept as. The same shape the renderer keeps its own
+# damage in, because it is the same question asked about a different buffer.
+zgui-bits = { path = "../zgui-bits", version = "0.1.0" }
+# The latency trace. A console has no standard error a person can read — it is the screen the frame
+# loop overwrites — so the loop writes its stage marks to the file `ZGUI_LATENCY` names.
+zgui-profile = { path = "../zgui-profile", version = "0.1.0" }
+khronos-egl.workspace = true
+glow.workspace = true
 # `TreeUpdate`, which the platform contract's `push_a11y_update` takes. This backend implements
 # that method as a no-op: no assistive technology is connected to a console, so the closure is
 # never run and no tree is built. The name is here for the signature.
@@ -36,21 +55,6 @@ raw-window-handle.workspace = true
 # asserted against. This crate issues no ioctl of its own outside those tests.
 rustix.workspace = true
 tracing.workspace = true
-# `libgbm`, for the buffers a display scans out of and a graphics device draws into. Loaded at run
-# time like every other library here, so a console session still starts where it is absent — such a
-# machine copies each frame instead.
-zgui-gbm = { path = "../zgui-gbm", version = "0.1.0" }
-# Copying between the buffers a display scans out of, on the display's own device, so that a
-# rotated buffer's debt does not cross the link to the renderer a second time.
-zgui-scanout = { path = "../zgui-scanout", version = "0.1.0" }
-# The damage set a scanout buffer's debt is kept as. The same shape the renderer keeps its own
-# damage in, because it is the same question asked about a different buffer.
-zgui-bits = { path = "../zgui-bits", version = "0.1.0" }
-# The EGL display and GL context wgpu's GL backend already holds, reached through its hal so that
-# a buffer can be imported as the texture a frame is composed into. The counterpart to `ash` above,
-# for the machines that have no Vulkan — which are exactly the machines this path is for.
-khronos-egl.workspace = true
-glow.workspace = true
 zgui-drm = { path = "../zgui-drm", version = "0.1.0" }
 # The kernel's input interface: which devices exist, what each one can report, the grab that keeps
 # a keystroke away from the shell behind the console, and the keymap the console driver holds. It
@@ -58,9 +62,6 @@ zgui-drm = { path = "../zgui-drm", version = "0.1.0" }
 zgui-evdev = { path = "../zgui-evdev", version = "0.1.0" }
 zgui-geom = { path = "../zgui-geom", version = "0.1.0" }
 zgui-platform = { path = "../zgui-platform", version = "0.1.0" }
-# The latency trace. A console has no standard error a person can read — it is the screen the frame
-# loop overwrites — so the loop writes its stage marks to the file `ZGUI_LATENCY` names.
-zgui-profile = { path = "../zgui-profile", version = "0.1.0" }
 # Input policy, asked through libinput: how far a pointer travels for one movement, whether a tap
 # is a click, whether a palm on the pad is anything. It reads the devices the seat hands over and
 # opens none itself. It is one step along the same layer, and this crate is the only one that names
@@ -104,8 +105,8 @@ zgui-scene = { path = "../zgui-scene", version = "0.1.0" }
 # thread reads the environment is a data race. `session_direct` also holds this process's
 # descriptor limit at zero for the length of the open, which would fail whatever else was opening a
 # file at the time. A test harness runs its tests on several threads, so neither belongs under one.
-# One process, because it draws through a graphics device and reads the memory behind a buffer back:
-# two tests doing that at once on one device would each see the other's frame.
+# The GL scanout test drives a real display and reports what it measured, so it prints rather than
+# asserting its way through a harness that would hide the numbers.
 [[test]]
 name = "drawn_gl"
 path = "tests/drawn_gl.rs"

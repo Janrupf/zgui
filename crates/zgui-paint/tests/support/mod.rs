@@ -27,6 +27,24 @@ use zgui_text::{BreakRequest, BrokenParagraph, ParagraphContent, ParagraphKey, S
 use zgui_text_style::TextPaint;
 use zgui_text_style::TextStyle;
 
+/// The poison test mode's offset. See [`zgui_scene::spatial::poison`].
+///
+/// Primitives are recorded in their own space, and the poison mode lays the document out at
+/// `(P, P)`. A test that reads primitive coordinates subtracts this to read them as at the origin.
+pub(crate) fn poison() -> f32 {
+    zgui_scene::spatial::poison::origin()
+}
+
+/// `bounds` with the poison offset taken off its origin.
+pub(crate) fn unpoisoned(bounds: [f32; 4]) -> [f32; 4] {
+    [
+        bounds[0] - poison(),
+        bounds[1] - poison(),
+        bounds[2],
+        bounds[3],
+    ]
+}
+
 /// One element of a fixture tree.
 pub(crate) struct Element {
     /// The element's name, which selectors match on.
@@ -37,8 +55,10 @@ pub(crate) struct Element {
     pub(crate) replaced: bool,
     /// The outlines it draws, as path notation, and the space they are written in.
     pub(crate) drawing: Option<(&'static str, Option<&'static str>)>,
-    /// The retained canvas it shows, as the packed token-and-revision reference.
-    pub(crate) canvas: Option<i64>,
+    /// The retained canvas it shows, as the packed token-and-revision reference and the view.
+    pub(crate) canvas: Option<(i64, u64)>,
+    /// The vector document it draws.
+    pub(crate) document: Option<&'static str>,
     /// Its children.
     pub(crate) children: Vec<Element>,
 }
@@ -52,6 +72,7 @@ impl Element {
             replaced: false,
             drawing: None,
             canvas: None,
+            document: None,
             children: Vec::new(),
         }
     }
@@ -76,10 +97,16 @@ impl Element {
 
     /// The same element, showing a retained canvas scene.
     pub(crate) fn canvas(mut self, handle: &zgui_canvas::SceneHandle) -> Self {
-        self.canvas = Some(zgui_vocab::prop::drawing::canvas_value(
-            handle.token().0,
-            handle.revision(),
+        self.canvas = Some((
+            zgui_vocab::prop::drawing::canvas_value(handle.token().0, handle.revision()),
+            handle.view(),
         ));
+        self
+    }
+
+    /// The same element, drawing a vector document.
+    pub(crate) fn document(mut self, source: &'static str) -> Self {
+        self.document = Some(source);
         self
     }
 
@@ -187,6 +214,7 @@ impl Harness {
         let mut tables = zgui_layout::fragment::build::Tables {
             clips: &mut self.scene.clips,
             spatial: &mut self.scene.spatial,
+            drawn: &zgui_scene::Placements::EMPTY,
             device: DeviceStyle::default(),
             scroll: &self.scroll,
             placements: &[],
@@ -219,6 +247,7 @@ impl Harness {
         let mut tables = zgui_layout::fragment::build::Tables {
             clips: &mut self.scene.clips,
             spatial: &mut self.scene.spatial,
+            drawn: &zgui_scene::Placements::EMPTY,
             device: DeviceStyle::default(),
             scroll: &self.scroll,
             placements: &[],
@@ -237,7 +266,8 @@ impl Harness {
 
     /// Rebuilds the box tree and recomposes, which is what a structural change costs.
     pub(crate) fn rebuild(&mut self, width: f32, height: f32) {
-        self.store = LayoutStore::new(self.document.store().document());
+        // In the same store, as a frame does: the pieces the old tree had are retired, and the
+        // rectangles they covered reach the damage through the fragment pass.
         zgui_layout::boxtree::build(&mut self.store, &self.document);
         self.compose(width, height);
     }
@@ -258,11 +288,13 @@ impl Harness {
 
     /// Grows the damage over the read-extent registry, exactly as a frame does before emitting.
     pub(crate) fn expand(&mut self) -> zgui_paint::Expansion {
+        let placements = zgui_scene::Placements::of(&self.scene.spatial);
         let expansion = zgui_paint::expand(
             &self.store,
             &mut self.damage,
             self.viewport,
             self.scale,
+            &placements,
             &mut self.backdrops,
         );
         self.keeping = expansion.keeping;
@@ -275,8 +307,10 @@ impl Harness {
         // Recorded in every profile. The tests below compare what was emitted against what the
         // damage reaches, so a recording that only happened in one profile would leave the other
         // asserting nothing at all.
+        let placements = zgui_scene::Placements::of(&self.scene.spatial);
         let mut input = PaintInput::new(&self.store, &self.damage);
         input.record_emitted = true;
+        input.placements = Some(&placements);
         input.keeping = self.keeping;
         let report = self.painter.emit(&input, &mut self.scene);
         // The other half of what a frame does with a kept backdrop copy, and a harness that
@@ -344,8 +378,21 @@ impl Harness {
         content: &mut zgui_paint::ContentCache,
         raster: &dyn zgui_text::GlyphRaster,
     ) -> zgui_paint::PaintReport {
+        self.paint_cached_vectors_ready(vectors, content, raster, false)
+    }
+
+    /// The same, as a frame whose general vector rasteriser is built when `ready` is true, and
+    /// with the content cache's frame ended.
+    pub(crate) fn paint_cached_vectors_ready(
+        &mut self,
+        vectors: &zgui_paint::VectorCache,
+        content: &mut zgui_paint::ContentCache,
+        raster: &dyn zgui_text::GlyphRaster,
+        ready: bool,
+    ) -> zgui_paint::PaintReport {
         self.damage = DamageSet::full();
         self.scene.begin_frame(self.viewport);
+        content.set_vector_raster_ready(ready);
         content.begin_frame();
         let report = {
             let drawings = vectors.frame(&self.document);
@@ -361,7 +408,21 @@ impl Harness {
             self.painter.emit(&input, &mut self.scene)
         };
         self.scene.finish(&self.damage);
+        content.end_frame();
         report
+    }
+
+    /// Writes the view of `handle` onto the element `name`, as the canvas binding would.
+    pub(crate) fn write_canvas_view(&mut self, name: &str, handle: &zgui_canvas::SceneHandle) {
+        let index = self.element(name);
+        let view = handle.view() as i64;
+        self.edit_and_restyle(|edit| {
+            edit.set_property(
+                index,
+                zgui_vocab::PropKey::new(zgui_vocab::prop::drawing::CANVAS_VIEW),
+                Some(zgui_vocab::PropValue::Integer(view)),
+            );
+        });
     }
 
     /// The document, for a test that changes a property a view would have written.
@@ -442,6 +503,26 @@ impl Harness {
             .fragments_of_box(self.box_of(name))
             .first()
             .expect("every box produces its own piece")
+    }
+
+    /// Every element with the given name, as document indices, in document order.
+    pub(crate) fn elements(&self, name: &str) -> Vec<NodeIndex> {
+        let mut out = Vec::new();
+        let mut stack = vec![self.root];
+        while let Some(index) = stack.pop() {
+            let core = self.document.store().core(index);
+            if core.local_name().as_str() == name {
+                out.push(index);
+            }
+            let mut children = Vec::new();
+            let mut child = core.first_child();
+            while let Some(index) = child {
+                children.push(index);
+                child = self.document.store().core(index).next_sibling();
+            }
+            stack.extend(children.into_iter().rev());
+        }
+        out
     }
 
     /// The element with the given name, as a document index.
@@ -563,13 +644,29 @@ fn append(document: &mut Document, parent: NodeIndex, element: &Element) -> Node
             })
             .expect("the fixture document is not poisoned");
     }
-    if let Some(reference) = element.canvas {
+    if let Some(source) = element.document {
+        document
+            .edit(&zgui_dom::EverythingMatters, |edit| {
+                edit.set_property(
+                    index,
+                    zgui_vocab::PropKey::new(zgui_vocab::prop::drawing::DOCUMENT),
+                    Some(zgui_vocab::PropValue::from(source)),
+                );
+            })
+            .expect("the fixture document is not poisoned");
+    }
+    if let Some((reference, view)) = element.canvas {
         document
             .edit(&zgui_dom::EverythingMatters, |edit| {
                 edit.set_property(
                     index,
                     zgui_vocab::PropKey::new(zgui_vocab::prop::drawing::CANVAS),
                     Some(zgui_vocab::PropValue::Integer(reference)),
+                );
+                edit.set_property(
+                    index,
+                    zgui_vocab::PropKey::new(zgui_vocab::prop::drawing::CANVAS_VIEW),
+                    Some(zgui_vocab::PropValue::Integer(view as i64)),
                 );
             })
             .expect("the fixture document is not poisoned");

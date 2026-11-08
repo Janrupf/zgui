@@ -30,10 +30,11 @@ pub fn DrawerContent(
     ///
     /// The bottom unless said otherwise, which is what a drawer usually is. The two edges that run
     /// the width of the window keep their inward corners rounded and centre their heading; the two
-    /// down the sides are a [`Sheet`](crate::Sheet)'s shape with a drawer's handle.
+    /// down the sides have the shape of a [`Sheet`](crate::Sheet).
     #[prop(default = SheetSide::Bottom)]
     direction: SheetSide,
-    /// Whether it draws the grab handle at its top.
+    /// Whether it draws the grab handle at its top. Only a drawer from the bottom draws it, because
+    /// only that drawer can be pulled.
     #[prop(default = true)]
     handle: bool,
     /// Whether a press on the dimmed window behind it closes it.
@@ -76,7 +77,7 @@ pub fn DrawerContent(
             {..attrs},
             class = class
         ) {
-            if move || handle {
+            if move || handle && direction == SheetSide::Bottom {
                 DrawerHandle()
             } else {}
             {children.view()}

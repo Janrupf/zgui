@@ -175,20 +175,26 @@ impl Matrix4 {
             && m[3][3] == 1.0
     }
 
-    /// The shift this matrix is, or nothing when it does anything besides shift.
+    /// How far the matrix moves a point of the z = 0 plane, when that is all it does to one.
     ///
-    /// The commonest transform a document holds, and the cheapest to act on: a box sliding across
-    /// the screen carries one of these and nothing else, sixty times a second. Worth asking before
-    /// multiplying, because the answer costs a handful of comparisons and the multiplication it
-    /// saves is sixteen products a point.
-    pub fn as_translation(&self) -> Option<(f32, f32)> {
-        let m = &self.columns;
-        (m[0] == [1.0, 0.0, 0.0, 0.0]
-            && m[1] == [0.0, 1.0, 0.0, 0.0]
-            && m[2] == [0.0, 0.0, 1.0, 0.0]
-            && m[3][2] == 0.0
-            && m[3][3] == 1.0)
-            .then(|| (m[3][0], m[3][1]))
+    /// The third column is left out: it multiplies the depth of a point in the plane, which is zero.
+    ///
+    /// ```
+    /// use zgui_geom::Matrix4;
+    ///
+    /// assert_eq!(Matrix4::translation(3.0, -2.5, 0.0).plane_translation(), Some((3.0, -2.5)));
+    /// assert_eq!(Matrix4::scale(2.0, 1.0, 1.0).plane_translation(), None);
+    /// ```
+    pub fn plane_translation(&self) -> Option<(f32, f32)> {
+        let [x, y, _, w] = self.columns;
+        let moves_only = x[0] == 1.0
+            && x[1] == 0.0
+            && x[3] == 0.0
+            && y[0] == 0.0
+            && y[1] == 1.0
+            && y[3] == 0.0
+            && w[3] == 1.0;
+        moves_only.then_some((w[0], w[1]))
     }
 
     /// The two-dimensional transform this embeds, or nothing when it moves out of the z = 0 plane.

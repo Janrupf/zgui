@@ -1,6 +1,7 @@
 //! Opening a device, and refusing to guess when none of them works.
 
 use std::ffi::CStr;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use zgui_geom::{Device, Size};
@@ -20,10 +21,10 @@ use crate::target::swapchain::{Offscreen, Presentation};
 /// created from the same instance the device came from, and whether an adapter is *usable* is only
 /// known once a device has been created from it and a surface configured for it — adapters on
 /// hybrid graphics report capabilities a device made from them turns out not to have. So: take the
-/// instance, let whatever owns a window make a surface from it, then run the candidate loop.
+/// window's handles, make a surface on each candidate's instance, then configure it.
 pub struct Builder {
-    /// The instance surfaces are created from.
-    instance: wgpu::Instance,
+    /// One instance per backend tier, each created when the candidate loop reaches it.
+    instances: adapter::Instances,
     /// Which backends were enumerated.
     backends: wgpu::Backends,
     /// What to run between submitting a frame and presenting it.
@@ -51,10 +52,7 @@ impl Builder {
     /// what such a user sees without uninstalling a driver.
     pub fn with_backends(backends: wgpu::Backends) -> Self {
         Self {
-            instance: wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends,
-                ..wgpu::InstanceDescriptor::new_without_display_handle()
-            }),
+            instances: adapter::Instances::new(backends),
             backends,
             pre_present: None,
             present_pacing: PresentPacing::Display,
@@ -71,9 +69,12 @@ impl Builder {
         self
     }
 
-    /// The instance, so that whatever owns a native window can create a surface from it.
+    /// The instance of the first backend tier.
+    ///
+    /// A surface made from it cannot present on a fallback tier. [`Builder::for_surface`] takes the
+    /// window's handles and makes the surface on each candidate's own instance.
     pub fn instance(&self) -> &wgpu::Instance {
-        &self.instance
+        self.instances.primary()
     }
 
     /// Which backends this will enumerate.
@@ -108,7 +109,7 @@ impl Builder {
             format,
             mutable_texture_formats,
         };
-        self.open(target, origin, |gpu| {
+        self.open(target, origin, |gpu: &Arc<Gpu>| {
             Ok(Presentation::Offscreen(Offscreen::new(
                 gpu,
                 extent(target),
@@ -118,38 +119,25 @@ impl Builder {
         })
     }
 
-    /// Opens a device presenting to a window's `surface`.
+    /// Opens a device presenting to the window that `window` names.
     ///
-    /// The surface must have been created from [`Builder::instance`]. It is configured here, under
-    /// a validation error scope, because configuring it is the only way to find out whether an
-    /// adapter can actually present to it. Before calling this, a window integration should attach
-    /// its compositor notification through [`Builder::with_pre_present`], so queued redraws can be
-    /// paced without blocking the thread that handles window events.
+    /// Each candidate gets a new surface, made from `window` on the candidate's instance. The
+    /// surface is configured under a validation error scope, because configuring it is the only way
+    /// to find out whether an adapter can actually present to it. Before calling this, a window
+    /// integration should attach its compositor notification through
+    /// [`Builder::with_pre_present`], so queued redraws can be paced without blocking the thread
+    /// that handles window events.
     pub fn for_surface(
         self,
         target: RenderTarget,
-        surface: wgpu::Surface<'static>,
+        window: impl Into<wgpu::SurfaceTarget<'static>> + Clone,
     ) -> Result<WgpuRenderer, GpuUnavailable> {
-        let mut surface = Some(surface);
         let setup = SurfaceSetup {
             size: extent(target),
             opaque: target.opaque,
             pacing: self.present_pacing,
         };
-        self.open(target, Origin::Surface, move |gpu| {
-            let surface = surface
-                .take()
-                // A surface is configured for the adapter that accepted it, and a configured
-                // surface cannot be handed to a second one. When the first candidate fails, the
-                // window has to produce another surface, which is a decision for whoever owns it.
-                .ok_or_else(|| "the surface was consumed by an earlier candidate".to_owned())?;
-            if surface.get_capabilities(gpu.adapter()).formats.is_empty() {
-                return Err("the surface is not compatible with this adapter".to_owned());
-            }
-            Ok(Presentation::Surface(Box::new(ConfiguredSurface::new(
-                gpu, surface, setup,
-            ))))
-        })
+        self.open(target, Origin::Surface, WindowSurface::new(window, setup))
     }
 
     /// Tries every candidate adapter in preference order, one backend tier at a time.
@@ -172,11 +160,11 @@ impl Builder {
         self,
         target: RenderTarget,
         origin: Origin,
-        present: impl FnMut(&Arc<Gpu>) -> Result<Presentation, String>,
+        present: impl Proof,
     ) -> Result<WgpuRenderer, GpuUnavailable> {
-        let (gpu, presentation) = open_device(&self.instance, self.backends, &[], present)?;
+        let (state, presentation) = open_device(&self.instances, &[], present)?;
         Ok(WgpuRenderer::assemble(
-            DeviceState::new(gpu),
+            state,
             None,
             presentation,
             target,
@@ -220,24 +208,26 @@ impl Builder {
 /// every adapter is still tried and one of them opens. [`Gpu::open`] says what the list does to a
 /// device once an adapter is chosen.
 pub(crate) fn open_device(
-    instance: &wgpu::Instance,
-    backends: wgpu::Backends,
+    instances: &adapter::Instances,
     extensions: &[&'static CStr],
-    mut present: impl FnMut(&Arc<Gpu>) -> Result<Presentation, String>,
-) -> Result<(Arc<Gpu>, Presentation), GpuUnavailable> {
+    mut present: impl Proof,
+) -> Result<(Rc<DeviceState>, Presentation), GpuUnavailable> {
     let mut rejections: Vec<(String, String)> = Vec::new();
     let mut enumerated = 0usize;
     // Adapters passed over for having the names and then being refused a device carrying them.
     // Offered again at the end, where nothing else opened at all.
-    let mut deferred: Vec<wgpu::Adapter> = Vec::new();
+    let mut deferred: Vec<(wgpu::Instance, wgpu::Adapter)> = Vec::new();
     // Adapters that rasterise on the processor. Held back past every tier, because a tier is
     // ordered by backend and a software adapter beats no hardware on any backend. See the head of
     // this function.
-    let mut software: Vec<wgpu::Adapter> = Vec::new();
+    let mut software: Vec<(wgpu::Instance, wgpu::Adapter)> = Vec::new();
     // Whether a list was asked for at all. With none, every candidate is equal and the pairing
     // below leaves the preference order exactly as `adapter::candidates` produced it.
     let asked = !extensions.is_empty();
-    for tier in adapter::tiers(backends) {
+    let mut backends = wgpu::Backends::empty();
+    for (tier, instance) in instances.iter() {
+        backends |= tier;
+        present.tier(instance, tier);
         // Paired with what each one can grant, asked before any device exists. The `&&`
         // short-circuits, so `granted_by` is never called where no list was asked for.
         let mut candidates: Vec<(bool, wgpu::Adapter)> = adapter::candidates(instance, tier)
@@ -258,12 +248,12 @@ pub(crate) fn open_device(
             if adapter::is_software(&info) {
                 // Held back rather than rejected: it is what a machine with no graphics driver at
                 // all runs on, and it opens once every tier has been walked.
-                software.push(candidate);
+                software.push((instance.clone(), candidate));
                 continue;
             }
             // Kept only where it is about to be judged on the list, so the ordinary path clones
             // nothing.
-            let again = grants.then(|| candidate.clone());
+            let again = grants.then(|| (instance.clone(), candidate.clone()));
             let gpu = match Gpu::open(instance.clone(), candidate, extensions) {
                 Ok(gpu) => Arc::new(gpu),
                 Err(reason) => {
@@ -285,9 +275,9 @@ pub(crate) fn open_device(
                 continue;
             }
             match offer(&gpu, &mut present) {
-                Ok(presentation) => {
+                Ok(opened) => {
                     tracing::info!(adapter = %gpu.describe(), "graphics device opened");
-                    return Ok((gpu, presentation));
+                    return Ok(opened);
                 }
                 Err(reason) => rejections.push((name, reason)),
             }
@@ -298,9 +288,9 @@ pub(crate) fn open_device(
     // refused a device carrying it. Those are offered again with the list no longer required. A
     // device that copies each frame through the processor still draws, and a machine with one
     // adapter and a driver that refuses the list would otherwise have no device at all.
-    for candidate in deferred {
+    for (instance, candidate) in deferred {
         let name = adapter::describe(&candidate.get_info());
-        let gpu = match Gpu::open(instance.clone(), candidate, &[]) {
+        let gpu = match Gpu::open(instance, candidate, &[]) {
             Ok(gpu) => Arc::new(gpu),
             Err(reason) => {
                 rejections.push((name, reason));
@@ -308,13 +298,13 @@ pub(crate) fn open_device(
             }
         };
         match offer(&gpu, &mut present) {
-            Ok(presentation) => {
+            Ok(opened) => {
                 tracing::warn!(
                     adapter = %gpu.describe(),
                     "graphics device opened without the Vulkan device extensions that were asked \
                      for"
                 );
-                return Ok((gpu, presentation));
+                return Ok(opened);
             }
             Err(reason) => rejections.push((name, reason)),
         }
@@ -324,7 +314,7 @@ pub(crate) fn open_device(
     // are what is left. This is the whole of what makes them a last resort rather than a tier: the
     // tiers are ordered by backend, and a machine can have a software Vulkan driver beside a real
     // OpenGL one — Mesa's `lavapipe` beside a card whose Vulkan driver does not exist.
-    for candidate in software {
+    for (instance, candidate) in software {
         let name = adapter::describe(&candidate.get_info());
         let gpu = match Gpu::open(instance.clone(), candidate, extensions) {
             Ok(gpu) => Arc::new(gpu),
@@ -334,13 +324,13 @@ pub(crate) fn open_device(
             }
         };
         match offer(&gpu, &mut present) {
-            Ok(presentation) => {
+            Ok(opened) => {
                 tracing::warn!(
                     adapter = %gpu.describe(),
                     "no graphics card on this machine could be drawn on, so every pixel is drawn \
                      on the processor"
                 );
-                return Ok((gpu, presentation));
+                return Ok(opened);
             }
             Err(reason) => rejections.push((name, reason)),
         }
@@ -352,26 +342,195 @@ pub(crate) fn open_device(
     Err(adapter::unavailable(rejections))
 }
 
-/// Offers `gpu` to `present`, and answers what came back or why nothing did.
+/// What the candidate loop proves each adapter against.
+pub(crate) trait Proof {
+    /// Prepares for the adapters of `tier`, before the loop lists them from `instance`.
+    fn tier(&mut self, instance: &wgpu::Instance, tier: wgpu::Backends) {
+        let _ = (instance, tier);
+    }
+
+    /// Produces something for `gpu` to present to, or the reason it cannot.
+    fn present(&mut self, gpu: &Arc<Gpu>) -> Result<Presentation, String>;
+}
+
+impl<F: FnMut(&Arc<Gpu>) -> Result<Presentation, String>> Proof for F {
+    fn present(&mut self, gpu: &Arc<Gpu>) -> Result<Presentation, String> {
+        self(gpu)
+    }
+}
+
+/// Proves adapters against a window, with a surface made on the instance of each tier.
+///
+/// The surface of a tier is made before the loop lists the tier's adapters, because wgpu's GL
+/// backend needs its surface to exist before its adapters. A candidate takes the surface, and a
+/// later candidate gets a new one, so a refusal consumes nothing the next candidate needs.
+pub(crate) struct WindowSurface<W> {
+    /// The window's handles.
+    window: W,
+    /// How the surface is configured.
+    setup: SurfaceSetup,
+    /// The surface made for the current tier, until a candidate takes it.
+    made: Option<(wgpu::Backends, wgpu::Surface<'static>)>,
+}
+
+impl<W: Into<wgpu::SurfaceTarget<'static>> + Clone> WindowSurface<W> {
+    /// Proves adapters against the window that `window` names.
+    pub(crate) fn new(window: W, setup: SurfaceSetup) -> Self {
+        Self {
+            window,
+            setup,
+            made: None,
+        }
+    }
+}
+
+impl<W: Into<wgpu::SurfaceTarget<'static>> + Clone> Proof for WindowSurface<W> {
+    fn tier(&mut self, instance: &wgpu::Instance, tier: wgpu::Backends) {
+        // A failure here is reported by `present`, which tries again on the candidate's instance.
+        self.made = instance
+            .create_surface(self.window.clone())
+            .ok()
+            .map(|surface| (tier, surface));
+    }
+
+    fn present(&mut self, gpu: &Arc<Gpu>) -> Result<Presentation, String> {
+        let backend = wgpu::Backends::from(gpu.adapter().get_info().backend);
+        let surface = match self.made.take() {
+            Some((tier, surface)) if tier.contains(backend) => surface,
+            _ => gpu
+                .instance()
+                .create_surface(self.window.clone())
+                .map_err(|error| error.to_string())?,
+        };
+        if surface.get_capabilities(gpu.adapter()).formats.is_empty() {
+            return Err("the surface is not compatible with this adapter".to_owned());
+        }
+        Ok(Presentation::Surface(Box::new(
+            ConfiguredSurface::unconfigured(gpu, surface, self.setup),
+        )))
+    }
+}
+
+/// Offers `gpu` to `present`, and answers the device state and what came back, or why nothing did.
 ///
 /// Configuring a surface is the only way to find out whether an adapter can present to it, and a
 /// failure there raises a validation error instead of returning one. So the attempt runs inside an
 /// error scope, and both halves of the answer are read.
+///
+/// A surface comes back unconfigured, and the pipelines for its formats are built before its swap
+/// chain is configured. On Vulkan on Linux the configure runs on a scoped thread while this thread
+/// builds the pipelines: on a new device each takes 8 to 20 ms, and the configure mostly waits for
+/// the driver and the compositor. Error scopes belong to one thread, so the configure's scope is
+/// pushed and popped on the scoped thread. Other targets configure on this thread, after the
+/// pipelines: a GL context or a Metal layer is bound to the thread that uses it, and a Windows
+/// swap chain can send messages to the window's thread while this thread waits. A candidate that
+/// is refused at the configure discards the pipelines built for it.
 fn offer(
     gpu: &Arc<Gpu>,
-    present: &mut impl FnMut(&Arc<Gpu>) -> Result<Presentation, String>,
-) -> Result<Presentation, String> {
+    present: &mut impl Proof,
+) -> Result<(Rc<DeviceState>, Presentation), String> {
     let scope = gpu.device().push_error_scope(wgpu::ErrorFilter::Validation);
-    let presentation = present(gpu);
+    let presentation = present.present(gpu);
     let validation = futures::executor::block_on(scope.pop());
-    match (presentation, validation) {
-        (Ok(presentation), None) => Ok(presentation),
-        (Ok(_), Some(error)) => Err(error.to_string()),
-        (Err(reason), _) => Err(reason),
+    let mut presentation = match (presentation, validation) {
+        (Ok(presentation), None) => presentation,
+        (Ok(_), Some(error)) => return Err(error.to_string()),
+        (Err(reason), _) => return Err(reason),
+    };
+    let state = DeviceState::new(Arc::clone(gpu));
+    if presentation.is_configured() {
+        return Ok((state, presentation));
+    }
+    let formats = presentation.formats();
+    let configure = |presentation: &mut Presentation| {
+        let scope = gpu.device().push_error_scope(wgpu::ErrorFilter::Validation);
+        presentation.apply_pending(gpu);
+        futures::executor::block_on(scope.pop())
+    };
+    let threaded =
+        cfg!(target_os = "linux") && gpu.adapter().get_info().backend == wgpu::Backend::Vulkan;
+    let validation = if threaded {
+        let configured = std::thread::scope(|threads| {
+            let configuring = threads.spawn(|| configure(&mut presentation));
+            state.prepare(formats);
+            configuring.join()
+        });
+        configured.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    } else {
+        state.prepare(formats);
+        configure(&mut presentation)
+    };
+    match validation {
+        None => Ok((state, presentation)),
+        Some(error) => Err(error.to_string()),
     }
 }
 
 /// The extent a target asks for, never smaller than one pixel.
 fn extent(target: RenderTarget) -> Size<i32, Device> {
     Size::new(target.size.width.max(1), target.size.height.max(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use zgui_geom::Size;
+
+    use super::open_device;
+    use crate::gpu::adapter;
+    use crate::gpu::device::Gpu;
+    use crate::pipeline::kind::PipelineKind;
+    use crate::target::swapchain::{Presentation, Supplied};
+
+    /// A presentation that is not configured: a supplied set out of step with its target.
+    ///
+    /// Its `apply_pending` does nothing, so the open takes the path of a new surface without a
+    /// window.
+    fn unconfigured(gpu: &Arc<Gpu>) -> Result<Presentation, String> {
+        let texture = gpu.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("zgui.test.unconfigured"),
+            size: wgpu::Extent3d {
+                width: 8,
+                height: 8,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let supplied = Supplied::new(vec![texture]).ok_or("the texture was refused")?;
+        let mut presentation = Presentation::Supplied(supplied);
+        presentation.resize(gpu, Size::new(16, 16));
+        Ok(presentation)
+    }
+
+    #[test]
+    fn a_device_opened_for_an_unconfigured_presentation_has_its_pipelines_built() {
+        let instances = adapter::Instances::new(adapter::requested_backends());
+        let (state, presentation) = match open_device(&instances, &[], unconfigured) {
+            Ok(opened) => opened,
+            Err(failure) => {
+                eprintln!("skipped: no usable graphics device ({failure})");
+                return;
+            }
+        };
+        assert!(
+            !presentation.is_configured(),
+            "the supplied set is still out of step with its target"
+        );
+        let formats = presentation.formats();
+        let pipelines = state.pipelines.borrow();
+        assert!(
+            pipelines.is_built(PipelineKind::Quad, formats.scene),
+            "the open builds the scene pipelines before it configures the surface"
+        );
+        assert!(
+            pipelines.is_built(PipelineKind::Blit, formats.present_attachment()),
+            "the open builds the final copy for the attachment it presents to"
+        );
+    }
 }

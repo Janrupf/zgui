@@ -2,7 +2,7 @@
 //!
 //! `Queue::write_buffer` allocates and maps a one-shot staging buffer for every call on native
 //! backends. A frame writes a dozen buffers, so an unlucky allocator or mapping round-trip can
-//! turn otherwise tiny uploads into a several-millisecond CPU spike. This belt suballocates those
+//! turn otherwise tiny uploads into a several-millisecond CPU stall. This belt suballocates those
 //! writes from a few mapped chunks and recycles them after the submitted copies complete.
 
 use std::sync::mpsc;
@@ -93,12 +93,7 @@ impl UploadBelt {
     /// megabytes of mapped memory held for two seconds.
     const ONE_SHOT: u64 = 1 << 20;
 
-    /// Starts a frame, taking back the chunks whose mappings have already completed.
-    ///
-    /// Nothing here reaches the device, which is why it takes none. A mapping completes when
-    /// something calls [`Gpu::reclaim`](crate::gpu::device::Gpu::reclaim) — once a frame, where the
-    /// device is known to have caught up. Asking for it here instead would put a GL backend's fence
-    /// query on the path that builds a frame, and that query waits for the card.
+    /// Starts a frame, opportunistically reclaiming completed mappings without waiting for them.
     pub fn begin_frame(&mut self) {
         self.frame = self.frame.wrapping_add(1);
         self.allocations = 0;
@@ -176,6 +171,7 @@ impl UploadBelt {
     }
 
     /// Copies tightly packed texels into level `mip` of a texture through padded mapped rows.
+    #[allow(clippy::too_many_arguments)]
     pub fn write_texture(
         &mut self,
         gpu: &Gpu,
@@ -204,10 +200,10 @@ impl UploadBelt {
     /// Copies tightly packed texels into a rectangle of `target`, whatever the texel is.
     ///
     /// The same work as [`UploadBelt::write_texture`] with no atlas format to name it: the tables
-    /// are `rgba32uint` and their texel is not one of the two an atlas has. What matters to a
-    /// caller is that this reaches the device through the belt rather than through
-    /// `Queue::write_texture`, which allocates and maps a staging buffer for every call — and on
-    /// the GL backend allocating one while the card is drawing waits for the card.
+    /// and the instance arenas are `rgba32uint`, and their texel is not one of the two an atlas
+    /// has. What matters to a caller is that this reaches the device through the belt rather than
+    /// through `Queue::write_texture`, which allocates and maps a staging buffer for every call —
+    /// and on the GL backend allocating one while the card is drawing waits for the card.
     #[expect(
         clippy::too_many_arguments,
         reason = "a texture write names a target, a level, an origin, an extent and a texel, and \
@@ -232,7 +228,7 @@ impl UploadBelt {
         }
         let row = u64::from(width) * u64::from(bytes_per_texel);
         let padded = row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64);
-        let size = padded * u64::from(height);
+        let staged = padded * u64::from(height);
         assert_eq!(bytes.len() as u64, row * u64::from(height));
 
         self.receive();
@@ -240,27 +236,27 @@ impl UploadBelt {
         let active = self
             .active
             .iter()
-            .position(|chunk| chunk.allocation(size, alignment).is_some());
+            .position(|chunk| chunk.allocation(staged, alignment).is_some());
         let mut chunk = if let Some(index) = active {
             self.active.swap_remove(index)
         } else if let Some(index) = self
             .free
             .iter()
-            .position(|chunk| chunk.allocation(size, alignment).is_some())
+            .position(|chunk| chunk.allocation(staged, alignment).is_some())
         {
             self.free.swap_remove(index)
         } else {
-            self.allocate_chunk(gpu, size, "zgui.texture-upload.chunk")
+            self.allocate_chunk(gpu, staged, "zgui.texture-upload.chunk")
         };
         let offset = chunk
-            .allocation(size, alignment)
+            .allocation(staged, alignment)
             .expect("a selected texture upload chunk has enough room");
-        chunk.offset = offset + size;
+        chunk.offset = offset + staged;
         chunk.last_used = self.frame;
         self.active.push(chunk);
 
         let chunk = self.active.last().expect("the selected chunk was retained");
-        let slice = chunk.buffer.slice(offset..offset + size);
+        let slice = chunk.buffer.slice(offset..offset + staged);
         {
             let mut mapped = slice.get_mapped_range_mut();
             for y in 0..height as usize {

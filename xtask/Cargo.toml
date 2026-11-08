@@ -3,6 +3,9 @@ name = "xtask"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Build, test and gate runner for the zgui workspace"
+repository.workspace = true
+homepage.workspace = true
 publish = false
 
 # xtask is the workspace's own gate runner. It stays dependency-light on purpose: it has to

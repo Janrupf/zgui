@@ -37,7 +37,10 @@ use crate::wake::RuntimeWaker;
 /// It is a queue rather than an immediate effect because every one of these can be issued from
 /// inside an event handler, and an event handler runs inside an open batch of changes to the
 /// document. Applying a focus move there would re-enter a change that has not finished.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// The debug form of [`Command::SetValue`] gives the length of the text and not the text, because
+/// the text can be a password.
+#[derive(Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Command {
     /// Move focus to this node, or take focus away when there is none.
@@ -99,6 +102,67 @@ pub enum Command {
         /// Which event.
         event: zgui_vocab::EventKind,
     },
+}
+
+impl core::fmt::Debug for Command {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Focus(node) => formatter.debug_tuple("Focus").field(node).finish(),
+            Self::Scroll {
+                node,
+                target,
+                behavior,
+            } => formatter
+                .debug_struct("Scroll")
+                .field("node", node)
+                .field("target", target)
+                .field("behavior", behavior)
+                .finish(),
+            Self::CapturePointer(node) => {
+                formatter.debug_tuple("CapturePointer").field(node).finish()
+            }
+            Self::InstallStylesheet { name, css } => formatter
+                .debug_struct("InstallStylesheet")
+                .field("name", name)
+                .field("css", css)
+                .finish(),
+            Self::RemoveStylesheet { name } => formatter
+                .debug_struct("RemoveStylesheet")
+                .field("name", name)
+                .finish(),
+            Self::FreezeScrolling(frozen) => formatter
+                .debug_tuple("FreezeScrolling")
+                .field(frozen)
+                .finish(),
+            Self::ReleasePointer(node) => {
+                formatter.debug_tuple("ReleasePointer").field(node).finish()
+            }
+            Self::Select { node, range } => formatter
+                .debug_struct("Select")
+                .field("node", node)
+                .field("range", range)
+                .finish(),
+            Self::SetValue { node, text } => formatter
+                .debug_struct("SetValue")
+                .field("node", node)
+                .field("text", &Redacted(text.len()))
+                .finish(),
+            Self::Synthesize { node, event } => formatter
+                .debug_struct("Synthesize")
+                .field("node", node)
+                .field("event", event)
+                .finish(),
+        }
+    }
+}
+
+/// Text in a debug form, given as its length in bytes.
+pub(crate) struct Redacted(pub(crate) usize);
+
+impl core::fmt::Debug for Redacted {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(formatter, "<{} bytes>", self.0)
+    }
 }
 
 /// The production [`ViewHost`]: the running engines, seen from a view.
@@ -394,18 +458,51 @@ impl RuntimeHost {
                     let restore = trap
                         .restore_to
                         .filter(|node| document.store().index_of(*node).is_some());
-                    (trap.id, trap.options.restore, restore)
+                    (trap.id, trap.options.restore, trap.root, restore)
                 })
                 .collect::<Vec<_>>()
         };
-        for (id, restore, node) in stranded {
+        for (id, restore, root, node) in stranded {
             self.entering
                 .borrow_mut()
                 .forget(FocusTrapId::new(id.get()));
-            if restore {
+            if restore && !self.focus_left(root) {
                 self.issue(Command::Focus(node.map(zgui_view_dom::id::to_view)));
             }
         }
+    }
+
+    /// Whether focus stands, or is on its way, to a node of the document outside the subtree of
+    /// `root`.
+    ///
+    /// A focus request issued in the same turn and not yet carried out counts as where focus goes:
+    /// an entry of a menu that opens a tab asks for the tab's focus before the menu finishes going,
+    /// and the request lands after the menu's trap has come down.
+    fn focus_left(&self, root: NodeKey) -> bool {
+        use zgui_reactive::prelude::GetUntracked;
+        let asked = self
+            .commands
+            .borrow()
+            .iter()
+            .rev()
+            .find_map(|command| match command {
+                Command::Focus(node) => Some(*node),
+                _ => None,
+            });
+        // A window that is closing has no focus left to keep.
+        let Some(focused) = asked
+            .unwrap_or_else(|| self.focused.try_get_untracked().flatten())
+            .and_then(|node| self.key_of(node))
+        else {
+            return false;
+        };
+        let document = self.document.borrow();
+        let store = document.store();
+        let Some(top) = document.root_index().map(|index| store.key_of(index)) else {
+            return false;
+        };
+        let chain = zgui_input::HitChain::to_root(store, focused);
+        chain.contains(top) && !chain.contains(root)
     }
 
     /// Whether any self-focusing trap is still waiting to be entered.
@@ -635,14 +732,23 @@ impl ViewHost for RuntimeHost {
 
     fn pop_focus_trap(&self, id: FocusTrapId) {
         self.entering.borrow_mut().forget(id);
-        let removed = self
-            .traps
-            .borrow_mut()
-            .pop(zgui_input::FocusTrapId::new(id.get()));
+        let (removed, topmost) = {
+            let mut traps = self.traps.borrow_mut();
+            let id = zgui_input::FocusTrapId::new(id.get());
+            let topmost = traps.is_topmost(id);
+            (traps.pop(id), topmost)
+        };
         let Some(trap) = removed else {
             return;
         };
-        if !trap.options.restore {
+        // A trap under a newer one leaves focus where the newer one holds it, and hands it the
+        // place it restores to.
+        if !trap.options.restore || !topmost {
+            return;
+        }
+        // Focus that moved out of the surface while it went, to a tab a menu entry opened or to
+        // the control a press outside landed on, stays where it went.
+        if self.focus_left(trap.root) {
             return;
         }
         // Focus goes back to whatever opened the dialog. Dropping it instead leaves the whole
@@ -651,6 +757,14 @@ impl ViewHost for RuntimeHost {
         self.issue(Command::Focus(
             trap.restore_to.map(zgui_view_dom::id::to_view),
         ));
+    }
+
+    fn is_text_entry(&self, node: NodeId) -> bool {
+        let Some(key) = self.key_of(node) else {
+            return false;
+        };
+        let document = self.document.borrow();
+        crate::editing::Editors::holds_text(&document, key)
     }
 
     fn selection(&self, node: NodeId) -> Option<Range<usize>> {
@@ -662,18 +776,18 @@ impl ViewHost for RuntimeHost {
             return;
         };
         let length = self.text_length(key);
-        self.selections.set(key, range, length);
+        self.selections.set(key, range.clone(), length);
         // The model has to hear about it too, because the caret it types at is its own. Issued
         // rather than written: the model is the window's, and this is called from inside handlers
         // that run in the middle of a frame.
         //
+        // The command carries the range as asked. A value written in the same frame reaches the
+        // model first, and the model clamps the range against that text when the command lands.
+        //
         // What is selected changed, so the frame that shows it is owed. Nothing is marked on the
         // document here: this is called from inside handlers, which run inside an open batch of
         // changes, and the frame that follows is where a caret and a highlight are drawn.
-        self.issue(Command::Select {
-            node,
-            range: self.selections.of(key).unwrap_or(0..0),
-        });
+        self.issue(Command::Select { node, range });
     }
 
     fn select_all(&self, node: NodeId) {
@@ -682,9 +796,11 @@ impl ViewHost for RuntimeHost {
         };
         let length = self.text_length(key);
         self.selections.set(key, 0..length, length);
+        // To the end of the model's text, which the model finds when the command lands: the
+        // document's length counts the bullets of a secure field.
         self.issue(Command::Select {
             node,
-            range: 0..length,
+            range: 0..usize::MAX,
         });
     }
 
@@ -784,5 +900,43 @@ fn translate(direction: FocusMove) -> zgui_input::FocusDirection {
         // A direction this build has never heard of moves focus forwards, which is what every
         // traversal a component writes means by "onwards".
         _ => zgui_input::FocusDirection::Next,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Command;
+
+    #[test]
+    fn a_loaded_value_is_debugged_as_its_length() {
+        let node = zgui_view::NodeId::from_u64(1 << 32 | 3).expect("a live handle");
+        let command = Command::SetValue {
+            node,
+            text: "hunter2".to_owned(),
+        };
+        let printed = format!("{command:?}");
+        assert!(!printed.contains("hunter2"), "{printed}");
+        assert!(printed.contains("<7 bytes>"), "{printed}");
+        assert!(printed.starts_with("SetValue"), "{printed}");
+        assert_eq!(
+            format!("{:?}", Command::FreezeScrolling(true)),
+            "FreezeScrolling(true)"
+        );
+    }
+
+    #[test]
+    fn an_edit_is_debugged_without_its_text() {
+        let edited = crate::editing::Edited {
+            handled: true,
+            clipboard: Some("hunter2".to_owned()),
+            value: Some("hunter2!".to_owned()),
+            ..Default::default()
+        };
+        let printed = format!("{edited:?}");
+        assert!(!printed.contains("hunter2"), "{printed}");
+        assert!(
+            printed.contains("<7 bytes>") && printed.contains("<8 bytes>"),
+            "{printed}"
+        );
     }
 }

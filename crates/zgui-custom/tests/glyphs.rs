@@ -90,11 +90,13 @@ impl CustomElement for Label {
         let run = ShapedRun {
             face: FaceId(0),
             size: 16.0,
+            instance: zgui_custom::VariationInstance::DEFAULT,
             synthetic_bold: 0.0,
             synthetic_slant: 0.0,
             has_color: false,
             brush: PaintSlot(0),
             glyphs: &GLYPHS,
+            text_start: 0,
         };
         painter.glyphs(&run, origin(), painter.current_color());
     }
@@ -125,8 +127,8 @@ fn custom_box(window: &zgui_runtime::Window) -> (f32, f32) {
         let fragment = layout.fragments_of_box(key).first().expect("a fragment");
         let fragment = layout.fragment(*fragment).expect("a fragment");
         return (
-            fragment.content_box.origin.x.0,
-            fragment.content_box.origin.y.0,
+            fragment.content_box().origin.x.0,
+            fragment.content_box().origin.y.0,
         );
     }
     panic!("the custom element laid out");

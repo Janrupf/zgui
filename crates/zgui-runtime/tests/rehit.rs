@@ -35,6 +35,8 @@ fn park_pointer(app: &mut zgui_platform_headless::Harness<zgui_runtime::Runtime>
 #[test]
 fn a_frame_that_moved_no_fragment_does_not_retest_under_the_pointer() {
     zgui_reactive::install().ok();
+    // Held for the whole test: parking the pointer re-tests too, and the test beside it counts.
+    let _guard = counter::exclusive();
     let tinted = RwSignal::new(false);
     let mut app = support::app(CSS, move |cx: &mut BuildCx<'_>| {
         Box::new(
@@ -50,7 +52,6 @@ fn a_frame_that_moved_no_fragment_does_not_retest_under_the_pointer() {
     app.settle(4);
     park_pointer(&mut app);
 
-    let _guard = counter::exclusive();
     counter::reset();
     tinted.set(true);
     app.settle(4);
@@ -65,6 +66,8 @@ fn a_frame_that_moved_no_fragment_does_not_retest_under_the_pointer() {
 #[test]
 fn a_box_that_appears_under_the_pointer_becomes_hovered_without_a_move() {
     zgui_reactive::install().ok();
+    // Held for the whole test: parking the pointer re-tests too, and the test beside it counts.
+    let _guard = counter::exclusive();
     let shown = RwSignal::new(false);
     let hovered = Rc::new(std::cell::Cell::new(false));
     let seen = Rc::clone(&hovered);
@@ -91,7 +94,6 @@ fn a_box_that_appears_under_the_pointer_becomes_hovered_without_a_move() {
     app.settle(4);
     park_pointer(&mut app);
 
-    let _guard = counter::exclusive();
     counter::reset();
     shown.set(true);
     app.settle(4);

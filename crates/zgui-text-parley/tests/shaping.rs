@@ -122,9 +122,11 @@ fn a_rebreak_equals_a_fresh_shape_at_the_same_width() {
     assert_eq!(rebroken.geometry.size, directly.geometry.size);
 }
 
-/// A colour change moves neither key, so it costs nothing at all.
+/// Each brush slot is shaped once, because the shaped glyphs name the slot they are drawn through.
+///
+/// A re-theme moves the colour behind a slot and keeps the slot, so it costs no shaping.
 #[test]
-fn a_brush_change_costs_nothing() {
+fn each_brush_slot_is_shaped_once() {
     let _guard = counting();
     let (_fonts, mut shaper) = support::shaper(Controls::Mark);
     let mut cache = ParagraphCache::new();
@@ -155,9 +157,9 @@ fn a_brush_change_costs_nothing() {
             &BreakRequest::new(&content, Some(CssPx(300.0))),
         );
     }
-    assert_eq!(counter::get(Counter::TextShaped), 1);
-    assert_eq!(counter::get(Counter::TextRebroken), 1);
-    assert_eq!(cache.len(), 1, "one entry serves all three brushes");
+    assert_eq!(counter::get(Counter::TextShaped), 3);
+    assert_eq!(counter::get(Counter::TextRebroken), 3);
+    assert_eq!(cache.len(), 3, "each brush has an entry of its own");
 }
 
 /// Re-styling `vertical-align` moves the box without re-shaping the paragraph.
@@ -383,4 +385,39 @@ fn a_banded_request_gives_each_line_its_own_width() {
         banded.geometry.lines.len(),
         "banding changed nothing about how the paragraph broke"
     );
+}
+
+/// The engine's byte estimate grows with the lines a break makes, and equal paragraphs broken at
+/// equal widths report equal bytes.
+#[test]
+fn the_byte_estimate_follows_the_break_and_is_deterministic() {
+    let _guard = counting();
+    let estimate = |width: f32| {
+        let (_fonts, mut shaper) = support::shaper(Controls::Mark);
+        let fixture = Fixture::new(PROSE, Direction::LeftToRight);
+        let content = fixture.content();
+        let mut shaped = shaper.shape(&content);
+        let unbroken = shaper.engine_bytes(&shaped);
+        let broken = shaper.break_lines(
+            &mut shaped,
+            &BreakRequest::new(&content, Some(CssPx(width))),
+        );
+        (
+            unbroken,
+            shaper.engine_bytes(&shaped),
+            broken.geometry.lines.len(),
+        )
+    };
+    let (unbroken, wide, wide_lines) = estimate(400.0);
+    let (_, narrow, narrow_lines) = estimate(120.0);
+    assert!(
+        wide > unbroken,
+        "the lines hold the glyphs: {unbroken} -> {wide}"
+    );
+    assert!(narrow_lines > wide_lines);
+    assert!(
+        narrow > wide,
+        "more lines hold more records: {wide} -> {narrow}"
+    );
+    assert_eq!(estimate(400.0).1, wide);
 }

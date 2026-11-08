@@ -1,0 +1,12 @@
+[package]
+name = "zgui"
+version.workspace = true
+edition = "2024"
+
+[dependencies]
+zgui-layout = { path = "../zgui-layout", version = "0.1.0" }
+
+# PLANTED VIOLATION: a published crate naming a member that is not published, optional and only
+# for one target.
+[target.'cfg(target_os = "linux")'.dependencies]
+zgui-platform-drm = { path = "../zgui-platform-drm", version = "0.1.0", optional = true }

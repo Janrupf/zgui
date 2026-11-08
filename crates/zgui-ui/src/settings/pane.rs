@@ -8,7 +8,7 @@ use zgui::{component, view};
 use crate::settings::context::SettingsContext;
 use crate::settings::style;
 
-/// What one page of a [`Settings`](crate::Settings) holds, shown while that page is chosen.
+/// What one page of a [`Settings`](crate::settings::Settings) holds, shown while that page is chosen.
 ///
 /// ```
 /// # use zgui::prelude::*;

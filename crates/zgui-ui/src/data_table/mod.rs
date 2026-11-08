@@ -7,7 +7,7 @@ mod style;
 
 pub use crate::data_table::column::{CellOrder, CellText, Column, track_list};
 pub use crate::data_table::model::{DataModel, Page, RowId, RowMatch, SortState};
-pub use crate::data_table::resize::{ColumnResizer, ColumnResizerProps, MIN_WIDTH};
+pub use crate::data_table::resize::{ColumnResizer, ColumnResizerProps, GripEdge, MIN_WIDTH};
 pub use crate::data_table::style::DataTableStyle;
 
 use std::collections::BTreeMap;
@@ -86,8 +86,9 @@ const SELECT_TRACK: &str = "40px";
 /// `virtualized=true` replaces the body's rows with the handful that are on screen and two boxes
 /// standing in for the rest, so the number of elements is a function of how tall the table is
 /// rather than of how much data there is. Scrolling within one row rebuilds nothing; scrolling past
-/// one builds one row and destroys one. It needs `row_size` to be true of the sheet, because the
-/// window is decided before the rows in it exist.
+/// one builds one row and destroys one. The window is decided before the rows in it exist, so the
+/// table writes `row_size` into `--zui-data-table-row` and the sheet makes every body cell that
+/// tall. A sheet that sets the height of a body cell itself must use the same value.
 ///
 /// Pagination and virtualisation are alternatives rather than layers: a virtualised table shows
 /// every row that survives the filter, and setting both makes the table virtualised.
@@ -130,7 +131,8 @@ pub fn DataTable<T, I>(
     /// Whether only the rows on screen are built.
     #[prop(default = false)]
     virtualized: bool,
-    /// How tall one row is in CSS pixels, which virtualisation is decided from.
+    /// How tall one row is in CSS pixels. A virtualised table decides its window from it and sizes
+    /// every body row to it.
     #[prop(default = 40.0)]
     row_size: f32,
     /// How tall the scrolling body is, in CSS pixels.
@@ -239,6 +241,7 @@ where
                 columns_count = column_count,
                 class = "zui-data-table__grid",
                 attr:data-virtualized = {Some(virtualized.to_string())},
+                var:--zui-data-table-row = {virtualized.then(|| format!("{row_size}px"))},
                 var:--zui-data-table-height = move || body_height.map(|height| format!("{height}px"))
             ) {
                 TableHeader {

@@ -133,9 +133,22 @@ pub fn moved(before: Option<(i32, i32, i32, i32)>, now: (i32, i32, i32, i32)) ->
     before != Some(now)
 }
 
+/// Whether an enabled field's state has to be sent again.
+///
+/// When its caret moved, and also when only its purpose changed: a password field that is
+/// revealed in place keeps its caret, and an input method that still believes it is a password
+/// field keeps its prediction off.
+pub fn restate(
+    before: Option<((i32, i32, i32, i32), TextInputPurpose)>,
+    now: ((i32, i32, i32, i32), TextInputPurpose),
+) -> bool {
+    let caret = before.map(|(caret, _)| caret);
+    moved(caret, now.0) || before.is_some_and(|(_, purpose)| purpose != now.1)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Composing, caret, hint, moved, purpose, span};
+    use super::{Composing, caret, hint, moved, purpose, restate, span};
     use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::{
         ContentHint, ContentPurpose,
     };
@@ -233,5 +246,23 @@ mod tests {
         assert!(moved(None, at));
         assert!(!moved(Some(at), at));
         assert!(moved(Some(at), (0, 0, 1, 1)));
+    }
+
+    #[test]
+    fn a_purpose_that_changed_is_sent_again_with_the_caret_where_it_was() {
+        let at = (10, 20, 1, 16);
+        assert!(restate(None, (at, TextInputPurpose::Password)));
+        assert!(!restate(
+            Some((at, TextInputPurpose::Password)),
+            (at, TextInputPurpose::Password)
+        ));
+        assert!(restate(
+            Some((at, TextInputPurpose::Password)),
+            (at, TextInputPurpose::Normal)
+        ));
+        assert!(restate(
+            Some((at, TextInputPurpose::Normal)),
+            ((0, 0, 1, 1), TextInputPurpose::Normal)
+        ));
     }
 }

@@ -115,6 +115,10 @@ impl Scene {
             // hides of it is hidden the same way. It can never *be* a cover: an effect may draw
             // anything at all, so nothing about its pixels is known here.
             Batch::Shaded { ref range, .. } => kept(PrimitiveKind::Shaded, range).then_some(batch),
+            // Marks are a payload of their own and draw in order like the rest, so what an opaque
+            // fill hides of them is decided the same way. A mark can never be a cover: the payload
+            // says what to draw and not what it covers.
+            Batch::Marks(ref range) => kept(PrimitiveKind::Marks, range).then_some(batch),
             // A group marker is never dropped: the scan that found the cover stopped at the first
             // one, so no marker is under it, and dropping half a pair would leave a target open.
             Batch::Group(_) => Some(batch),

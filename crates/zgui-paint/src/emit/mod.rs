@@ -7,6 +7,7 @@
 pub mod box_;
 pub mod group;
 pub mod highlight;
+pub mod inline;
 pub mod paint;
 pub mod replaced;
 pub mod scrollbar;

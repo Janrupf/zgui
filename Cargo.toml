@@ -7,6 +7,16 @@ exclude = ["xtask/fixtures", "vendor"]
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
+repository = "https://github.com/zortax/zgui"
+homepage = "https://zgui.zortax.de"
+# What every published crate shares. The console crates are not published and do not inherit these:
+# `zgui-xkb` needs nightly, so they keep no minimum stable version either.
+rust-version = "1.90"
+keywords = ["gui", "ui", "css", "reactive", "wgpu"]
+categories = ["gui"]
+# A package carries what a dependent builds and the licence text, and none of the tests, fixtures
+# or test fonts.
+include = ["/src", "/build", "/build.rs", "/README.md", "/LICENSE", "/NOTICE"]
 
 # Every dependency of every crate is declared here and inherited with `foo.workspace = true`,
 # so a version, a feature set or a `default-features` decision exists in exactly one place.
@@ -28,33 +38,19 @@ app_units = "0.7.8"
 euclid = "0.22.14"
 
 # --- layout: named only by zgui-layout ----------------------------------------------------
-# The feature set is pinned explicitly and `default-features` is off: we own the tree, so
-# `taffy_tree` is unwanted, while losing `content_size` would silently zero every intrinsic
-# size and losing `float_layout` would silently delete floats. `std` is not optional in
-# practice: taffy 0.12.2's `detailed_layout_info` names `Box` through the std prelude, so the
-# crate does not compile without it.
-#
-# The vendored copy is named by path rather than through `[patch.crates-io]`, because a patch
-# section only takes effect in the root manifest of whatever workspace is building: a project
-# depending on zgui by path would compile zgui-layout against the unpatched release — which,
-# now that the local changes extend a trait zgui-layout implements, does not compile at all,
-# and before that silently dropped the layout fixes. See vendor/README.md for the changes.
-taffy = { path = "vendor/taffy", default-features = false, features = [
-    "std",
-    "flexbox",
+# A retained, incremental engine written against a host-owned tree. `block`, `flex` and `grid` are
+# the three algorithms the box tree dispatches to; the workspace drives its own layout pool through
+# the engine's batching seam.
+cephal = { version = "0.2.0", default-features = false, features = [
+    "block",
+    "flex",
     "grid",
-    "block_layout",
-    "float_layout",
-    "content_size",
-    "calc",
-    "detailed_layout_info",
 ] }
 
 # --- text: named only by zgui-text-parley --------------------------------------------------
 parley = "0.11.0"
 fontique = "0.11.0"
-harfrust = "0.10.0"
-skrifa = "0.43.2"
+skrifa = "0.44.0"
 swash = "0.2.10"
 zeno = "0.3.3"
 
@@ -136,6 +132,14 @@ accesskit_unix = "0.22.1"
 # unconditionally and the Wayland clipboard goes through smithay-clipboard instead.
 arboard = { version = "3.6", default-features = false }
 smithay-clipboard = "0.7"
+# The macOS application menu, the dock's reopen request and the title-bar buttons. All three are
+# AppKit objects winit does not expose, so `zgui-platform-winit` reaches them through objc2 and
+# builds the menu with muda. `default-features = false` keeps gtk out of every other desktop.
+muda = { version = "0.21.0", default-features = false }
+objc2 = "0.6.4"
+block2 = "0.6.2"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSUserDefaults", "NSGeometry", "NSObject", "NSNotification", "NSOperation", "block2"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSWindow", "NSView", "NSResponder", "NSButton", "NSControl", "NSGraphics", "NSRunningApplication", "NSEvent", "block2"] }
 zbus = "5.18"
 # The native handles a surface hands a graphics API, named by the platform contract and by both
 # backends that implement it.
@@ -251,7 +255,6 @@ glow = "0.17"
 # --- test and benchmark tooling ----------------------------------------------------------------
 proptest = "1.11"
 criterion = "0.8"
-insta = "1.48"
 trybuild = "1.0"
 loom = "0.7"
 
@@ -267,3 +270,8 @@ private_intra_doc_links = "warn"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 undocumented_unsafe_blocks = "warn"
+
+# The font collection under the text engine, vendored so that a font query keeps its resolved
+# families and loaded faces from one paragraph to the next (see vendor/README.md for the changes).
+[patch.crates-io]
+fontique = { path = "vendor/fontique" }

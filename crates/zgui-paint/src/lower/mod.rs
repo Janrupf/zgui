@@ -21,6 +21,7 @@ pub mod clip;
 pub mod filter;
 pub mod key;
 pub mod outline;
+pub mod scrollbar;
 pub mod shader;
 pub mod shadow;
 pub mod transform;
@@ -37,6 +38,7 @@ pub use crate::lower::border::BorderPaint;
 pub use crate::lower::clip::ClipShape;
 pub use crate::lower::filter::GroupPaint;
 pub use crate::lower::outline::OutlinePaint;
+pub use crate::lower::scrollbar::ScrollbarStyle;
 pub use crate::lower::shader::{NamedShader, ShaderStyle};
 pub use crate::lower::shadow::ShadowSpec;
 
@@ -81,6 +83,9 @@ pub struct PaintStyle {
     /// icons resolve one paint between them, and so that the same custom-property lookups are not
     /// repeated per outline of a chart with two hundred marks.
     pub shape: crate::emit::vector::ShapePaint,
+    /// Whether a drawing's line series are reduced per device column, from
+    /// [`LOD`](crate::emit::vector::LOD).
+    pub vector_lod: bool,
     /// What makes the box composite on its own.
     pub group: GroupPaint,
     /// What the box cuts its own painting to.
@@ -107,6 +112,9 @@ pub struct PaintStyle {
     /// Held as the computed pair rather than resolved numbers, because a percentage here is a
     /// percentage of the box's leftover space — geometry, resolved where the content is emitted.
     pub object_position: ObjectPositionValue,
+    /// How the box's scrollbars are painted, for a scroll container. The default for every other
+    /// box.
+    pub scrollbar: ScrollbarStyle,
 }
 
 impl PaintStyle {
@@ -167,6 +175,7 @@ pub fn lower(style: &ComputedStyle, scale: f32) -> PaintStyle {
         decoration: crate::emit::text::DecorationStyle::of(style, scale),
         text_fill,
         shape: crate::emit::vector::shape_paint(style, scale),
+        vector_lod: crate::emit::vector::vector_lod(style),
         group: filter::of(style, scale),
         clip_path: clip::of(style),
         corner_shape: zgui_layout::fragment::corner::shape(style),
@@ -174,6 +183,7 @@ pub fn lower(style: &ComputedStyle, scale: f32) -> PaintStyle {
         transform_forces_group: transform::forces_group(style),
         object_fit: style.get_position().object_fit,
         object_position: style.get_position().object_position.clone(),
+        scrollbar: scrollbar::of(style),
     }
 }
 

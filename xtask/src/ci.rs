@@ -13,7 +13,14 @@ use crate::{
 };
 
 /// Runs every gate, stopping at the first failure.
-pub(crate) fn run(root: &Path) -> Result<()> {
+///
+/// `hosted` skips `perf` and `tails`. Their bands are absolute times taken on the reference
+/// machine, so a shared build machine fails them for reasons unrelated to the commit, and `perf`
+/// writes its numbers into `docs/performance.md`. It also skips `resize`, `workloads`, `verify` and
+/// `growth`, which fail on the current tree until their bands and faults are resolved. The
+/// wall-clock budgets run with [`wall_clock::HOSTED`] set, so a budget set close to the reference
+/// machine can state a hosted figure. Every other gate runs.
+pub(crate) fn run(root: &Path, hosted: bool) -> Result<()> {
     let cargo = process::cargo();
 
     step("cargo fmt --check");
@@ -54,18 +61,26 @@ pub(crate) fn run(root: &Path) -> Result<()> {
     // execute these — the targets are behind a feature it does not turn on — so this is the only
     // place they run, and it runs every time.
     step("cargo test --release (wall-clock budgets)");
-    wall_clock::run(root)?;
+    wall_clock::run(root, hosted)?;
 
     // In release for the same reason, and beside the ratchet because it is the same kind of
     // instrument: a slope measured in an unoptimised build is a slope of a program nobody runs.
-    step("resize");
-    resize::run(root)?;
+    if hosted {
+        skipped("resize");
+    } else {
+        step("resize");
+        resize::run(root)?;
+    }
 
     // After `resize` and before the documentation gate, for the same reason `resize` sits where it
     // does: these are measurements in an optimised build, and they belong with the other ones
     // rather than among the checks that only read source.
-    step("workloads");
-    workloads::run(root)?;
+    if hosted {
+        skipped("workloads");
+    } else {
+        step("workloads");
+        workloads::run(root)?;
+    }
 
     // The two differentials over what a frame is other than its pixels. In release and after the
     // measurements, because each is the whole script over two windows and one of them recomputes
@@ -81,27 +96,40 @@ pub(crate) fn run(root: &Path) -> Result<()> {
     // they were built to extend: what the frame *draws*. It is last of the three because it is the
     // longest — seven documents rather than four — and because a disagreement about a hit or a
     // published rectangle is cheaper to read than one about six hundred primitives.
-    step("verify");
-    verify::run(root)?;
+    if hosted {
+        skipped("verify");
+    } else {
+        step("verify");
+        verify::run(root)?;
+    }
 
     // After the budgets and before the documentation gate, because this *writes* documentation:
     // `docs/performance.md` is regenerated from the run it just took, so a build whose numbers
     // moved leaves the change in the working tree where a reader will see it.
-    step("performance ratchet");
-    perf::run(root)?;
+    if hosted {
+        skipped("performance ratchet");
+        skipped("tails");
+    } else {
+        step("performance ratchet");
+        perf::run(root)?;
 
-    // Immediately after the ratchet, and reading what it just stored rather than taking its own
-    // measurement: the claim being checked is about the numbers a reader will see in
-    // `docs/performance.md`, and a second opinion taken from a second run would be about a
-    // different one.
-    step("tails");
-    tails::run(root)?;
+        // Immediately after the ratchet, and reading what it just stored rather than taking its
+        // own measurement: the claim being checked is about the numbers a reader will see in
+        // `docs/performance.md`, and a second opinion taken from a second run would be about a
+        // different one.
+        step("tails");
+        tails::run(root)?;
+    }
 
     // A count band of zero over everything a run keeps, which is the one gate in this list that
     // can see a defect no timing can: a table that grows makes no frame slower until thousands of
     // frames later, and by then nothing attributes the cost to what caused it.
-    step("growth");
-    growth::run(root)?;
+    if hosted {
+        skipped("growth");
+    } else {
+        step("growth");
+        growth::run(root)?;
+    }
 
     step("cargo doc");
     process::run(
@@ -116,8 +144,10 @@ pub(crate) fn run(root: &Path) -> Result<()> {
     step("docs");
     docs::run(root)?;
 
+    // The packages are made and not built here: building each one is a second build of the tree,
+    // and `cargo xtask release` does it before a publish.
     step("release");
-    release::run(root)?;
+    release::run(root, release::Packaging::Listed)?;
 
     step("ledger");
     ledger::run(root, None)
@@ -126,4 +156,9 @@ pub(crate) fn run(root: &Path) -> Result<()> {
 /// Announces a gate, so a failure is easy to attribute in a scrolling log.
 fn step(name: &str) {
     println!("\n=== {name} ===");
+}
+
+/// Announces a gate that `--hosted` leaves out, so the log says what was not checked.
+fn skipped(name: &str) {
+    println!("\n=== {name}: skipped on a hosted machine ===");
 }

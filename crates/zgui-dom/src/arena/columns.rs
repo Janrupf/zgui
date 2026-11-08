@@ -22,7 +22,7 @@
 //! | [`observed`](Columns::observed) | sparse | almost nothing is watched |
 //! | [`anim`](Columns::anim) | sparse | live only while a cheap animation runs |
 //! | [`state_mask`](Columns::state_mask) | sparse | only nodes something has written to |
-//! | [`paint_key`](Columns::paint_key) | **dense** | every styled node is compared every restyle |
+//! | [`paint_key`](Columns::paint_key) | **dense** | every styled node is compared every restyle; a slot is two pointers wide |
 //! | [`a11y_key`](Columns::a11y_key) | **dense** | the same, one projection over |
 //!
 //! Columns are never written while the style traversal runs, which is the same frame discipline the
@@ -40,7 +40,7 @@ use crate::side::custom_state::CustomStates;
 use crate::side::inline_style::StyleBlock;
 use crate::side::listeners::ListenerSet;
 use crate::side::observed::ObservationSlots;
-use crate::side::paint_key::PaintStyleKey;
+use crate::side::paint_key::PaintStyleHeld;
 use crate::side::props::PropMap;
 use crate::side::semantics::SemanticsSlot;
 
@@ -72,10 +72,12 @@ pub struct Columns {
     /// changed". It is here rather than in the record because only nodes something writes to ever
     /// get an entry, and a document is mostly nodes nothing writes to.
     pub state_mask: PagedVec<NodeKey, StateMaskSlot>,
-    /// Identity of everything this node's painted appearance depends on.
-    pub paint_key: SlotVec<NodeKey, PaintStyleKey>,
+    /// The styles this node's paint key was last computed from.
+    pub paint_key: SlotVec<NodeKey, PaintStyleHeld>,
     /// Identity of everything this node's accessible description depends on.
     pub a11y_key: SlotVec<NodeKey, A11yKey>,
+    /// Which custom properties this node's rules read, own and below.
+    pub readers: SlotVec<NodeKey, crate::side::readers::Readers>,
 }
 
 impl Columns {
@@ -99,6 +101,7 @@ impl Columns {
             state_mask: PagedVec::for_domain(domain),
             paint_key: SlotVec::for_domain(domain),
             a11y_key: SlotVec::for_domain(domain),
+            readers: SlotVec::for_domain(domain),
         }
     }
 
@@ -140,6 +143,7 @@ impl Columns {
         self.state_mask.clear(key);
         self.paint_key.remove(key);
         self.a11y_key.remove(key);
+        self.readers.remove(key);
     }
 
     /// Drops every sparse page nothing is stored on any more.

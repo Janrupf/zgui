@@ -4,7 +4,7 @@ use zgui_geom::{DevicePx, Point};
 use zgui_layout::FragmentFlags;
 use zgui_layout::fragment::diff::Everything;
 
-use crate::probe::{box_named, own_fragment};
+use crate::probe::{box_named, device_box, drawn_matrix, own_fragment};
 use crate::support::{Element, Fixture, fragments, lay_out, measurer};
 
 #[test]
@@ -22,12 +22,11 @@ fn a_fragment_sits_where_the_whole_ancestor_chain_puts_it() {
     );
     let mut store = fixture.box_tree();
     let mut content = measurer();
-    lay_out(&mut store, &mut content, 400.0, 400.0);
+    let frame = lay_out(&mut store, &mut content, 400.0, 400.0);
 
     let inner = box_named(&store, &fixture, "inner");
-    let fragment = own_fragment(&store, inner);
     assert_eq!(
-        fragment.border_box.origin,
+        device_box(&store, &frame, inner).origin,
         Point::new(DevicePx(17.0), DevicePx(17.0)),
         "10 of the root's padding, 2 of the outer's border and 5 of its padding"
     );
@@ -82,7 +81,7 @@ fn a_scrolled_container_moves_its_contents_and_leaves_itself_alone() {
 
     let port = box_named(&store, &fixture, "port");
     let row = box_named(&store, &fixture, "row");
-    let before = own_fragment(&store, row).border_box.origin.y.0;
+    let before = device_box(&store, &frame, row).origin.y.0;
 
     let scrolled = frame.scroll.scroll_to(
         &store,
@@ -97,12 +96,12 @@ fn a_scrolled_container_moves_its_contents_and_leaves_itself_alone() {
     fragments(&mut frame, &mut store, root, &mut Everything);
 
     assert_eq!(
-        own_fragment(&store, row).border_box.origin.y.0,
+        device_box(&store, &frame, row).origin.y.0,
         before - 60.0,
         "the row moved up by the scroll offset"
     );
     assert_eq!(
-        own_fragment(&store, port).border_box.origin.y.0,
+        device_box(&store, &frame, port).origin.y.0,
         0.0,
         "the container itself did not move"
     );
@@ -164,7 +163,7 @@ fn a_sticky_header_stops_at_the_top_of_its_scrollport() {
             .flags
             .contains(FragmentFlags::IS_STICKY)
     );
-    assert_eq!(own_fragment(&store, head).border_box.origin.y.0, 100.0);
+    assert_eq!(device_box(&store, &frame, head).origin.y.0, 100.0);
 
     // Scrolled past where the header sat, it stays at the top of the port instead of leaving it.
     frame.scroll.scroll_to(
@@ -178,7 +177,7 @@ fn a_sticky_header_stops_at_the_top_of_its_scrollport() {
     let root = store.root().expect("a root");
     fragments(&mut frame, &mut store, root, &mut Everything);
     assert_eq!(
-        own_fragment(&store, head).border_box.origin.y.0,
+        device_box(&store, &frame, head).origin.y.0,
         0.0,
         "the header is held at the scrollport's top edge"
     );
@@ -214,6 +213,135 @@ fn a_positive_z_index_paints_after_a_later_sibling() {
     );
 }
 
+/// The paint order of the named boxes, as the positions each holds in the document's paint order.
+fn painted(store: &zgui_layout::LayoutStore, fixture: &Fixture, names: &[&str]) -> Vec<usize> {
+    let root = store.root().expect("a root");
+    let order = zgui_layout::fragment::stacking::paint_order(store, root);
+    names
+        .iter()
+        .map(|name| {
+            let key = box_named(store, fixture, name);
+            order.iter().position(|held| *held == key).expect("painted")
+        })
+        .collect()
+}
+
+/// Whether `values` is strictly increasing.
+fn increasing(values: &[usize]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+#[test]
+fn an_absolute_box_paints_before_a_later_positioned_sibling() {
+    // Both positioned with `z-index: auto`, so tree order decides. The absolute box is appended to
+    // its containing block's layout list, and must still paint first.
+    let fixture = Fixture::new(
+        Element::new("root").children(vec![
+            Element::new("a").children(vec![Element::new("r"), Element::new("c")]),
+        ]),
+        "root { display: block; width: 200px }
+         a { display: block; position: relative; height: 20px }
+         r { display: block; position: absolute; top: 50%; left: 0; right: 0; height: 4px }
+         c { display: block; position: relative; width: 50px; margin: 0 auto; height: 20px }",
+    );
+    let mut store = fixture.box_tree();
+    let mut content = measurer();
+    lay_out(&mut store, &mut content, 200.0, 200.0);
+    assert!(increasing(&painted(&store, &fixture, &["r", "c"])));
+}
+
+#[test]
+fn an_absolute_box_in_a_static_wrapper_paints_before_a_later_positioned_sibling() {
+    // Written inside a static box, positioned by the box around that one.
+    let fixture = Fixture::new(
+        Element::new("root").children(vec![Element::new("a").children(vec![
+            Element::new("before"),
+            Element::new("wrap").children(vec![Element::new("r")]),
+            Element::new("c"),
+        ])]),
+        "root { display: block; width: 200px }
+         a { display: block; position: relative; height: 60px }
+         before { display: block; position: relative; height: 10px }
+         wrap { display: block; height: 10px }
+         r { display: block; position: absolute; inset: 0 }
+         c { display: block; position: relative; height: 20px }",
+    );
+    let mut store = fixture.box_tree();
+    let mut content = measurer();
+    lay_out(&mut store, &mut content, 200.0, 200.0);
+    assert!(increasing(&painted(
+        &store,
+        &fixture,
+        &["before", "r", "c"]
+    )));
+}
+
+#[test]
+fn z_index_still_orders_an_absolute_box_before_tree_order() {
+    let fixture = Fixture::new(
+        Element::new("root").children(vec![Element::new("a").children(vec![
+            Element::new("low"),
+            Element::new("up"),
+            Element::new("c"),
+        ])]),
+        "root { display: block; width: 200px }
+         a { display: block; position: relative; height: 40px }
+         low { display: block; position: absolute; inset: 0; z-index: -1 }
+         up { display: block; position: absolute; inset: 0; z-index: 1 }
+         c { display: block; position: relative; height: 20px }",
+    );
+    let mut store = fixture.box_tree();
+    let mut content = measurer();
+    lay_out(&mut store, &mut content, 200.0, 200.0);
+    assert!(increasing(&painted(&store, &fixture, &["low", "c", "up"])));
+}
+
+#[test]
+fn several_absolute_boxes_keep_tree_order_among_positioned_siblings() {
+    let fixture = Fixture::new(
+        Element::new("root").children(vec![Element::new("a").children(vec![
+            Element::new("one"),
+            Element::new("two"),
+            Element::new("mid"),
+            Element::new("three"),
+            Element::new("last"),
+        ])]),
+        "root { display: block; width: 200px }
+         a { display: block; position: relative; height: 40px }
+         one, two, three { display: block; position: absolute; inset: 0 }
+         mid, last { display: block; position: relative; height: 10px }",
+    );
+    let mut store = fixture.box_tree();
+    let mut content = measurer();
+    lay_out(&mut store, &mut content, 200.0, 200.0);
+    assert!(increasing(&painted(
+        &store,
+        &fixture,
+        &["one", "two", "mid", "three", "last"]
+    )));
+}
+
+#[test]
+fn flex_order_still_moves_painting_around_an_absolute_box() {
+    // `order` moves the in-flow items; the absolute box paints after the item written before it.
+    let fixture = Fixture::new(
+        Element::new("root").children(vec![Element::new("a").children(vec![
+            Element::new("x"),
+            Element::new("r"),
+            Element::new("y"),
+        ])]),
+        "root { display: block; width: 200px }
+         a { display: flex; position: relative; height: 40px }
+         x { display: block; position: relative; width: 20px; order: 2 }
+         y { display: block; position: relative; width: 20px; order: 1 }
+         r { display: block; position: absolute; inset: 0 }",
+    );
+    let mut store = fixture.box_tree();
+    let mut content = measurer();
+    lay_out(&mut store, &mut content, 200.0, 200.0);
+    assert!(increasing(&painted(&store, &fixture, &["y", "x", "r"])));
+}
+
 #[test]
 fn a_fixed_box_at_half_the_viewport_pulled_back_by_half_itself_is_centred() {
     // How every modal dialog is centred, and the only arrangement that centres one whose size is
@@ -243,17 +371,14 @@ fn a_fixed_box_at_half_the_viewport_pulled_back_by_half_itself_is_centred() {
     // A transform does not move the layout box, so the box itself is at the centre; what centres
     // the panel is the matrix the fragment carries.
     assert_eq!(
-        fragment.border_box.origin,
+        device_box(&store, &frame, panel).origin,
         Point::new(DevicePx(400.0), DevicePx(300.0)),
         "half the viewport, which is where the leading corner belongs before the pull-back"
     );
     let id = fragment
         .transform
         .expect("a translated panel carries a matrix");
-    let matrix = frame
-        .spatial
-        .resolve(id)
-        .expect("the name resolves to a matrix");
+    let matrix = drawn_matrix(&frame, id);
     assert_eq!(
         (matrix.columns[3][0], matrix.columns[3][1]),
         (-200.0, -100.0),

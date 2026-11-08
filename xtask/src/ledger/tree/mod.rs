@@ -13,7 +13,6 @@ pub(crate) mod sources;
 use std::path::Path;
 
 use crate::error::Result;
-use crate::ledger::phases::PhaseMap;
 use crate::ledger::tree::features::{FeatureSource, FeatureTree};
 use crate::ledger::tree::lock::Lock;
 use crate::ledger::tree::manifest::Manifest;
@@ -32,8 +31,6 @@ pub(crate) struct Tree {
     pub(crate) notice: String,
     /// The resolved versions.
     pub(crate) lock: Lock,
-    /// Which phase introduces which crate.
-    pub(crate) phases: PhaseMap,
     /// The resolved feature graph.
     pub(crate) features: FeatureTree,
 }
@@ -55,7 +52,6 @@ impl Tree {
             prose: sources::prose(root)?,
             notice,
             lock: Lock::load(root)?,
-            phases: PhaseMap::load(root)?,
             features: FeatureTree::gather(root, features)?,
         })
     }

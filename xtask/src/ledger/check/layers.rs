@@ -2,13 +2,8 @@
 //!
 //! The workspace's one architectural rule: a dependency points at the crate's own layer or at a
 //! lower one. `docs/guide/layering.md` states it, and every layered manifest declares its layer
-//! in a `# L<n> — …` header.
-//!
-//! [`topo`](super::topo) asks a related question — a crate may not depend on one that arrives in
-//! a later implementation phase — against the schedule in `docs/planning/PHASES.md`, a local file
-//! that is never committed. On a clone that has none, `topo` prints `ok` and a second line saying
-//! it skipped. This check reads only what is committed, so a fork with no schedule gets the same
-//! answer as the tree the schedule was written for.
+//! in a `# L<n> — …` header. This check reads only what is committed, so a fork gets the same
+//! answer as this tree.
 //!
 //! # Members with no header
 //!

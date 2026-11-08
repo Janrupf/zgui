@@ -7,7 +7,7 @@
 //! while it drives.
 //!
 //! The loop and the renderer are coupled through that map and through nothing else. Neither half
-//! draws anything without the other, so `App::run_drm` makes one [`Displays`] and gives it to both.
+//! draws anything without the other, so `zgui_console::RunDrm::run_drm` makes one [`Displays`] and gives it to both.
 //!
 //! # The state the two halves share
 //!
@@ -33,14 +33,12 @@
 
 use std::cell::RefCell;
 use std::ops::Range;
-use std::os::fd::AsFd;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use zgui_drm::Device;
 use zgui_drm::commit::Commit;
 use zgui_platform::{PlatformError, SurfaceId};
-use zgui_render_wgpu::target::swapchain::PeerCopy;
 use zgui_render_wgpu::{Gpu, Pixels, wgpu};
 
 use crate::cursor::Cursor;
@@ -196,14 +194,6 @@ impl DrmDisplay {
     /// answers is staging, and the display's own device puts a frame on the buffer it reads.
     pub fn composites_its_own_frames(&self) -> bool {
         self.scanout.borrow().composites_its_own_frames()
-    }
-
-    /// Returns something that can copy between this display's buffers without the renderer.
-    ///
-    /// [`Scanout::peer_copy`]'s own answer, over this display's own node. Asked once, beside
-    /// [`DrmDisplay::textures`], because it is settled when the buffers are made and never moves.
-    pub fn peer_copy(&self) -> Option<Box<dyn PeerCopy>> {
-        self.scanout.borrow_mut().peer_copy(self.device.as_fd())
     }
 
     /// Takes the buffer the next frame is drawn into back from the display engine, and names it.

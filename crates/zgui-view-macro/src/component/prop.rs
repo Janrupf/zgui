@@ -160,13 +160,18 @@ impl Prop {
                 ),
                 None => (quote!(value: #ty), quote!(value)),
             },
-            Conversion::Into => {
-                let ty = self.optional_inner().unwrap_or_else(|| ty.clone());
-                (
+            // An optional prop takes a value or an `Option` of one, for the reason the exact
+            // conversion above does.
+            Conversion::Into => match self.optional_inner() {
+                Some(inner) => (
+                    quote!(value: impl ::zgui::expansion::view::IntoOptionalProp<#inner, __OptionalShape>),
+                    quote!(::zgui::expansion::view::IntoOptionalProp::into_optional_prop(value)),
+                ),
+                None => (
                     quote!(value: impl ::core::convert::Into<#ty>),
-                    stored(quote!(::core::convert::Into::into(value))),
-                )
-            }
+                    quote!(::core::convert::Into::into(value)),
+                ),
+            },
             Conversion::Reactive(inner) => (
                 quote!(value: impl ::zgui::expansion::view::IntoReactiveValue<#inner, __ValueShape>),
                 stored(quote!(
@@ -186,7 +191,11 @@ impl Prop {
 
     /// The extra type parameter the setter needs, when its conversion has one.
     pub(crate) fn setter_generics(&self) -> Option<proc_macro2::TokenStream> {
-        matches!(self.conversion, Conversion::Reactive(_)).then(|| quote!(__ValueShape))
+        match self.conversion {
+            Conversion::Reactive(_) => Some(quote!(__ValueShape)),
+            Conversion::Into if self.optional_inner().is_some() => Some(quote!(__OptionalShape)),
+            _ => None,
+        }
     }
 
     /// What the prop is when it was not given.

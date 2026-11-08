@@ -25,6 +25,7 @@
 //! rewritten in place is the same box. And a patch that cannot express what changed has to say so,
 //! so that the caller rebuilds rather than laying out a tree that no longer describes the document.
 
+pub mod custom;
 pub mod structure;
 pub mod style;
 pub mod subtree;
@@ -33,4 +34,4 @@ pub mod text;
 pub use crate::boxtree::patch::structure::{detach, replace};
 pub use crate::boxtree::patch::style::restyle;
 pub use crate::boxtree::patch::subtree::{Rebuilt, rebuild};
-pub use crate::boxtree::patch::text::{Refusal, Retext, Retexted, retext, walk};
+pub use crate::boxtree::patch::text::{Retext, retext};

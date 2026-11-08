@@ -35,6 +35,9 @@ use crate::carousel::{SHEET, style};
 /// narrow slide and stops short of every wide one, and a viewport holding two slides at once has
 /// no whole number of viewports that is one slide.
 ///
+/// The track never travels past the point where the last slide sits against the trailing edge,
+/// so a viewport that holds several slides shows no empty space after the last one.
+///
 /// Which slide is showing is published beside it as `--zui-carousel-index`, a plain number, for a
 /// sheet that wants to count rather than to measure.
 #[component]
@@ -50,8 +53,8 @@ pub fn CarouselContent(
 ) -> impl IntoView {
     install_stylesheet(SHEET, CarouselStyle::CSS);
     let context = CarouselContext::current();
-    let track = NodeRef::new();
-    let measured = track.observe_border_box();
+    let track = context.map_or_else(NodeRef::new, CarouselContext::track);
+    let measured = context.map_or_else(|| track.observe_border_box(), CarouselContext::track_box);
     let vertical = context
         .map(CarouselContext::orientation)
         .is_some_and(|orientation| matches!(orientation, Orientation::Vertical));
@@ -63,17 +66,20 @@ pub fn CarouselContent(
     // moves the track and every slide on it together, so the distance between them is the one
     // number the offset itself cannot disturb.
     let travelled = move || {
-        let start = context?.start_of_showing()?;
+        let context = context?;
+        let start = context.start_of_showing()?;
         let box_ = measured.get()?;
         let from = if vertical {
             box_.origin.y.0
         } else {
             box_.origin.x.0
         };
+        // No further than the last slide against the trailing edge.
+        let travel = context.reach().map_or(f32::INFINITY, |reach| reach.travel);
         // Device pixels are what geometry is observed in and CSS pixels are what a sheet is
         // written in; the two differ by the window's scale on every display that is not exactly 1×.
         let scale = track.scale();
-        let distance = (start - from) / if scale > 0.0 { scale } else { 1.0 };
+        let distance = (start - from).min(travel) / if scale > 0.0 { scale } else { 1.0 };
         distance.is_finite().then_some(distance)
     };
 

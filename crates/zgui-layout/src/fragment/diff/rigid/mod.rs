@@ -1,10 +1,11 @@
 //! Moving a subtree that only moved.
 //!
-//! A scroll is the case this exists for. Nothing inside a scrolled container is restyled, relaid
-//! out or re-broken; every piece of it is the same piece, the same size and the same shape, one
-//! offset further along. Composing it again arrives at exactly that answer after reading each box's
-//! style five times, resolving its sticky offset, re-deriving its ink and comparing the result
-//! against what was already there — for every box, on every frame of the glide.
+//! Layout often moves a subtree and changes nothing in it: the rows after a row that grew, or the
+//! children of a sticky box whose offset changed, or the rows of a scroll container that keeps its
+//! children in its own space (see [`scroll_nodes`](crate::fragment::scroll_nodes)). Every piece of
+//! it is the same piece, the same size and the same shape, one offset further along. Composing it
+//! again arrives at exactly that answer after reading each box's style five times, resolving its
+//! sticky offset, re-deriving its ink and comparing the result against what was already there.
 //!
 //! So the geometry is offset instead. What that is allowed to skip is the whole of what
 //! [`build::place`](crate::fragment::build::place) computes; what it is *not* allowed to skip is
@@ -12,6 +13,9 @@
 //! now are, and the accessibility marks a moved control owes. Those are done here, in the terms the
 //! comparing walk states them in, so that a frame produced this way and a frame produced by
 //! composing every box put the same pixels on the screen.
+//!
+//! A scroll of a container that draws its children in a content space writes that space and
+//! reaches none of this.
 //!
 //! # What makes a subtree eligible
 //!
@@ -56,11 +60,10 @@ mod duty;
 mod walk;
 
 use zgui_dom::side::BoxKey;
-use zgui_geom::{Device, DevicePx, Rect, Size};
+use zgui_geom::{Device, DevicePx, Size};
 use zgui_scene::ClipId;
 
 use crate::fragment::FragmentFlags;
-use crate::fragment::diff::damage::absorb;
 use crate::fragment::diff::dirty::FrameDirty;
 use crate::fragment::diff::split::{self, Part, Passes};
 use crate::fragment::diff::{Folded, Pass};
@@ -72,6 +75,13 @@ use self::walk::Walk;
 pub(super) struct Move {
     /// The offset every piece of it takes.
     pub(super) by: (f32, f32),
+    /// How far the scroll and sticky offsets above the subtree moved: all of `by` for a change of
+    /// shift, and the part of a layout move that a scroll in the same frame added.
+    ///
+    /// Every box the move carries adds it to the shift its contents were composed against. A box
+    /// left with the old shift reads the same scroll as a movement again the next time it is
+    /// composed, and offsets its clean contents twice.
+    pub(super) scrolled: (f32, f32),
     /// The chain the subtree's own root is drawn under, after the move.
     pub(super) clip: ClipId,
     /// Everything the scroll and sticky offsets above the subtree add up to, after the move.
@@ -116,45 +126,44 @@ impl<D: FrameDirty> Pass<'_, '_, D> {
     /// bounded damage set converges to after absorbing the pieces one at a time anyway.
     pub(super) fn translate(&mut self, key: BoxKey, moved: Move) -> Folded {
         let Some(&root) = self.store.fragments_of_box(key).first() else {
-            return Folded {
-                subtree_ink: Rect::ZERO,
-                blending: false,
-                disjoint: true,
-                rigid: true,
-            };
+            return Folded::empty();
         };
         let Some(fragment) = self.store.fragment(root) else {
-            return Folded {
-                subtree_ink: Rect::ZERO,
-                blending: false,
-                disjoint: true,
-                rigid: true,
-            };
+            return Folded::empty();
         };
         let before = fragment.subtree_ink;
+        let anchor = fragment.anchor;
         let folded = Folded {
             subtree_ink: before.translate(moved.size()),
             blending: fragment
                 .flags
                 .contains(FragmentFlags::HAS_BLENDING_DESCENDANT),
+            reads: fragment.flags.intersects(FragmentFlags::READS_BACKDROP),
             disjoint: fragment.subtree_disjoint,
             rigid: true,
+            order: self.store.subtree_order(key),
+            anchor: Some(anchor),
+            bound: fragment.flags.intersection(FragmentFlags::BOUND),
         };
-        // Recorded before the damage rather than after, so that a caller reading
-        // [`RigidMoves`](super::RigidMoves) sees every move that put a rectangle in the set.
-        self.moves.moved(moved.by);
-        absorb(self.damage, before);
-        absorb(self.damage, folded.subtree_ink);
+        // The frame cannot answer this by moving pixels: what was under the subtree is now
+        // something else, and so is what is under where it went. Both land beyond any rigid move
+        // the frame reports, so a caller that moves the pixels of a content space in the same
+        // frame still draws them.
+        let admitted = self.admitted(moved.clip);
+        let was = self.device_before(before, anchor);
+        self.damage_drawn_beyond_a_move(was, super::Admitted::everything());
+        let is = self.device_now(folded.subtree_ink, anchor);
+        self.damage_beyond_a_move(is, admitted);
+        // Inside a content space that moved, the frame may move the port's pixels by the space's
+        // vector, and the subtree's old pixels go with them. For a row that layout moved in the
+        // frame the port scrolled, no box above damages that rectangle.
+        if let Some(by) = self.chase.by {
+            let carried = was.translate(Size::new(DevicePx(by.0), DevicePx(by.1)));
+            self.damage_beyond_a_move(carried, admitted);
+        }
 
         let scale = self.tables.device.scale;
-        let mut walk = Walk::over(
-            self.store,
-            self.hit,
-            self.tables,
-            self.dirty,
-            moved.size(),
-            scale,
-        );
+        let mut walk = Walk::over(self.store, self.hit, self.tables, self.dirty, moved, scale);
         match self.passes {
             Passes::Together => walk.subtree::<duty::Both>(key, moved.clip, moved.shift()),
             Passes::TogetherTimed => {

@@ -35,6 +35,10 @@ style! { pub DataTableStyle =>
         border-radius: var(--zui-radius-md);
         max-height: var(--zui-data-table-height, none);
     }"
+    // A virtualised body decides its window from `row_size`, so every body cell is that tall.
+    ":scope .zui-data-table__grid[data-virtualized=\"true\"] .zui-table__body .zui-table__cell {
+        height: var(--zui-data-table-row);
+    }"
     // The two spacers a virtualised body puts in place of the rows it did not build. Grid items
     // spanning every column, so the scrollbar is the length of the whole table.
     ":scope .zui-data-table__spacer {
@@ -64,6 +68,19 @@ style! { pub DataTableStyle =>
         text-align: inherit;
         transition: background-color var(--zui-motion-duration-normal) var(--zui-motion-ease-standard),
                     color var(--zui-motion-duration-normal) var(--zui-motion-ease-standard);
+    }"
+    // A heading at the end or in the middle follows its column. The grip then takes no room in the
+    // row, and the button reaches over the cell's end padding as it does over the start padding, so
+    // the heading lines up with the cells below it.
+    ":scope .zui-table__head[data-align=\"end\"] > .zui-data-table__sort { justify-content: flex-end; }"
+    ":scope .zui-table__head[data-align=\"center\"] > .zui-data-table__sort { justify-content: center; }"
+    ":scope .zui-table__head[data-align=\"end\"] > .zui-data-table__sort,
+     :scope .zui-table__head[data-align=\"center\"] > .zui-data-table__sort {
+        margin-right: calc(0px - var(--zui-space-sm));
+    }"
+    ":scope .zui-table__head[data-align=\"end\"] > .zui-data-table__grip,
+     :scope .zui-table__head[data-align=\"center\"] > .zui-data-table__grip {
+        margin-left: -6px;
     }"
     ":scope .zui-data-table__sort:hover {
         background-color: var(--zui-color-accent);

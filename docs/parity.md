@@ -29,10 +29,10 @@ not a backlog, so it is never added to what is left to do.
 | Property names the engine generates | 322 |
 | Distinct longhands behind them | 250 |
 | Classified | 250 |
-| Implemented | 178 |
-| Parsed and cascaded, not yet implemented | 72 |
+| Implemented | 179 |
+| Parsed and cascaded, not yet implemented | 71 |
 | Classified as unavailable from the engine | 0 |
-| Shown by probe to change what a frame produces | 159 |
+| Shown by probe to change what a frame produces | 160 |
 | Out of reach: defined by the engine for another target only | 172 |
 | Out of reach: register rows | 7 |
 | Not yet implemented: register rows | 0 |
@@ -204,7 +204,7 @@ it. It is not a plan.
 | `clip` | unread | no observable change | nothing paints yet, so nothing reads it |
 | `clip-path` | implemented | changes what a frame produces | zgui-layout::fragment |
 | `color` | implemented | changes what a frame produces | zgui-text-style::lower::paint |
-| `color-scheme` | unread | no observable change | no probe has shown it changing a shaped line, and no module reads it |
+| `color-scheme` | implemented | changes what a frame produces | zgui-paint::lower::scrollbar |
 | `column-count` | unread | no observable change | no probe has shown it moving an edge, and no module reads it |
 | `column-gap` | implemented | changes what a frame produces | zgui-layout::style::flex |
 | `column-span` | unread | no observable change | no probe has shown it moving an edge, and no module reads it |

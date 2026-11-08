@@ -17,8 +17,8 @@ use zgui_geom::{Css, CssPx, Size};
 use zgui_reactive::prelude::*;
 use zgui_reactive::{ArcTrigger, RenderEffect, RwSignal};
 use zgui_view::{
-    Anchor, BuildCx, DomHandle, NodeId, ObservationHandle, Observed, ObservedValue, PropKey,
-    PropValue, View,
+    Anchor, BuildCx, DomHandle, HostHandle, NodeId, ObservationHandle, Observed, ObservedValue,
+    PropKey, PropValue, View,
 };
 use zgui_vocab::prop::drawing;
 
@@ -60,6 +60,19 @@ impl CanvasHandle {
         result
     }
 
+    /// Sets the scene's view transform, and marks every element showing it for repaint when the
+    /// view moved.
+    ///
+    /// The transform maps canvas units to canvas units before the view-box fit. It moves every
+    /// shape and series and moves no revision. A pan or a zoom builds no new geometry for the
+    /// series and for the shapes that become analytic quads or marks; a turn or a stretch, for the
+    /// series only. Other shapes are placed again under each view.
+    pub fn set_transform(&self, transform: kurbo::Affine) {
+        if self.scene.set_transform(transform) {
+            self.changed.notify();
+        }
+    }
+
     /// The thread-safe half, for a producer that draws from off the UI thread.
     ///
     /// Edits through it move the scene's revision but wake nobody: pair it with a signal or a
@@ -79,16 +92,23 @@ impl Default for CanvasHandle {
 impl Element<Canvas> {
     /// Shows `handle`'s scene in this element.
     ///
-    /// The binding writes the scene's token and revision as a property and tracks the handle's
-    /// change edge, so a [`CanvasHandle::draw`] elsewhere becomes a value change here, and a
-    /// value change is a repaint of exactly this element.
+    /// The binding writes the scene's token and revision, and its view counter, as two
+    /// properties, and tracks the handle's change edge. So a [`CanvasHandle::draw`] or a
+    /// [`CanvasHandle::set_transform`] elsewhere becomes a value change here, and a value change
+    /// is a repaint of exactly this element.
     #[must_use]
     pub fn scene(self, handle: &CanvasHandle) -> Self {
         let scene = handle.scene.clone();
         let changed = handle.changed.clone();
+        let viewed = handle.scene.clone();
+        let moved = handle.changed.clone();
         self.property(PropKey::new(drawing::CANVAS), move || {
             changed.track();
             PropValue::Integer(drawing::canvas_value(scene.token().0, scene.revision()))
+        })
+        .property(PropKey::new(drawing::CANVAS_VIEW), move || {
+            moved.track();
+            PropValue::Integer(viewed.view() as i64)
         })
     }
 
@@ -146,7 +166,8 @@ impl Element<Canvas> {
 
 /// One run of a canvas closure: the scene to draw into, and the box it is drawn in.
 pub struct DrawCx<'a> {
-    /// The scene, already cleared for this run.
+    /// The scene, already cleared for this run. The view transform
+    /// ([`CanvasScene::set_transform`]) stays between runs.
     pub scene: &'a mut CanvasScene,
     /// The element's content box size, in CSS pixels. Zero until the first layout has run.
     pub size: Size<CssPx, Css>,
@@ -201,11 +222,11 @@ impl<F: Fn(&mut DrawCx<'_>) + 'static> View for DrawnCanvas<F> {
     fn build(self, cx: &mut BuildCx<'_>) -> Self::State {
         let handle = CanvasHandle::new();
         let size = cx.with_owner(|| RwSignal::new(Size::new(CssPx(0.0), CssPx(0.0))));
-        let scale = cx.host().scale();
+        let host = cx.host().clone();
 
         let element = self.element.scene(&handle).build(cx);
-        let observation = observe_content_size(cx.dom(), element.node(), size, scale);
-        let effect = start(cx, handle.clone(), size, scale, self.draw);
+        let observation = observe_content_size(cx.dom(), element.node(), size, host.clone());
+        let effect = start(cx, handle.clone(), size, host, self.draw);
 
         DrawnCanvasState {
             element,
@@ -225,31 +246,29 @@ impl<F: Fn(&mut DrawCx<'_>) + 'static> View for DrawnCanvas<F> {
         // The closure is replaced, not accumulated: the state described by *this* description is
         // what the new closure draws, and the old effect dropped here is what stops the previous
         // one running beside it.
-        let scale = cx.host().scale();
+        let host = cx.host().clone();
         state.effect = None;
-        state.effect = Some(start(
-            cx,
-            state.handle.clone(),
-            state.size,
-            scale,
-            self.draw,
-        ));
+        state.effect = Some(start(cx, state.handle.clone(), state.size, host, self.draw));
     }
 }
 
 /// Registers the content-size observation that feeds `size`.
+///
+/// The scale is read when a size arrives, so a canvas built before its window knew its scale factor,
+/// or one whose window moved to another scale since, still reports its size in CSS pixels.
 fn observe_content_size(
     dom: &DomHandle,
     node: NodeId,
     size: RwSignal<Size<CssPx, Css>>,
-    scale: f32,
+    host: HostHandle,
 ) -> ObservationHandle {
-    let scale = if scale > 0.0 { scale } else { 1.0 };
     dom.observe(
         node,
         Observed::ContentSize,
         Rc::new(move |value: ObservedValue| {
             if let Some(device) = value.as_content_size() {
+                let scale = host.scale();
+                let scale = if scale > 0.0 { scale } else { 1.0 };
                 size.set(Size::new(
                     CssPx(device.width.0 / scale),
                     CssPx(device.height.0 / scale),
@@ -264,7 +283,7 @@ fn start<F: Fn(&mut DrawCx<'_>) + 'static>(
     cx: &BuildCx<'_>,
     handle: CanvasHandle,
     size: RwSignal<Size<CssPx, Css>>,
-    scale: f32,
+    host: HostHandle,
     draw: F,
 ) -> RenderEffect<()> {
     cx.with_owner(|| {
@@ -275,7 +294,7 @@ fn start<F: Fn(&mut DrawCx<'_>) + 'static>(
                 draw(&mut DrawCx {
                     scene,
                     size: current,
-                    scale,
+                    scale: host.scale(),
                 });
             });
         })
@@ -313,17 +332,24 @@ mod tests {
 
     /// The stub scaffolding every test here mounts into.
     fn harness() -> (Rc<StubDom>, DomHandle, Mounted, BuildCxOwned) {
+        let (backend, dom, window, cx, _) = scaled_harness();
+        (backend, dom, window, cx)
+    }
+
+    /// The scaffolding, with the host kept so a test can change its scale.
+    fn scaled_harness() -> (Rc<StubDom>, DomHandle, Mounted, BuildCxOwned, Rc<StubHost>) {
         zgui_reactive::install().ok();
         let backend = Rc::new(StubDom::new(DocumentId::FIRST));
         let dom = DomHandle::from_rc(backend.clone() as Rc<dyn Dom>);
         let window = Mounted::new();
+        let host = Rc::new(StubHost::default());
         let cx = BuildCxOwned::new(
             dom.clone(),
-            HostHandle::new(StubHost::default()),
+            HostHandle::from_rc(host.clone() as Rc<dyn zgui_view::ViewHost>),
             window.owner().clone(),
             DocumentId::FIRST,
         );
-        (backend, dom, window, cx)
+        (backend, dom, window, cx, host)
     }
 
     #[test]
@@ -347,6 +373,32 @@ mod tests {
             before, after,
             "a draw moves the revision, and the binding rewrites the property"
         );
+        window.unmount();
+    }
+
+    #[test]
+    fn set_transform_rewrites_the_view_and_leaves_the_reference() {
+        let (backend, dom, window, cx) = harness();
+        let handle = CanvasHandle::new();
+        let root = dom.create_element(ElementName::new("box"));
+        let mut built = window.with(|| canvas().scene(&handle).build(&mut cx.cx()));
+        built.mount(&dom, root, None);
+
+        let node = built.first_node().expect("the element is a node");
+        let reference = PropKey::new(drawing::CANVAS);
+        let view = PropKey::new(drawing::CANVAS_VIEW);
+        let before = backend.property(node, reference).expect("written");
+        let view_before = backend.property(node, view).expect("written");
+
+        handle.set_transform(kurbo::Affine::translate((12.0, 0.0)));
+        zgui_reactive::flush();
+        assert_eq!(
+            backend.property(node, reference).expect("still written"),
+            before,
+            "a view transform moves no revision"
+        );
+        let view_after = backend.property(node, view).expect("still written");
+        assert_ne!(view_before, view_after, "the view moved");
         window.unmount();
     }
 
@@ -388,6 +440,35 @@ mod tests {
         assert_ne!(
             at_zero, at_size,
             "the size arriving re-ran the closure, which is a new revision"
+        );
+        window.unmount();
+    }
+
+    #[test]
+    fn a_scale_set_after_the_build_reaches_the_draw_closure() {
+        let (backend, dom, window, cx, host) = scaled_harness();
+        let root = dom.create_element(ElementName::new("box"));
+        let seen = Rc::new(std::cell::Cell::new((0.0_f32, 0.0_f32)));
+        let record = seen.clone();
+        let mut built = window.with(|| {
+            canvas()
+                .draw(move |cx| record.set((cx.size.width.0, cx.scale)))
+                .build(&mut cx.cx())
+        });
+        built.mount(&dom, root, None);
+        let node = built.first_node().expect("the element is a node");
+
+        // The window learns its scale factor after the canvas was built.
+        host.set_scale(2.0);
+        backend.deliver(
+            node,
+            ObservedValue::ContentSize(Size::new(DevicePx(120.0), DevicePx(40.0))),
+        );
+        zgui_reactive::flush();
+        assert_eq!(
+            seen.get(),
+            (60.0, 2.0),
+            "the size is in CSS pixels at the new scale"
         );
         window.unmount();
     }

@@ -1,25 +1,33 @@
 //! Splitting a frame's batches at the points an encoder operation has to run.
 
 use zgui_bits::DamageSet;
-use zgui_geom::{Device, DevicePx, Rect};
+use zgui_geom::{Device, DevicePx, Edges, Rect};
+use zgui_profile::{Counter, counter};
 use zgui_render::ExternalTexture;
-use zgui_scene::{BackdropFilter, Batch, GroupBoundary, OpaqueCover, Scene};
+use zgui_scene::{
+    BackdropFilter, Batch, Filter, GroupBoundary, MarkPlan, OpaqueCover, PrimitiveKind, Scene,
+};
 
 use crate::filter::chain::Chain;
 use crate::filter::{self, Filtered};
 use crate::frame::build::{FramePlan, PlanBuilder};
 use crate::frame::damage;
+use crate::frame::reach::{self, Reached};
 use crate::frame::segment::PlannedDraw;
 use crate::frame::target::TargetRef;
 use crate::frame::vector;
 use crate::pipeline::composite::CompositeParams;
 use crate::pipeline::external::ExternalParams;
+use crate::pipeline::marks::{MarkDraw, MarkKind};
 use crate::target::scale::TargetScale;
 
 /// A group whose content is being drawn into a target of its own.
 struct OpenGroup {
-    /// The target it writes.
-    target: TargetRef,
+    /// The target it writes, or `None` when nothing it draws reaches the rectangle being redrawn.
+    ///
+    /// Such a group lends no target. Its content is planned into passes with an empty scissor,
+    /// which are not recorded, so that vector rounds still advance in order.
+    target: Option<TargetRef>,
     /// Where it composites back to.
     parent: TargetRef,
     /// Its marker.
@@ -27,6 +35,22 @@ struct OpenGroup {
     /// The region of the composed target its content may touch.
     region: Rect<i32, Device>,
 }
+
+/// How many device pixels each step of a filter chain adds to its reach, for one half-resolution
+/// texel read past what a pass writes and one texel of rounding.
+const STEP_SLACK: f32 = 4.0;
+
+/// How many device pixels a step that reads its neighbours adds on top of its own support.
+///
+/// A blur rounds its taps up to whole half-resolution texels, reads one texel past its last tap
+/// through the bilinear sampler, and its downsample and composite each read one more.
+const RESAMPLE_SLACK: f32 = 12.0;
+
+/// The largest reach a group region is grown by, in device pixels.
+///
+/// Larger than any surface, so a region grown by it is cut to the surface, and small enough that
+/// growing a rectangle by it cannot overflow.
+const MAX_REACH: i32 = 1 << 16;
 
 /// Splits `scene` into the passes and encoder operations that draw it, once per damage rectangle.
 ///
@@ -36,17 +60,17 @@ struct OpenGroup {
 /// them a value that can be read and asserted; discovering them while recording would mean
 /// discarding the borrow that states the constraint.
 ///
-/// One rectangle is one replay of the batch stream under a different scissor, rather than a
-/// re-culled stream. Which primitives survive a damage set is decided where the display list is
-/// built, from the fragments' own ink; here the rectangles are only where the writes land.
+/// One rectangle is one full replay of the batch stream under a different scissor. Which primitives
+/// survive a damage set is decided where the display list is built, from the fragments' own ink.
+/// When there are several rectangles, an instanced batch whose reach misses the scissor is left out
+/// of a rectangle, because it writes no pixel there.
 ///
-/// The replay is cut at one point only: an opaque fill covering the whole rectangle hides
-/// everything before it, so the stream is picked up there. See
-/// [`Scene::opaque_covers`](zgui_scene::Scene::opaque_covers).
+/// `marks` holds the union bins, planned against `damage` or more.
 pub fn plan_segments(
     mut builder: PlanBuilder<'_>,
     scene: &Scene,
     damage: &DamageSet,
+    marks: &MarkPlan,
     used: Rect<i32, Device>,
     externals: &dyn Fn(zgui_scene::ExternalTextureId) -> Option<ExternalTexture>,
     vectors: Option<&zgui_render::VectorPlan>,
@@ -60,32 +84,180 @@ pub fn plan_segments(
         // A kept copy already holds everything outside the damage, so the rectangles do not have
         // to reach what this one reads. That is the whole of what makes a frosted panel cheap.
         .filter(|backdrop| !backdrop.keeps_its_capture())
-        .map(|backdrop| rounded_out(backdrop.source))
+        .map(|backdrop| rounded_out(on_device(scene, backdrop).1))
         .collect();
 
+    plan_mark_pages(&mut builder, scene, marks);
+    let rects = damage::rects_covering_backdrops(damage, used, &backdrops);
+    // One rectangle draws every batch, so only several need to know where each batch lands.
+    let batches = reach::batches(scene, rects.len() > 1);
+    let nested = if backdrops.is_empty() {
+        Vec::new()
+    } else {
+        backdrop_reach(scene, &batches)
+    };
     // What this frame replaces outright, which is what decides whether a rectangle needs erasing.
     let mut opaque = Vec::new();
     scene.opaque_covers(&mut opaque);
-
-    for rect in damage::rects_covering_backdrops(damage, used, &backdrops) {
-        plan_rect(&mut builder, scene, rect, used, &opaque, externals, vectors);
+    for rect in rects {
+        plan_rect(
+            &mut builder,
+            scene,
+            &batches,
+            &nested,
+            marks,
+            &opaque,
+            rect,
+            used,
+            externals,
+            vectors,
+        );
     }
-    builder.finish()
+    let plan = builder.finish();
+    counter::add(Counter::BatchesCulled, u64::from(plan.culled));
+    plan
+}
+
+/// Plans one pass per bin page, adding the coverage of every bin on it.
+///
+/// The pages come before every damage rectangle and every target, because a composite in any of
+/// them reads its bin.
+fn plan_mark_pages(builder: &mut PlanBuilder<'_>, scene: &Scene, plan: &MarkPlan) {
+    if plan.pages == 0 {
+        return;
+    }
+    builder.set_mark_extent(plan.extent);
+    let mut position_of = vec![0usize; scene.primitives.marks.len()];
+    for (position, &slot) in scene.remap(PrimitiveKind::Marks).iter().enumerate() {
+        position_of[slot as usize] = position;
+    }
+    let page = Rect::new(zgui_geom::Point::new(0, 0), plan.extent);
+    for index in 0..plan.pages {
+        builder.begin_pass(TargetRef::MarksPage(index), page);
+        for bin in plan.bins.iter().filter(|bin| bin.page == index) {
+            let position = position_of[bin.item as usize];
+            let block = builder.stage_mark_draw(position, || {
+                MarkDraw::binned(position as u32, bin.page, bin.region, bin.at)
+            });
+            draw_mark_kinds(builder, scene, bin.item as usize, position, block, true);
+        }
+    }
+    builder.end_pass();
+}
+
+/// Plans one draw per payload kind the mark at `slot` holds.
+fn draw_mark_kinds(
+    builder: &mut PlanBuilder<'_>,
+    scene: &Scene,
+    slot: usize,
+    position: usize,
+    block: u32,
+    coverage: bool,
+) {
+    let item = &scene.primitives.marks[slot];
+    let kinds = if coverage {
+        MarkKind::BINNED
+    } else {
+        MarkKind::ALL
+    };
+    for kind in kinds {
+        let instances = mark_instances(item, kind);
+        if !instances.is_empty() {
+            let glyph = kind == MarkKind::Glyph;
+            builder.draw(PlannedDraw::Marks {
+                kind,
+                coverage,
+                position,
+                block,
+                instances: [instances.start, instances.end],
+                texture: glyph.then_some(item.texture),
+            });
+        }
+    }
+}
+
+/// The instances of payload `kind` the mark `item` draws, counted from its payload start.
+///
+/// Instance `i` of a polyline strokes vertex `i` to vertex `i + 1`. The first vertex the item reads
+/// and the last two only end a segment: a run is a separator, two vertices and a separator, and
+/// fewer strokes nothing. A glyph item's tile table comes first and draws nothing.
+pub(crate) fn mark_instances(item: &zgui_scene::MarkItem, kind: MarkKind) -> core::ops::Range<u32> {
+    let first = item.first;
+    let (start, end) = match kind {
+        MarkKind::Disc => (first, first.saturating_add(item.discs)),
+        MarkKind::Box => (first, first.saturating_add(item.boxes)),
+        MarkKind::Polyline if item.vertices >= 3 => (
+            first.saturating_add(1),
+            first.saturating_add(item.vertices - 2),
+        ),
+        MarkKind::Polyline => (0, 0),
+        MarkKind::Glyph => (first.max(item.tiles), first.saturating_add(item.glyphs)),
+    };
+    start..end.max(start)
+}
+
+/// Plans one batch of marks into the pass open on `target` with `scissor`: each union item
+/// through its bin, and every other one directly.
+fn plan_marks(
+    builder: &mut PlanBuilder<'_>,
+    scene: &Scene,
+    marks: &MarkPlan,
+    range: core::ops::Range<usize>,
+    target: TargetRef,
+    scissor: Rect<i32, Device>,
+) {
+    let remap = scene.remap(PrimitiveKind::Marks);
+    for position in range {
+        let slot = remap[position];
+        let item = &scene.primitives.marks[slot as usize];
+        if item.is_union() {
+            if let Some(bin) = marks.bin(slot) {
+                let block = builder.stage_mark_draw(position, || {
+                    MarkDraw::binned(position as u32, bin.page, bin.region, bin.at)
+                });
+                builder.draw(PlannedDraw::MarksComposite { block });
+            } else if let Some(bin) = marks.overflow_bin(slot) {
+                // The spare page holds one item at a time, so the item writes its coverage there
+                // right before its composite.
+                let block = builder.stage_mark_draw(position, || {
+                    MarkDraw::binned(position as u32, bin.page, bin.region, bin.at)
+                });
+                let page = Rect::new(zgui_geom::Point::new(0, 0), marks.extent);
+                builder.begin_pass(TargetRef::MarksPage(bin.page), page);
+                draw_mark_kinds(builder, scene, slot as usize, position, block, true);
+                builder.begin_pass(target, scissor);
+                builder.draw(PlannedDraw::MarksComposite { block });
+            }
+            // With no bin, the item's ink misses the damage, so the scissor holds none of it.
+            continue;
+        }
+        let block = builder.stage_mark_draw(position, || MarkDraw::direct(position as u32));
+        draw_mark_kinds(builder, scene, slot as usize, position, block, false);
+    }
 }
 
 /// Plans one damage rectangle's worth of the batch stream.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a damage rectangle replays the whole stream, and each argument is a source it reads"
+)]
 fn plan_rect(
     builder: &mut PlanBuilder<'_>,
     scene: &Scene,
+    batches: &[Reached],
+    nested: &[i32],
+    marks: &MarkPlan,
+    opaque: &[OpaqueCover],
     rect: Rect<i32, Device>,
     used: Rect<i32, Device>,
-    opaque: &[OpaqueCover],
     externals: &dyn Fn(zgui_scene::ExternalTextureId) -> Option<ExternalTexture>,
     vectors: Option<&zgui_render::VectorPlan>,
 ) {
     let mut stack: Vec<OpenGroup> = Vec::new();
     let mut current = TargetRef::Composed;
     let mut scissor = rect;
+    // How many groups are open, whether the pool lent them a target or not.
+    let mut depth = 0usize;
 
     builder.begin_pass(current, scissor);
     // Where something the frame draws replaces every pixel of the rectangle by itself — a page
@@ -104,21 +276,31 @@ fn plan_rect(
         builder.draw(PlannedDraw::Clear);
     }
 
-    for batch in scene.batches() {
-        let Some(batch) = hidden.map_or(Some(batch.clone()), |cover| scene.behind(batch, cover))
-        else {
+    for Reached { batch, reach } in batches {
+        // What the covering fill hides of this batch is not drawn. Quads are cut exactly, because
+        // the fill is one of them; a batch of another kind goes whole or not at all.
+        let cut = hidden.map_or_else(
+            || Some(batch.clone()),
+            |cover| scene.behind(batch.clone(), cover),
+        );
+        let Some(batch) = cut.as_ref() else {
             continue;
         };
-        match batch {
+        match *batch {
             Batch::Group(index) => {
                 let Some(boundary) = scene.primitives.groups.get(index) else {
                     continue;
                 };
                 if boundary.is_start {
-                    match begin_group(builder, boundary, current, used) {
+                    let reach = nested.get(index).copied().unwrap_or(0);
+                    let plain = depth == 0 && is_plain(boundary);
+                    depth += 1;
+                    match begin_group(
+                        builder, scene, boundary, current, scissor, used, reach, plain,
+                    ) {
                         Some(group) => {
                             scissor = group.region;
-                            current = group.target;
+                            current = group.target.unwrap_or(current);
                             stack.push(group);
                             builder.begin_pass(current, scissor);
                         }
@@ -129,7 +311,11 @@ fn plan_rect(
                             builder.note_unisolated();
                         }
                     }
-                } else if let Some(group) = stack.pop() {
+                } else {
+                    depth = depth.saturating_sub(1);
+                    let Some(group) = stack.pop() else {
+                        continue;
+                    };
                     // The composite lands in whatever is beneath the group, and what may be
                     // written there is that target's own region — the damage rectangle only when
                     // it *is* the composed target. Cutting a composite into an enclosing group's
@@ -137,7 +323,9 @@ fn plan_rect(
                     // filter reading texels the inner group never wrote, and a filtered pixel would
                     // then differ between a partial redraw and a whole one.
                     scissor = stack.last().map_or(rect, |outer| outer.region);
-                    end_group(builder, &group, scissor);
+                    if let Some(target) = group.target {
+                        end_group(builder, &group, target, scissor);
+                    }
                     current = group.parent;
                     builder.begin_pass(current, scissor);
                 }
@@ -146,7 +334,7 @@ fn plan_rect(
                 let Some(backdrop) = scene.primitives.backdrops.get(index) else {
                     continue;
                 };
-                plan_backdrop(builder, backdrop, current, scissor, used);
+                plan_backdrop(builder, scene, backdrop, current, scissor, used);
                 builder.begin_pass(current, scissor);
             }
             Batch::External(index) => {
@@ -172,6 +360,7 @@ fn plan_rect(
             Batch::Vector(index) => {
                 match vectors.and_then(|plan| plan.passes.get(index).map(|pass| (plan, pass))) {
                     Some((plan, pass)) => {
+                        builder.round(pass.round);
                         let (first, count) = builder.stage_vector(vector::instances_of(plan, pass));
                         if count == 0 {
                             builder.defer();
@@ -189,12 +378,24 @@ fn plan_rect(
                     None => builder.defer(),
                 }
             }
-            Batch::Shaded {
-                shader,
-                params,
-                ref range,
-            } => plan_shaded(builder, scene, shader, params, range.clone(), scissor),
-            other => plan_instances(builder, scene, other, scissor),
+            Batch::Marks(ref range) => {
+                plan_marks(builder, scene, marks, range.clone(), current, scissor);
+            }
+            // The scissor is the damage rectangle or, inside a group, the group's region. Both
+            // bound what any draw of this pass can write.
+            _ if reach.is_some_and(|reach| !reach.intersects(scissor)) => builder.note_culled(),
+            // Per-channel coverage blends correctly only against an opaque destination, and an
+            // isolated target never is one. Paint emits single-channel coverage for text in a
+            // group. A plain group's target has the composed format, which has the per-channel
+            // pipeline, so the planner also keeps such a batch out.
+            Batch::SubpixelSprites { .. } if current.slot().is_some() => {
+                debug_assert!(
+                    false,
+                    "per-channel coverage is drawn into an isolated target"
+                );
+                builder.defer();
+            }
+            _ => builder.draw(PlannedDraw::Batch(batch.clone())),
         }
     }
 
@@ -203,187 +404,165 @@ fn plan_rect(
     // here is what keeps a wrong display list from becoming a lost target.
     while let Some(group) = stack.pop() {
         let enclosing = stack.last().map_or(rect, |outer| outer.region);
-        end_group(builder, &group, enclosing);
+        if let Some(target) = group.target {
+            end_group(builder, &group, target, enclosing);
+        }
         builder.begin_pass(group.parent, enclosing);
     }
     builder.end_pass();
 }
 
-/// Plans one instanced batch, with the instances that cannot reach `scissor` left out.
-///
-/// A scissor rejects a primitive after its vertex stage has read the whole record out of the
-/// arena, so an instance that lands nowhere is not free — measured at 0.61 microseconds on the
-/// slowest device this runs on. A frame damaged in many places replays every batch in every
-/// rectangle, which is where nearly all of them land nowhere.
-///
-/// Culled by device-space ink, and only where the scene will answer for it: a primitive under a
-/// coordinate system of its own has ink in that system, and is kept rather than transformed here.
-fn plan_instances(
-    builder: &mut PlanBuilder<'_>,
-    scene: &Scene,
-    batch: Batch,
-    scissor: Rect<i32, Device>,
-) {
-    let Some((kind, primitive, lane, texture, range)) = instanced(batch) else {
-        return;
-    };
-    let reaches = |at: &usize| {
-        scene
-            .device_ink(primitive, *at)
-            .is_none_or(|ink| inflated(rounded_out(ink)).intersects(scissor))
-    };
-    let (first, count) = builder.stage_instances(lane, range.filter(reaches));
-    if count == 0 {
-        return;
-    }
-    builder.draw(PlannedDraw::Instances {
-        kind,
-        texture,
-        first,
-        count,
-    });
-}
-
-/// `rect` grown by the pixel a primitive's own geometry is expanded by.
-///
-/// Every instanced quad is drawn one pixel larger than its bounds on every side, so that an edge
-/// that covers a pixel partly has somewhere to land — see `inflated_corner`. A primitive whose
-/// bounds stop just outside a rectangle therefore still writes its antialiased edge into it, and
-/// culling on the bounds alone takes a pixel off the edge of everything near a damage boundary.
-/// The byte-for-byte comparison between a damaged redraw and a whole one is what says so.
-fn inflated(rect: Rect<i32, Device>) -> Rect<i32, Device> {
-    Rect::from_corners(
-        zgui_geom::Point::new(rect.left() - 1, rect.top() - 1),
-        zgui_geom::Point::new(rect.right() + 1, rect.bottom() + 1),
-    )
-}
-
-/// The pipeline, the primitive kind, the atlas texture and the draw-order range `batch` names,
-/// for a batch that is drawn as instances at all.
-#[allow(
-    clippy::type_complexity,
-    reason = "the four things one batch names, returned together because they are read together"
-)]
-fn instanced(
-    batch: Batch,
-) -> Option<(
-    crate::pipeline::kind::PipelineKind,
-    zgui_scene::PrimitiveKind,
-    usize,
-    Option<u32>,
-    core::ops::Range<usize>,
-)> {
-    use crate::pipeline::kind::PipelineKind;
-    use zgui_scene::PrimitiveKind;
-    // The lane is the one `FrameBuffers` resolves remaps into, and the two orders have to agree.
-    Some(match batch {
-        Batch::Quads(range) => (PipelineKind::Quad, PrimitiveKind::Quad, 0, None, range),
-        Batch::Shadows(range) => (PipelineKind::Shadow, PrimitiveKind::Shadow, 1, None, range),
-        Batch::Decorations(range) => (
-            PipelineKind::Decoration,
-            PrimitiveKind::Decoration,
-            2,
-            None,
-            range,
-        ),
-        Batch::MonoSprites { texture, range } => (
-            PipelineKind::MonoSprite,
-            PrimitiveKind::MonoSprite,
-            3,
-            Some(texture),
-            range,
-        ),
-        Batch::SubpixelSprites { texture, range } => (
-            PipelineKind::SubpixelSprite,
-            PrimitiveKind::SubpixelSprite,
-            4,
-            Some(texture),
-            range,
-        ),
-        Batch::ColorSprites { texture, range } => (
-            PipelineKind::ColorSprite,
-            PrimitiveKind::ColorSprite,
-            5,
-            Some(texture),
-            range,
-        ),
-        // A shaded run is instanced, but through a per-application pipeline this crate never
-        // enumerated, so it is planned on its own path — see `plan_shaded`.
-        //
-        // Group markers, backdrops, vector composites and external quads are planned rather than
-        // batched: each one changes what is being drawn into or where the pixels come from, and
-        // every one of them is handled before this is reached.
-        Batch::Shaded { .. }
-        | Batch::Group(_)
-        | Batch::Backdrop(_)
-        | Batch::Vector(_)
-        | Batch::External(_) => {
-            return None;
-        }
-    })
-}
-
-/// Plans one run of an application's own primitive effect, culled to `scissor`.
-///
-/// The shaded lane is one arena like the six the framework's own pipelines draw from, so it is
-/// culled by the same device-space ink and staged into the same order list. What differs is only
-/// the pipeline and the parameter block, which the draw binds.
-fn plan_shaded(
-    builder: &mut PlanBuilder<'_>,
-    scene: &Scene,
-    shader: zgui_scene::ShaderId,
-    params: zgui_scene::ShaderParamsSlot,
-    range: core::ops::Range<usize>,
-    scissor: Rect<i32, Device>,
-) {
-    let lane = crate::renderer::frame::FrameBuffers::SHADED_LANE;
-    let reaches = |at: &usize| {
-        scene
-            .device_ink(zgui_scene::PrimitiveKind::Shaded, *at)
-            .is_none_or(|ink| inflated(rounded_out(ink)).intersects(scissor))
-    };
-    let (first, count) = builder.stage_instances(lane, range.filter(reaches));
-    if count == 0 {
-        return;
-    }
-    builder.draw(PlannedDraw::Shaded {
-        shader,
-        params,
-        first,
-        count,
-    });
-}
-
 /// Lends a group its target and works out the region its content may touch.
+///
+/// `scissor` is what this frame may write into the target beneath. The region is what the group
+/// reads, cut to `scissor` grown by how far the filter chain and the backdrops in the group read
+/// (`nested`). Every pixel inside `scissor` then reads the same texels it would read from a target
+/// over the whole group: the region depends on the damage set, and no pixel inside `scissor` does.
+///
+/// A `plain` group ([`is_plain`]) can be held in the composed format.
+///
+/// Returns `None` when the group is off the surface or the pool could not lend a target, and a
+/// group with no target when nothing it draws reaches `scissor`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is a fact about the group that decides its target"
+)]
 fn begin_group(
     builder: &mut PlanBuilder<'_>,
+    scene: &Scene,
     boundary: &GroupBoundary,
     parent: TargetRef,
+    scissor: Rect<i32, Device>,
     used: Rect<i32, Device>,
+    nested: i32,
+    plain: bool,
 ) -> Option<OpenGroup> {
     // The content is drawn over everything the group *reads*, not only over what it writes. A blur
     // samples outside the element's box, and a target populated only where the composite lands
     // would fade to an edge that is an artefact of the damage rectangle rather than of the filter.
-    let region = enclosing(boundary.source, used)?;
-    let target = TargetRef::Pool(builder.acquire(TargetScale::Full)?);
+    // The rectangle is in the coordinates of the group's own system, which a place write can have
+    // moved since the group was emitted, so it goes on the device through the current matrix.
+    let source = boundary
+        .transform
+        .and_then(|space| scene.spatial.resolve(space))
+        .map_or(boundary.source, |matrix| {
+            zgui_geom::transformed_bounds(&matrix, boundary.source)
+        });
+    let whole = enclosing(source, used)?;
+    if !whole.intersects(scissor) {
+        return Some(OpenGroup {
+            target: None,
+            parent,
+            boundary: boundary.clone(),
+            region: Rect::ZERO,
+        });
+    }
+    let reach = chain_reach(&boundary.filters).saturating_add(nested);
+    let region = whole
+        .intersection(scissor.outset(Edges::uniform(reach.min(MAX_REACH))))
+        .unwrap_or(whole);
+    let target = TargetRef::Pool(builder.acquire_group(TargetScale::Full, region, plain)?);
     Some(OpenGroup {
-        target,
+        target: Some(target),
         parent,
         boundary: boundary.clone(),
         region,
     })
 }
 
-/// Filters a finished group and composites it back into the target beneath.
+/// How far outside a pixel a group's filter chain reads its content, in device pixels.
+///
+/// The filters' own support, and a slack per step for what the passes resample past it.
+fn chain_reach(filters: &[Filter]) -> i32 {
+    let reach: f32 = filters
+        .iter()
+        .map(|filter| {
+            let (left, top, right, bottom) = filter.kernel_support();
+            let support = left.max(top).max(right).max(bottom);
+            if support > 0.0 {
+                STEP_SLACK + support + RESAMPLE_SLACK
+            } else {
+                STEP_SLACK
+            }
+        })
+        .sum();
+    (reach + STEP_SLACK).ceil().min(MAX_REACH as f32) as i32
+}
+
+/// How far each group's backdrops read past what they write, by the index of its opening marker.
+///
+/// A backdrop reads the target of the innermost group around it. When the pool lends that group
+/// no target, the backdrop reads the target of a group further out, so every group around it grows
+/// by its reach.
+fn backdrop_reach(scene: &Scene, batches: &[Reached]) -> Vec<i32> {
+    let mut reach = vec![0; scene.primitives.groups.len()];
+    let mut open: Vec<usize> = Vec::new();
+    for Reached { batch, .. } in batches {
+        match *batch {
+            Batch::Group(index) => match scene.primitives.groups.get(index) {
+                Some(boundary) if boundary.is_start => open.push(index),
+                Some(_) => {
+                    open.pop();
+                }
+                None => {}
+            },
+            Batch::Backdrop(index) => {
+                let Some(backdrop) = scene.primitives.backdrops.get(index) else {
+                    continue;
+                };
+                if open.is_empty() {
+                    continue;
+                }
+                if backdrop.reads_only_what_it_writes() {
+                    continue;
+                }
+                let (written, read) = on_device(scene, backdrop);
+                let outset = (written.left().0 - read.left().0)
+                    .max(written.top().0 - read.top().0)
+                    .max(read.right().0 - written.right().0)
+                    .max(read.bottom().0 - written.bottom().0)
+                    .max(0.0);
+                let needed = (outset + STEP_SLACK + RESAMPLE_SLACK)
+                    .ceil()
+                    .min(MAX_REACH as f32) as i32;
+                for &group in &open {
+                    reach[group] = reach[group].max(needed);
+                }
+            }
+            _ => {}
+        }
+    }
+    reach
+}
+
+/// Whether a group in no other group may be held in the composed format
+/// ([`GroupPool::format_for`]): it has no filter and composites by source-over.
+///
+/// The answer comes from the group's own marker and its depth, which do not depend on the damage.
+/// A frame that emits only part of the group's content gives the same answer as a frame that emits
+/// all of it, so a steady group keeps one format.
+///
+/// [`GroupPool::format_for`]: crate::target::group_pool::GroupPool::format_for
+fn is_plain(boundary: &GroupBoundary) -> bool {
+    boundary.filters.is_empty() && is_source_over(boundary)
+}
+
+/// Filters a finished group, whose content is in `target`, and composites it back into the target
+/// beneath.
 ///
 /// `scissor` is the region of the target beneath that this frame may write: the damage rectangle
 /// when that target is the composed one, and the enclosing group's own region when it is not.
-fn end_group(builder: &mut PlanBuilder<'_>, group: &OpenGroup, scissor: Rect<i32, Device>) {
+fn end_group(
+    builder: &mut PlanBuilder<'_>,
+    group: &OpenGroup,
+    target: TargetRef,
+    scissor: Rect<i32, Device>,
+) {
     // Closed here rather than by the first pass the composite opens, so that what follows can ask
     // whether anything was drawn into the group at all: a pass with no draws is not recorded, and
     // recording it is what would have cleared the target.
     builder.end_pass();
-    if let Some(slot) = group.target.slot()
+    if let Some(slot) = target.slot()
         && builder.is_unwritten(slot)
     {
         // Nothing was drawn into this lease, so it never discarded what the lease before it left
@@ -399,7 +578,7 @@ fn end_group(builder: &mut PlanBuilder<'_>, group: &OpenGroup, scissor: Rect<i32
         return;
     }
     let chain = Chain::of(&group.boundary.filters);
-    let filtered = filter::plan(builder, &chain, group.target, group.region, group.region);
+    let filtered = filter::plan(builder, &chain, target, group.region, group.region);
     if !is_source_over(&group.boundary) {
         builder.note_unsupported_blend();
     }
@@ -423,7 +602,7 @@ fn end_group(builder: &mut PlanBuilder<'_>, group: &OpenGroup, scissor: Rect<i32
         .iter()
         .filter_map(|shadow| shadow.source.slot())
         .chain(filtered.target.slot())
-        .chain(group.target.slot())
+        .chain(target.slot())
     {
         builder.release(slot);
     }
@@ -432,12 +611,14 @@ fn end_group(builder: &mut PlanBuilder<'_>, group: &OpenGroup, scissor: Rect<i32
 /// Captures what lies beneath a backdrop, filters it, and draws the result.
 fn plan_backdrop(
     builder: &mut PlanBuilder<'_>,
+    scene: &Scene,
     backdrop: &BackdropFilter,
     beneath: TargetRef,
     scissor: Rect<i32, Device>,
     used: Rect<i32, Device>,
 ) {
-    let Some(source) = enclosing(backdrop.source, used) else {
+    let (written, read) = on_device(scene, backdrop);
+    let Some(source) = enclosing(read, used) else {
         return;
     };
     let keeps = backdrop.keeps_its_capture() && crate::filter::backdrop::keepable(beneath);
@@ -457,41 +638,64 @@ fn plan_backdrop(
 
     // The batch stream is replayed once per damage rectangle, so a rectangle nowhere near this
     // backdrop still reaches here, and it writes nothing inside such a rectangle.
-    let bounds = clamped(backdrop.bounds, scissor, used);
+    let bounds = clamped(written, scissor, used);
     if bounds.is_empty() {
         return;
     }
+    // A group nothing has been drawn into yet was never cleared, and holds what its last lease left
+    // there. What is beneath the backdrop is then transparent, and so is any filter of it.
+    if let Some(slot) = beneath.slot() {
+        builder.end_pass();
+        if builder.is_unwritten(slot) {
+            builder.begin_pass(beneath, scissor);
+            return;
+        }
+    }
     let chain = Chain::of(&backdrop.filters);
-    let filtered = if keeps {
+    let (filtered, captured) = if keeps {
         // Everything the filter reads is in the kept copy already, so the only thing that has to
         // be produced is what it writes *here* — this rectangle's share of the panel rather than
         // the whole of it. That is the difference between a frosted panel costing its own area on
         // every frame and costing whatever moved under it.
-        filter::plan(builder, &chain, TargetRef::Kept, bounds, source)
+        (
+            filter::plan(builder, &chain, TargetRef::Kept, bounds, source),
+            TargetRef::Kept,
+        )
     } else {
         // What a backdrop reads has to be inside what this frame has already written into the
         // target beneath it, or it samples the previous frame's composite — which already contains
         // this filter's own output, and the panel smears a little further every frame. A filter
         // with no reach is exempt and safe: it reads only the pixel it writes, which the scissor
-        // already covers.
+        // already covers. A group's target holds no earlier frame: its first pass clears all of
+        // it, so a read past the group's region reads transparent, which is what lies outside a
+        // backdrop root.
         debug_assert!(
-            backdrop.reads_only_what_it_writes() || scissor.contains_rect(source),
+            beneath != TargetRef::Composed
+                || backdrop.reads_only_what_it_writes()
+                || scissor.contains_rect(source),
             "a backdrop reads {source:?}, which the region {scissor:?} being written does not \
              contain"
         );
-        let into = match capture_target(builder, beneath) {
-            Some(into) => into,
-            None => {
-                builder.note_unisolated();
-                return;
+        // The copy goes into the kept target wherever it can, even on a frame that renews it:
+        // that is what leaves the frame after this one something to keep. A scratch lease
+        // otherwise, which is a backdrop inside a group — the composite beneath it is that group's
+        // own target and holds a different thing from the composed one.
+        let into = if crate::filter::backdrop::keepable(beneath) {
+            TargetRef::Kept
+        } else {
+            match crate::filter::backdrop::scratch(builder, beneath, source) {
+                Some(into) => into,
+                None => {
+                    builder.note_unisolated();
+                    return;
+                }
             }
         };
         crate::filter::backdrop::capture(builder, beneath, into, source);
-        filter::plan(builder, &chain, into, source, source)
+        (filter::plan(builder, &chain, into, source, source), into)
     };
     // A backdrop composites only over what it writes, which is what gives a frosted panel the
     // defined shape its clip describes rather than a soft fade past its own edge.
-    let bounds = clamped(backdrop.bounds, scissor, used);
     composite(
         builder,
         &filtered,
@@ -509,18 +713,41 @@ fn plan_backdrop(
     {
         builder.release(slot);
     }
+    // The copy is the chain's input, which the chain keeps. Holding it to the end of the frame
+    // holds one target per backdrop, and every damage rectangle replays the backdrop.
+    if let Some(slot) = captured.slot()
+        && captured != filtered.target
+        && !filtered
+            .shadows
+            .iter()
+            .any(|shadow| shadow.source == captured)
+    {
+        builder.release(slot);
+    }
 }
 
-/// Where a backdrop that has to copy what lies beneath afresh puts the copy.
+/// What a backdrop writes and what it reads, on the device.
 ///
-/// The kept copy wherever it can be, so that the frame after this one has something to keep. A
-/// scratch lease otherwise, which is a backdrop inside a group: the composite beneath it is that
-/// group's own target and holds a different thing from the composed one.
-fn capture_target(builder: &mut PlanBuilder<'_>, beneath: TargetRef) -> Option<TargetRef> {
-    if crate::filter::backdrop::keepable(beneath) {
-        return Some(TargetRef::Kept);
-    }
-    crate::filter::backdrop::scratch(builder, beneath)
+/// The backdrop is measured in its coordinate system, which a place write can have moved since the
+/// backdrop was emitted, so the rectangles go on the device through the current matrix. The read
+/// extent is then taken on the device, where the filter runs.
+fn on_device(
+    scene: &Scene,
+    backdrop: &BackdropFilter,
+) -> (Rect<DevicePx, Device>, Rect<DevicePx, Device>) {
+    let Some(matrix) = backdrop
+        .transform
+        .and_then(|space| scene.spatial.resolve(space))
+    else {
+        return (backdrop.bounds, backdrop.source);
+    };
+    let written = zgui_geom::transformed_bounds(&matrix, backdrop.bounds);
+    let read = if backdrop.reads_only_what_it_writes() {
+        written
+    } else {
+        zgui_scene::read_extent(written, &backdrop.filters)
+    };
+    (written, read)
 }
 
 /// Draws a filtered result, and any shadow behind it, into `destination`.
@@ -553,6 +780,7 @@ fn composite(
         bounds.to_unit(),
         builder.extent_of(filtered.target),
         filtered.target.scale(),
+        filtered.target.origin(),
         clip,
     )
     .with_opacity(opacity)
@@ -574,10 +802,10 @@ fn is_source_over(boundary: &GroupBoundary) -> bool {
 /// The region a composite that reads `source` needs written, or `None` if it is off the surface.
 ///
 /// It is what the composite reads, cut to the surface, and deliberately **not** widened to the
-/// rectangle being redrawn. A region that depended on the damage set would make a filter's own
-/// answer depend on how much of the frame was being redrawn, and a filtered pixel would then
-/// differ between a partial redraw and a whole one — which is the one property everything about
-/// redrawing part of a frame rests on.
+/// rectangle being redrawn. A filtered pixel must be the same in a partial redraw and in a whole
+/// one, which is the one property everything about redrawing part of a frame rests on. A group
+/// cuts this region to the rectangle only after growing the rectangle by everything its filters
+/// read (`begin_group`).
 fn enclosing(source: Rect<DevicePx, Device>, used: Rect<i32, Device>) -> Option<Rect<i32, Device>> {
     rounded_out(source).intersection(used)
 }

@@ -9,7 +9,10 @@ mod style;
 mod tooltip;
 
 pub use crate::chart::container::{ChartContainer, ChartContainerProps};
-pub use crate::chart::geometry::{MarkBox, Plot, area_path, axes_path, line_path, rect_path};
+pub use crate::chart::geometry::{
+    MarkBox, Plot, area_path, axes_path, category_step, line_path, measured_gutter, rect_path,
+    value_gutter,
+};
 pub use crate::chart::legend::{
     ChartLegendContent, ChartLegendContentProps, LegendAlign, LegendEntry,
 };
@@ -21,16 +24,21 @@ pub use crate::chart::tooltip::{
 };
 
 use zgui::prelude::*;
-use zgui::reactive::{LocalStorage, RwSignal};
+use zgui::reactive::{LocalStorage, Memo, RwSignal};
 use zgui::view::CustomPropertyName;
 use zgui::vocab::{PropValue, SharedString};
 use zgui::{component, view};
+
+use crate::chart::geometry::LABEL_GAP;
 
 /// What the chart's rules are installed under.
 pub(crate) const SHEET: &str = "zui-chart";
 
 /// How wide a point mark is, in CSS pixels.
 const POINT_SIZE: f64 = 8.0;
+
+/// How far under the plot the category labels start, in CSS pixels.
+const CATEGORY_GAP: f64 = 4.0;
 
 /// A chart of one or more series, drawn as paths and readable as a list of numbers.
 ///
@@ -63,6 +71,18 @@ const POINT_SIZE: f64 = 8.0;
 ///
 /// The axes and the grid go the other way: they are one path, because they are one thing to a
 /// reader and because a dozen separate lines would be a dozen elements nobody can use.
+///
+/// # Axes
+///
+/// The value axis is labelled at its ticks, right-aligned against the axis. Its gutter is as wide
+/// as the longest label once the labels are laid out, or `axis_width` when given. The category
+/// axis is labelled under each band from the first series. When the bands are too narrow for every
+/// label, only every second, third or later label is drawn.
+///
+/// # Several series
+///
+/// A bar chart puts the bars of one category side by side in its band, in series order. A line or
+/// an area chart draws each series through the middle of the bands.
 ///
 /// # Keyboard
 ///
@@ -100,6 +120,9 @@ pub fn Chart(
     /// Roughly how many values to label the value axis with.
     #[prop(default = 5)]
     ticks: usize,
+    /// How wide the value axis' gutter is, in CSS pixels. By default it follows the longest label.
+    #[prop(optional)]
+    axis_width: Option<f64>,
     /// Whether to draw a key naming each series.
     #[prop(default = true)]
     legend: bool,
@@ -124,12 +147,36 @@ pub fn Chart(
 ) -> impl IntoView {
     install_stylesheet(SHEET, ChartStyle::CSS);
     let element = node_ref.unwrap_or_default();
-    let plot = Plot::new(width, height);
-
-    let scale = Signal::derive_local(move || {
-        plot.value_scale(series.get().iter().flat_map(Series::values))
+    // The value scale and its ticks, which change only when the data does. The scale reads the
+    // plot's height alone, so it does not wait for the gutter.
+    let axis = Memo::new(move |_| {
+        let base = Plot::new(width, height);
+        let scale = series.with(|runs| base.value_scale(runs.iter().flat_map(Series::values)));
+        let marks = scale.ticks(ticks);
+        (scale, marks)
     });
-    let axis_ticks = Signal::derive_local(move || scale.get().ticks(ticks));
+    // The widest value label as laid out, in CSS pixels. The probe is a 100px unit beside a column
+    // of the labels, so the unit converts device pixels without asking for the window's scale.
+    let probe = NodeRef::new();
+    let unit = NodeRef::new();
+    let probe_size = probe.observe_border_size_while(move || axis_width.is_none());
+    let unit_size = unit.observe_border_size_while(move || axis_width.is_none());
+    let widest = Memo::new(move |_| {
+        let labels = f64::from(probe_size.get()?.width.0);
+        let unit = f64::from(unit_size.get()?.width.0) / 100.0;
+        (unit > 0.0).then(|| ((labels - 100.0 * unit) / unit).max(0.0).ceil())
+    });
+    // The plot with its gutter: the caller's width, else the measured labels, else an estimate
+    // until the first measurement arrives.
+    let layout = Memo::new(move |_| {
+        let (scale, marks) = axis.get();
+        let left = axis_width.unwrap_or_else(|| {
+            widest
+                .get()
+                .map_or_else(|| value_gutter(&marks), measured_gutter)
+        });
+        (Plot::new(width, height).with_left(left), scale, marks)
+    });
     // Which measurement the pointer is over, and where its mark is. Held rather than derived,
     // because it is an answer only the pointer knows.
     let over = RwSignal::new_local(None::<Over>);
@@ -155,48 +202,42 @@ pub fn Chart(
 
     view! {
         box(node_ref = element, {..own}, {..attrs}, class = class) {
+            if move || axis_width.is_none() {
+                row(class = "zui-chart__probe", a11y:hidden = true, node_ref = probe) {
+                    box(class = "zui-chart__probe-unit", node_ref = unit) {}
+                    column {
+                        {move || axis.with(|(_, marks)| probe_labels(marks))}
+                    }
+                }
+            } else {}
             box(class = "zui-chart__plot") {
                 vector(
                     class = "zui-chart__axes",
                     a11y:hidden = true,
                     prop:d = move || {
-                        PropValue::from(SharedString::from(axes_path(
-                            &plot,
-                            &scale.get(),
-                            &axis_ticks.get(),
-                        )))
+                        let path = layout.with(|(plot, scale, marks)| axes_path(plot, scale, marks));
+                        PropValue::from(SharedString::from(path))
                     }
                 ) {}
                 {move || {
-                    let scale = scale.get();
-                    axis_ticks
-                        .get()
-                        .into_iter()
-                        .map(|tick| {
-                            let y = scale.at(tick);
-                            AnyView::new(view! {
-                                text(
-                                    class = "zui-chart__label",
-                                    a11y:hidden = true,
-                                    style:top = move || Some(format!("{:.2}px", y - 7.0)),
-                                    style:left = "0px"
-                                ) {
-                                    {tick_label(tick)}
-                                }
-                            })
-                        })
-                        .collect::<Vec<AnyView>>()
+                    let (plot, scale, marks) = layout.get();
+                    value_labels(&plot, &scale, &marks)
                 }}
                 {move || {
-                    let scale = scale.get();
-                    series
-                        .get()
+                    let (plot, scale, _) = layout.get();
+                    let runs = series.get();
+                    let count = runs.len();
+                    let axis = runs.first().map(|first| category_labels(&plot, first));
+                    let mut views: Vec<AnyView> = runs
                         .into_iter()
                         .enumerate()
                         .map(|(index, run)| {
-                            AnyView::new(marks(plot, scale, kind, index, run, tooltip.then_some(over)))
+                            let over = tooltip.then_some(over);
+                            AnyView::new(marks(plot, scale, kind, (index, count), run, over))
                         })
-                        .collect::<Vec<AnyView>>()
+                        .collect();
+                    views.extend(axis);
+                    views
                 }}
                 {move || {
                     let here = over.get()?;
@@ -291,15 +332,84 @@ fn placed_at(box_: MarkBox) -> Attrs {
         )
 }
 
+/// The value axis' labels: one per tick, right-aligned against the axis and centred on the tick's
+/// grid line.
+fn value_labels(plot: &Plot, scale: &Scale, ticks: &[f64]) -> Vec<AnyView> {
+    let right = plot.width - plot.x0() + LABEL_GAP;
+    ticks
+        .iter()
+        .map(|tick| {
+            let y = scale.at(*tick);
+            AnyView::new(view! {
+                text(
+                    class = "zui-chart__label",
+                    attr:data-axis = "value",
+                    a11y:hidden = true,
+                    style:top = {Some(format!("{y:.2}px"))},
+                    style:right = {Some(format!("{right:.2}px"))}
+                ) {
+                    {tick_label(*tick)}
+                }
+            })
+        })
+        .collect()
+}
+
+/// The value labels as the probe lays them out: one per row, at their natural width.
+fn probe_labels(ticks: &[f64]) -> Vec<AnyView> {
+    ticks
+        .iter()
+        .map(|tick| AnyView::new(view! { text {{tick_label(*tick)}} }))
+        .collect()
+}
+
+/// The category axis' labels: one under the middle of each band, from `run`'s measurements.
+fn category_labels(plot: &Plot, run: &Series) -> AnyView {
+    let count = run.points.len();
+    let longest = run
+        .points
+        .iter()
+        .map(|point| point.label.chars().count())
+        .max();
+    let (_, band) = plot.band(0, count);
+    let step = category_step(band, longest.unwrap_or(0));
+    let top = plot.y1() + CATEGORY_GAP;
+    let labels: Vec<AnyView> = run
+        .points
+        .iter()
+        .enumerate()
+        .step_by(step)
+        .map(|(position, point)| {
+            let (start, band) = plot.band(position, count);
+            let x = start + band / 2.0;
+            AnyView::new(view! {
+                text(
+                    class = "zui-chart__label",
+                    attr:data-axis = "category",
+                    a11y:hidden = true,
+                    style:top = {Some(format!("{top:.2}px"))},
+                    style:left = {Some(format!("{x:.2}px"))}
+                ) {
+                    {point.label.clone()}
+                }
+            })
+        })
+        .collect();
+    AnyView::new(labels)
+}
+
 /// One series' marks: a shape per measurement, plus the connecting path when there is one.
+///
+/// `series` is the series' index and the number of series, which places its bars in each band.
 fn marks(
     plot: Plot,
     scale: Scale,
     kind: ChartKind,
-    index: usize,
+    series: (usize, usize),
     run: Series,
     over: Option<RwSignal<Option<Over>, LocalStorage>>,
 ) -> impl IntoView {
+    let (index, series_count) = series;
     let tone = run.colour_token();
     let count = run.points.len();
     let name = run.name.clone();
@@ -333,17 +443,20 @@ fn marks(
         .map(|(position, point)| {
             let (start, band) = plot.band(position, count);
             let placement = match kind {
-                // A tenth of the band on each side, so neighbouring bars are distinguishable.
-                ChartKind::Bar => MarkBox::bar(start + band * 0.1, band * 0.8, point.value, &scale),
+                ChartKind::Bar => {
+                    let (x, width) = plot.bar_slot(position, count, index, series_count);
+                    MarkBox::bar(x, width, point.value, &scale)
+                }
                 ChartKind::Line | ChartKind::Area => {
                     let (x, y) = placed[position];
                     MarkBox::point(x, y, POINT_SIZE)
                 }
             };
             let described = format!("{}, {}, {}", name, point.label, tick_label(point.value));
+            // Over the middle of the band, which is where the readout for all its series belongs.
             let here = Over {
                 point: position,
-                x: placement.x + placement.width / 2.0,
+                x: start + band / 2.0,
                 y: placement.y,
             };
             AnyView::new(view! {

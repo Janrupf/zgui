@@ -153,7 +153,12 @@ impl Window {
             SurfaceEvent::Key {
                 state: zgui_vocab::KeyState::Pressed,
                 ..
-            } => self.focus_modality = zgui_input::FocusSource::Keyboard,
+            } => {
+                self.focus_modality = zgui_input::FocusSource::Keyboard;
+                // A key ends a run of text presses and leaves a drag live, so that a modifier
+                // pressed during a drag does not stop it.
+                self.text_clicks.forget();
+            }
             SurfaceEvent::Pointer {
                 action: zgui_vocab::PointerAction::Pressed,
                 ..
@@ -271,12 +276,26 @@ impl Window {
         // text that is still on the screen, and the commit that follows lands in whatever gained
         // the focus.
         let held = composing && matches!(event, SurfaceEvent::Key { .. });
+        // A chord nothing in the document claimed runs the menu action it is the shortcut of.
+        if dispatched.default_allowed && !typed && !held && default.is_none() {
+            self.note_menu_shortcut(event);
+        }
+        let defaulted = dispatched.default_allowed && !typed && !held && default.is_some();
         if dispatched.default_allowed
             && !typed
             && !held
             && let Some(default) = default
         {
-            self.carry_out_default(default, timestamp);
+            self.carry_out_default(default, modifiers, Self::button_of(event), timestamp, event);
+        }
+        if !defaulted
+            && let SurfaceEvent::Wheel {
+                event: wheel,
+                timestamp: sent,
+                ..
+            } = event
+        {
+            self.scroll_without_default(wheel, *sent, dispatched.default_allowed);
         }
         // A handler that clicked its own element on the press has taken the activation, and the
         // release that ends that press must not click it a second time. Forgetting the press is the
@@ -296,6 +315,17 @@ impl Window {
         // those is meaningless if the first has not happened yet.
         if dispatched.default_allowed {
             self.point_at_text(event, target);
+        } else if matches!(
+            event,
+            SurfaceEvent::Pointer {
+                action: zgui_vocab::PointerAction::Pressed
+                    | zgui_vocab::PointerAction::Released
+                    | zgui_vocab::PointerAction::Cancelled,
+                ..
+            }
+        ) {
+            self.selecting = None;
+            self.text_clicks.forget();
         }
         // A finger produces presses and moves and nothing else; what those *mean* is read here and
         // acted on after the listeners, exactly as the wheel's own default is. A handler that took
@@ -323,6 +353,25 @@ impl Window {
         // surface identical to the one just presented. A handler whose work genuinely outlives the
         // frame — a task that finishes later, an effect scheduled from a callback — asks for
         // itself, from where it finishes.
+    }
+
+    /// Records the menu action a key press is the shortcut of.
+    fn note_menu_shortcut(&mut self, event: &SurfaceEvent) {
+        let SurfaceEvent::Key {
+            state: zgui_vocab::KeyState::Pressed,
+            event: key,
+            modifiers,
+            ..
+        } = event
+        else {
+            return;
+        };
+        if key.repeat || modifiers.is_empty() {
+            return;
+        }
+        if let Some(id) = self.menu_keys.action_for(key, *modifiers) {
+            self.menu_fired.push(id);
+        }
     }
 
     /// Types into whatever editable element has focus.
@@ -470,7 +519,7 @@ impl Window {
             let layout = self.layout.borrow();
             crate::caret::Located::of(&layout, &self.text, node).and_then(|located| {
                 located.line_step(
-                    selection.focus,
+                    self.editors.to_shown(node, selection.focus),
                     selection.affinity,
                     down,
                     self.vertical_goal,
@@ -478,9 +527,9 @@ impl Window {
             })
         };
         let (focus, affinity) = match stepped {
-            Some((focus, affinity, goal)) => {
+            Some((shown, affinity, goal)) => {
                 self.vertical_goal = Some(goal);
-                (focus, affinity)
+                (self.editors.to_model(node, shown), affinity)
             }
             None => {
                 // No line in that direction: the edge of the text, which ends the run.
@@ -524,12 +573,18 @@ impl Window {
     /// is in: a candidate window beside the field rather than beside the insertion point is
     /// visible, and is not wrong about which surface or which element is being typed into.
     fn caret_area(&self, node: zgui_dom::NodeKey) -> Option<zgui_platform::TextInput> {
+        // A secure field asks the input method for a password purpose: no prediction, no learning.
+        let purpose = if self.editors.is_secure(node) {
+            zgui_platform::TextInputPurpose::Password
+        } else {
+            zgui_platform::TextInputPurpose::Normal
+        };
         if let Some(caret) = self.caret_rect() {
             return Some(zgui_input::ime::caret_area(
                 caret.origin,
                 caret.size.height,
                 zgui_geom::Scale::new(self.scale),
-                zgui_platform::TextInputPurpose::Normal,
+                purpose,
             ));
         }
         let layout = self.layout.borrow();
@@ -539,7 +594,7 @@ impl Window {
             box_.origin,
             box_.size.height,
             zgui_geom::Scale::new(self.scale),
-            zgui_platform::TextInputPurpose::Normal,
+            purpose,
         ))
     }
 
@@ -569,23 +624,69 @@ impl Window {
         }
     }
 
+    /// The button one surface event names, when it names one.
+    fn button_of(event: &SurfaceEvent) -> Option<zgui_vocab::PointerButton> {
+        match event {
+            SurfaceEvent::Pointer { event, .. } => event.button,
+            _ => None,
+        }
+    }
+
     /// Carries out the framework's own behaviour for one event, when no handler refused it.
-    fn carry_out_default(&mut self, default: zgui_input::FrameworkDefault, timestamp: Timestamp) {
+    fn carry_out_default(
+        &mut self,
+        default: zgui_input::FrameworkDefault,
+        modifiers: Modifiers,
+        button: Option<zgui_vocab::PointerButton>,
+        timestamp: Timestamp,
+        event: &SurfaceEvent,
+    ) {
         use zgui_input::FrameworkDefault;
         match default {
             FrameworkDefault::Focus { node, source } => self.move_focus(node, source, timestamp),
             FrameworkDefault::Activate(node) => {
-                self.synthesize(
+                self.synthesize_pointer(
                     zgui_view_dom::id::to_view(node),
                     EventKind::Click,
+                    modifiers,
+                    button,
                     timestamp,
                 );
+                // A second press of the pointer on the same element, soon and near, is a double
+                // click as well. A key that activates starts the count again.
+                let double = match event {
+                    SurfaceEvent::Pointer {
+                        event: pointer,
+                        timestamp: sent,
+                        ..
+                    } => self.clicks.note(node, *sent, pointer.position),
+                    _ => {
+                        self.clicks.forget();
+                        false
+                    }
+                };
+                if double {
+                    self.synthesize_pointer(
+                        zgui_view_dom::id::to_view(node),
+                        EventKind::DoubleClick,
+                        modifiers,
+                        button,
+                        timestamp,
+                    );
+                }
             }
             FrameworkDefault::Scroll {
                 container,
                 delta,
                 phase,
-            } => self.scroll_by(container, delta, phase),
+            } => {
+                // The event's own stamp, which a gesture measures its speed with.
+                let sent = match event {
+                    SurfaceEvent::Wheel { timestamp, .. } => *timestamp,
+                    _ => timestamp,
+                };
+                self.scroll_by(container, delta, phase, sent);
+            }
             FrameworkDefault::ScrollAlong {
                 container,
                 axis,
@@ -672,14 +773,16 @@ impl Window {
                 let Some(key) = zgui_view_dom::id::to_document(node) else {
                     return;
                 };
-                let edited = {
+                {
                     let document = self.document.borrow();
-                    self.editors.select(&document, key, range)
-                };
+                    self.editors.select(&document, key, range);
+                }
                 // The model clamps to the text it holds, so what it settled on is what the record
                 // has to say too: two answers here is a field that types where nothing is drawn.
-                if let Some(selection) = edited.selection {
-                    self.host.write_selection(key, selection);
+                // Written back even when the model did not move, because the record was clamped
+                // against the text the document holds, which can be longer than the model's.
+                if let Some(selection) = self.editors.selection(key) {
+                    self.host.write_selection(key, selection.range());
                 }
             }
             Command::SetValue { node, text } => {
@@ -709,7 +812,7 @@ impl Window {
                 node,
                 target,
                 behavior,
-            } => self.carry_out_scroll(node, target, behavior),
+            } => self.owe_scroll(node, target, behavior),
             Command::FreezeScrolling(frozen) => self.freeze_scrolling(frozen),
         }
     }
@@ -720,6 +823,29 @@ impl Window {
     /// moment a form validates on. It is announced *after* focus has moved, so a handler that
     /// reads what holds focus sees the answer the user's own action produced rather than the one
     /// they were leaving.
+    /// Clears focus when the element that held it is no longer in the document.
+    ///
+    /// A node a view detached is still in the arena for a while, so the flag answers rather than
+    /// the slot: a key aimed at a detached node runs listeners whose scope is already gone.
+    pub(crate) fn drop_focus_that_went(&mut self, timestamp: Timestamp) {
+        let Some(node) = self.router.interaction().focus.focused() else {
+            return;
+        };
+        let held = {
+            let document = self.document.borrow();
+            let store = document.store();
+            store.index_of(node).is_some_and(|index| {
+                store
+                    .core(index)
+                    .has_flags(zgui_dom::NodeFlags::IN_DOCUMENT)
+            })
+        };
+        if held {
+            return;
+        }
+        self.move_focus(None, zgui_input::FocusSource::Script, timestamp);
+    }
+
     pub(crate) fn move_focus(
         &mut self,
         node: Option<zgui_dom::NodeKey>,
@@ -825,7 +951,7 @@ impl Window {
     fn attach_caret(&mut self, node: Option<zgui_dom::NodeKey>) {
         let editable = node.filter(|node| {
             let document = self.document.borrow();
-            crate::editing::Editors::is_editable(&document, *node)
+            crate::editing::Editors::is_selectable(&document, *node)
         });
         let Some(node) = editable else {
             self.carets.stop();
@@ -886,6 +1012,21 @@ impl Window {
         event: EventKind,
         timestamp: Timestamp,
     ) {
+        self.synthesize_pointer(node, event, Modifiers::NONE, None, timestamp);
+    }
+
+    /// The same, with the modifiers and the button of the interaction that asked for it.
+    ///
+    /// An activation carries what the release carried, so a handler reads the same control and
+    /// shift state off a click as off the press behind it.
+    pub(crate) fn synthesize_pointer(
+        &mut self,
+        node: zgui_view::NodeId,
+        event: EventKind,
+        modifiers: Modifiers,
+        button: Option<zgui_vocab::PointerButton>,
+        timestamp: Timestamp,
+    ) {
         let Some(key) = zgui_view_dom::id::to_document(node) else {
             return;
         };
@@ -908,8 +1049,10 @@ impl Window {
                 zgui_geom::CssPx(0.0),
                 zgui_geom::CssPx(0.0),
             ));
-        let payload = Payload::Pointer(zgui_vocab::PointerEvent::mouse(position));
-        self.dispatch_synthetic(key, event, payload, timestamp);
+        let mut pointer = zgui_vocab::PointerEvent::mouse(position);
+        pointer.button = button;
+        let payload = Payload::Pointer(pointer);
+        self.dispatch_with(key, event, payload, modifiers, timestamp);
     }
 
     /// Dispatches an event this process produced, down the path a real one would have taken.
@@ -925,8 +1068,27 @@ impl Window {
         payload: Payload,
         timestamp: Timestamp,
     ) {
+        self.dispatch_with(key, event, payload, Modifiers::NONE, timestamp);
+    }
+
+    /// The same, with the modifiers a handler reads off the event.
+    pub(crate) fn dispatch_with(
+        &mut self,
+        key: zgui_dom::NodeKey,
+        event: EventKind,
+        payload: Payload,
+        modifiers: Modifiers,
+        timestamp: Timestamp,
+    ) {
         let steps = {
             let document = self.document.borrow();
+            // An element that left the document between the ask and the dispatch has nothing left
+            // to reach: its listeners belong to a view that took it away, and that view's scope
+            // is gone with it. A press that asked for a click, then set off a rebuild, is the
+            // common case.
+            if !is_connected(document.store(), document.document_index(), key) {
+                return;
+            }
             let chain = zgui_input::HitChain::to_root(document.store(), key);
             let mut plan = zgui_input::dispatch::Plan::default();
             zgui_input::dispatch::resolve(document.store(), &chain, event, &mut plan);
@@ -938,8 +1100,28 @@ impl Window {
             event,
             Some(key),
             &payload,
-            Modifiers::NONE,
+            modifiers,
             timestamp,
         );
+    }
+}
+
+/// Whether `key` still hangs, through its ancestors, from the document node `document`.
+fn is_connected(
+    store: &zgui_dom::DocumentStore,
+    document: zgui_dom::NodeIndex,
+    key: zgui_dom::NodeKey,
+) -> bool {
+    let Some(mut index) = store.index_of(key) else {
+        return false;
+    };
+    loop {
+        if index == document {
+            return true;
+        }
+        match store.core(index).parent() {
+            Some(parent) => index = parent,
+            None => return false,
+        }
     }
 }

@@ -15,8 +15,36 @@ use crate::gpu::loss::DeviceLoss;
 /// drivers. Nothing here is required: a missing feature changes which primitives are emitted, and
 /// a device that refuses to open because it lacks one would be a device that renders nothing at
 /// all rather than one that renders slightly worse text.
+///
+/// Timestamp queries are asked for only when [pass timing](crate::gpu::timing) was asked for, so
+/// the default device keeps its default feature set.
 fn optional_features() -> wgpu::Features {
-    wgpu::Features::DUAL_SOURCE_BLENDING | wgpu::Features::PIPELINE_CACHE
+    let features = wgpu::Features::DUAL_SOURCE_BLENDING | wgpu::Features::PIPELINE_CACHE;
+    if crate::gpu::timing::requested() {
+        features | wgpu::Features::TIMESTAMP_QUERY
+    } else {
+        features
+    }
+}
+
+/// The smallest memory block the allocator reserves on a device.
+const MIN_MEMORY_BLOCK: u64 = 8 << 20;
+
+/// The largest memory block the allocator reserves on a device.
+const MAX_MEMORY_BLOCK: u64 = 256 << 20;
+
+/// How the device's allocator sizes its memory blocks.
+///
+/// wgpu's default reserves a 128 MiB device block and a 64 MiB host block for the first
+/// allocations, and a small window uses less than 8 MiB of them. On an integrated GPU, all of that
+/// is system memory. Here the first blocks are 8 MiB and 4 MiB, and each new block is twice the
+/// size of the last up to 256 MiB, so a large document gets the default's block size after five
+/// more allocations. An allocation larger than the current block gets a block of its own, as with
+/// the default.
+fn memory_hints() -> wgpu::MemoryHints {
+    wgpu::MemoryHints::Manual {
+        suballocated_device_memory_block_size: MIN_MEMORY_BLOCK..MAX_MEMORY_BLOCK,
+    }
 }
 
 /// A device, its queue, the adapter they came from and the instance behind all three.
@@ -41,6 +69,8 @@ pub struct Gpu {
     extensions: Vec<&'static CStr>,
     /// Whether the device has been reported lost.
     loss: Arc<DeviceLoss>,
+    /// Whether another program part opened the device and gave it to this one.
+    adopted: bool,
 }
 
 impl Gpu {
@@ -106,6 +136,7 @@ impl Gpu {
             label: Some("zgui.device"),
             required_features: optional_features() & adapter.features(),
             required_limits: limits,
+            memory_hints: memory_hints(),
             ..Default::default()
         };
         let (device, queue, extensions) = match extensions::open(&adapter, extensions, &descriptor)
@@ -137,7 +168,70 @@ impl Gpu {
             capabilities,
             extensions,
             loss,
+            adopted: false,
         })
+    }
+
+    /// Adopts a device that a host opened, with its queue, adapter and instance.
+    ///
+    /// Use this where a host, for example a game engine, owns the one graphics device of the
+    /// process and the interface has to draw on that device. The host keeps its own features and
+    /// limits. The capabilities are read off `device` and `adapter` the same way
+    /// [`Gpu::open`] reads them, so a device without dual-source blending draws text with ordinary
+    /// coverage, and so on.
+    ///
+    /// # Device loss
+    ///
+    /// wgpu keeps one device-lost callback per device, and setting a callback replaces the
+    /// previous one. The host already has its callback on `device`, so this function sets no
+    /// callback. The host tells this [`Gpu`] about a loss: it calls
+    /// [`DeviceLoss::report`] on [`Gpu::loss`], or it installs the closure that
+    /// [`DeviceLoss::observer`] returns inside its own callback. Until the host reports it, a loss
+    /// is invisible to every renderer on this device.
+    ///
+    /// # Recovery
+    ///
+    /// An adopted device is never replaced by this crate: a
+    /// [`SharedGraphics`](crate::SharedGraphics) made with
+    /// [`SharedGraphics::with_gpu`](crate::SharedGraphics::with_gpu) opens no device of its own.
+    /// After the host recovers, it adopts the new device with
+    /// [`SharedGraphics::adopt`](crate::SharedGraphics::adopt).
+    ///
+    /// ```no_run
+    /// # use zgui_render_wgpu::wgpu;
+    /// # fn host() -> (wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue) { unimplemented!() }
+    /// use zgui_render_wgpu::{Gpu, SharedGraphics};
+    ///
+    /// let (instance, adapter, device, queue) = host();
+    /// let gpu = Gpu::from_existing(instance, adapter, device, queue);
+    /// let graphics = SharedGraphics::with_gpu(gpu);
+    /// assert!(graphics.gpu().is_some());
+    /// ```
+    pub fn from_existing(
+        instance: wgpu::Instance,
+        adapter: wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+    ) -> Arc<Self> {
+        let capabilities = probe(&adapter, &device);
+        Arc::new(Self {
+            instance,
+            adapter,
+            device,
+            queue,
+            capabilities,
+            extensions: Vec::new(),
+            loss: Arc::new(DeviceLoss::new()),
+            adopted: true,
+        })
+    }
+
+    /// Returns `true` where the device came from [`Gpu::from_existing`].
+    ///
+    /// An adopted device belongs to the host. This crate does not replace it after a loss and does
+    /// not watch it for one: see [`Gpu::from_existing`].
+    pub fn is_adopted(&self) -> bool {
+        self.adopted
     }
 
     /// The instance surfaces are created from.
@@ -191,26 +285,24 @@ impl Gpu {
         adapter::describe(&self.adapter.get_info())
     }
 
+    /// Lets the device retire what it has finished, so mapped staging memory comes back.
+    ///
+    /// `PollType::Poll` is documented as a poll which never waits. On the GL backend it has
+    /// measured as a block of 20.7 ms a frame — 61% of all wall time — on the oldest target this
+    /// runs on. The cause there was contention for a lock the driver holds process-wide rather
+    /// than the card itself, so the figure belongs to one driver and one moment.
+    ///
+    /// The rule it leaves behind does not: the frame loop has one place it may block, and this is
+    /// not it. So the call is made here alone, and only where the device is known to have caught
+    /// up — after acquisition, where what was handed back is a buffer nothing in flight still
+    /// reads. Never on the path that builds a frame.
+    pub fn reclaim(&self) {
+        let _ = self.device.poll(wgpu::PollType::Poll);
+    }
+
     /// Blocks until everything submitted has finished.
     pub fn wait(&self) {
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
-    }
-
-    /// Hands back what the device has finished with: completed mappings, and the memory behind
-    /// retired resources.
-    ///
-    /// **Call this only where the device is known to have caught up.** `wgpu::PollType::Poll` is
-    /// documented as a poll that never waits, and on the GL backend it waits for the card:
-    /// `Device::poll` asks the fence for its status, and on Mesa's nouveau `glGetSynciv` blocks
-    /// until the fence signals and then answers `SIGNALED`. Measured on a G86 that is 21 ms, the
-    /// whole time a frame takes to draw, against 2 microseconds for the same query once the fence
-    /// has signalled.
-    ///
-    /// Two places know: acquisition, where the buffer just handed back is one the device has
-    /// finished with, and a console backend settling a frame whose fence has signalled. Nowhere on
-    /// the path that builds a frame.
-    pub fn reclaim(&self) {
-        let _ = self.device.poll(wgpu::PollType::Poll);
     }
 }
 

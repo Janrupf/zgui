@@ -23,7 +23,7 @@ pub enum ShaderMode {
     ///
     /// `fn apply(in: ShaderInput, params: Params, beneath: texture_2d<f32>, beneath_sampler:
     /// sampler, region: FilterSource) -> vec4<f32>`, returning a premultiplied colour. It reads
-    /// the content through [`source_at`], which clamps to the region it is allowed to sample.
+    /// the content through `source_at`, which clamps to the region it is allowed to sample.
     ///
     /// Unlike the other two this is not a rectangle in the display list: it is an entry in a
     /// group's filter chain, so the content it reads is already in a target of its own. That is

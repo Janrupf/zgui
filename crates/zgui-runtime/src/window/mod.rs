@@ -10,6 +10,7 @@ pub mod anim;
 mod brushes;
 mod budget;
 pub mod caret;
+mod clicks;
 mod crossing;
 mod cursor;
 pub mod frame;
@@ -18,10 +19,12 @@ pub mod observe;
 pub mod pointer_text;
 pub mod present;
 pub mod probe;
+pub mod query;
 pub mod resize;
 pub mod scale;
 pub mod scheme;
 pub mod scroll;
+mod secure;
 mod select;
 mod sheets;
 mod surface_focus;
@@ -57,6 +60,9 @@ pub(crate) const STARVE_BACKOFF_START: Duration = Duration::from_secs(1);
 /// The most a starvation probe waits. A cap because the probe is also what recovers a *visible*
 /// window from a compositor hiccup no event announces the end of.
 pub(crate) const STARVE_BACKOFF_CAP: Duration = Duration::from_secs(16);
+
+/// How long after its last normal frame a window waits before it trims idle resources.
+pub const MAINTENANCE_DELAY: Duration = Duration::from_secs(2);
 use crate::timer::Timers;
 use crate::wake::FrameGate;
 
@@ -78,13 +84,13 @@ pub const ATLAS_SOFT_BYTES: u64 = 64 * 1024 * 1024;
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct WindowContent {
-    /// The application's own stylesheet, as text.
-    pub stylesheet: Option<String>,
-    /// This window's own sheet, cascaded after the application's.
+    /// The application's own stylesheets, as text. They cascade in this order.
+    pub stylesheets: Vec<String>,
+    /// This window's own sheets, cascaded after the application's, in this order.
     ///
     /// For the window that is not the application: an inspector, a preferences panel, a palette.
-    /// Later in the cascade than the application's own sheet, so a rule of equal weight here wins.
-    pub window_stylesheet: Option<String>,
+    /// Later in the cascade than the application's own sheets, so a rule of equal weight here wins.
+    pub window_stylesheets: Vec<String>,
     /// What to tell about each frame after it has been produced, if anything.
     ///
     /// An option and not a list: one seam, one occupant. A window with several probes would have
@@ -97,17 +103,19 @@ pub struct WindowContent {
 impl WindowContent {
     /// The application's options with one window's own laid over them.
     ///
-    /// The application's stylesheet stays the application's and the window's becomes the second
-    /// sheet, so a window sheet extends the application's rather than replacing it. A window that
+    /// The application's stylesheets stay the application's. The window's sheets come after them,
+    /// so a window sheet extends the application's sheets. A window that
     /// brought its own probe is watched by that one; one that brought none is watched by whatever
     /// watches the application.
     pub(crate) fn layered_with(&self, window: &Self) -> Self {
         Self {
-            stylesheet: self.stylesheet.clone(),
-            window_stylesheet: window
-                .window_stylesheet
-                .clone()
-                .or_else(|| window.stylesheet.clone()),
+            stylesheets: self.stylesheets.clone(),
+            window_stylesheets: window
+                .stylesheets
+                .iter()
+                .chain(&window.window_stylesheets)
+                .cloned()
+                .collect(),
             probe: window.probe.clone().or_else(|| self.probe.clone()),
         }
     }
@@ -130,7 +138,7 @@ pub struct Window {
     /// The rule set and the device.
     engine: StyleEngine,
     /// The application's cascade pool, when it runs one.
-    style_pool: Option<Rc<zgui_style::engine::thread_pool::StylePool>>,
+    style_pool: Option<Rc<crate::app::StylePoolCell>>,
     /// Whether the next restyle is a broad one, which is what the pool is for.
     ///
     /// True for the first cascade — the largest this window will ever run — and again whenever
@@ -146,8 +154,12 @@ pub struct Window {
     hit: HitIndex,
     /// The hit index generation the stationary pointer was last re-tested against.
     rehit_seen: u64,
+    /// The last pointer activation, which a second one near it turns into a double click.
+    clicks: crate::window::clicks::ClickCount,
     /// The reusable buffers the fragment walk works in, warm across frames.
     diff_scratch: zgui_layout::fragment::diff::DiffScratch,
+    /// The boxes that imposed a clip and left the tree, whose chains are still in the table.
+    retired_clips: rustc_hash::FxHashSet<zgui_scene::PropertyOwner>,
     /// Where each scroll container is scrolled to, and everything that moves one over time.
     scroll: Rc<RefCell<zgui_scroll::Scroller>>,
     /// What this desktop means by one detent of a wheel, and which way it points.
@@ -227,6 +239,9 @@ pub struct Window {
     vector_routes: rustc_hash::FxHashMap<zgui_dom::NodeKey, zgui_paint::VectorRoutes>,
     /// The document revision at which stale retained vector routes were last retired.
     vector_routes_revision: u64,
+    /// The device rectangles of drawings the last painted frame owes a frame: a CPU layer
+    /// stretched from another scale, or one the layer budget deferred.
+    layers_owed: Vec<zgui_geom::Rect<i32, zgui_geom::Device>>,
     /// The complex-vector elements present in the frame that first constructed Vello.
     vello_initializers: Vec<zgui_dom::NodeKey>,
     /// What each budgeted cache last did, and the levels the entry-counted ones are held to.
@@ -251,13 +266,19 @@ pub struct Window {
     /// have them drawn again. Reset at the top of each frame and merged across passes, because a
     /// scroll delivered to a listener can relay out inside the frame that delivered it.
     rigid_moves: zgui_layout::fragment::diff::RigidMoves,
-    /// What this frame had damaged before its first layout pass ran.
+    /// What this frame had damaged before its first layout pass ran, measured on the drawn frame.
     ///
     /// The other half of [`Window::rigid_moves`]: the walk reports what *it* damaged beyond the
     /// movement, and this is what was already owed before it started. Held separately because a
     /// frame runs the walk more than once and only the first of them starts from what the frame
-    /// inherited.
+    /// inherited. A caret's old marks join it after layout, because they are pixels of the drawn
+    /// frame too. A scroll that moves composed pixels moves this damage with them.
     damage_before_layout: DamageSet,
+    /// What the stages after the last layout pass damaged, measured on this frame's matrices.
+    ///
+    /// A scroll that moves composed pixels keeps this as it is: it names pixels the frame draws,
+    /// in the places the frame draws them.
+    damage_after_layout: DamageSet,
     /// How many layout passes this frame has run, so the first can be told from the rest.
     layout_passes: u32,
     /// Which containers scrolled this frame, and from where to where.
@@ -273,10 +294,7 @@ pub struct Window {
     /// every time the cascade runs while everything already shaped still names the slot the old one
     /// claimed. This is the way back from the element the style engine reports to the slot its
     /// glyphs actually read.
-    text_slots: rustc_hash::FxHashMap<
-        (zgui_dom::NodeKey, zgui_style::TextRun),
-        crate::window::brushes::TextSlot,
-    >,
+    text_slots: crate::window::brushes::TextSlots,
     /// The text engine.
     text: Box<dyn TextEngine>,
     /// What puts the display list on the screen.
@@ -304,6 +322,21 @@ pub struct Window {
     /// re-derived from where the finger is now stops naming the list as soon as the drag carries
     /// it past the edge of its own scrollport.
     panning: Vec<zgui_dom::NodeKey>,
+    /// The scrolls views asked for, in the order they asked, carried out after the next layout
+    /// pass so that they measure the layout that holds what the same flush added.
+    owed_scrolls: Vec<(
+        zgui_dom::NodeKey,
+        zgui_view::ScrollTarget,
+        zgui_view::ScrollBehavior,
+    )>,
+    /// The scrolls the last layout pass of this frame carried out that give the same result when
+    /// carried out again. A relayout after an observation delivery carries them out once more, so
+    /// they measure the geometry that relayout produces.
+    carried_scrolls: Vec<(
+        zgui_dom::NodeKey,
+        zgui_view::ScrollTarget,
+        zgui_view::ScrollBehavior,
+    )>,
     /// When the earliest contact still being held becomes a long press.
     ///
     /// Kept as a moment on the loop's own clock rather than derived when the park is computed,
@@ -346,6 +379,8 @@ pub struct Window {
     /// gesture *began*: re-deriving it from what is under the pointer now would make every drag
     /// select nothing at all.
     selecting: Option<crate::window::pointer_text::Selecting>,
+    /// Consecutive text presses, separate from generic double-click activations.
+    text_clicks: crate::window::pointer_text::TextClicks,
     /// Text an editing command asked to be put on the clipboard, waiting for a turn of the loop
     /// that holds the platform context.
     ///
@@ -360,6 +395,8 @@ pub struct Window {
     /// inside a frame, the clipboard is readable only from the loop that owns the platform, and
     /// so the request is recorded here and answered by whoever has one.
     wants_paste: Vec<zgui_dom::NodeKey>,
+    /// Fields whose `secure` attribute changed, waiting for the frame to mask or unmask them.
+    secure_changes: Rc<RefCell<Vec<zgui_dom::NodeKey>>>,
     /// Clipboard text on its way into an element, waiting for the frame that will type it in.
     ///
     /// A paste edits the document and announces an input event, and both of those are a frame's
@@ -399,6 +436,12 @@ pub struct Window {
     /// time the surface moves, and a preference that lived only inside it would be discarded by
     /// the next resize.
     scheme: zgui_style::ColorScheme,
+    /// Whether the surface is drawn translucent rather than opaque.
+    ///
+    /// Stated on every [`RenderTarget`](zgui_render::RenderTarget) this window configures and on
+    /// every frame it paints, because text with per-channel coverage has no meaning over a
+    /// destination that is not opaque.
+    translucent: bool,
     /// Whether the surface is entirely hidden.
     occluded: bool,
     /// Whether the surface is the one receiving the keyboard.
@@ -411,6 +454,10 @@ pub struct Window {
     /// arriving rather than being held, so the alternative is a window that answers its first real
     /// report by doing the work of losing focus it never had.
     surface_focused: bool,
+    /// The shortcuts of the application menu's actions, shared by every window.
+    menu_keys: crate::desktop::MenuKeys,
+    /// The menu actions whose shortcut a key press of this frame ran.
+    menu_fired: Vec<zgui_platform::MenuId>,
     /// Whether the surface has to be reconfigured before the next frame is built.
     reconfigure: bool,
     /// Whether the desktop says the surface is being interactively resized right now.
@@ -572,10 +619,13 @@ impl Window {
             (atlas_limits.max_texture_size - 2).max(1) as u32,
         );
         let sources = images.source_queue();
-        dom.set_attribute_hook(Rc::new(move |node, name, value| {
-            if name.as_str() == "src" {
-                sources.borrow_mut().push((node, value.map(str::to_owned)));
-            }
+        let secure_changes: Rc<RefCell<Vec<zgui_dom::NodeKey>>> = Rc::default();
+        let secure_heard = Rc::clone(&secure_changes);
+        dom.watch_attributes_of(zgui_interned::ElementName::new("field"));
+        dom.set_attribute_hook(Rc::new(move |node, name, value| match name.as_str() {
+            "src" => sources.borrow_mut().push((node, value.map(str::to_owned))),
+            crate::editing::SECURE => secure_heard.borrow_mut().push(node),
+            _ => {}
         }));
         let dom_handle = DomHandle::from_rc(Rc::clone(&dom) as Rc<dyn zgui_view::Dom>);
         let document_id = dom.document_id();
@@ -595,14 +645,12 @@ impl Window {
             StyleEngine::new(&borrowed, metrics, viewport)
         };
         let mut sheets = Vec::new();
-        // The application's sheet first and this window's own second, so a rule of equal weight in
-        // a window's sheet wins over the application's.
-        for css in [
-            options.stylesheet.as_deref(),
-            options.window_stylesheet.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
+        // The application's sheets first and this window's own after them, each in call order, so
+        // a rule of equal weight in a later sheet wins.
+        for css in options
+            .stylesheets
+            .iter()
+            .chain(&options.window_stylesheets)
         {
             let borrowed = document.borrow();
             let (handle, diagnostics) =
@@ -667,7 +715,9 @@ impl Window {
             layout,
             hit: HitIndex::new(),
             rehit_seen: 0,
+            clicks: crate::window::clicks::ClickCount::default(),
             diff_scratch: zgui_layout::fragment::diff::DiffScratch::default(),
+            retired_clips: rustc_hash::FxHashSet::default(),
             scroll,
             last_frame: None,
             opened_at: None,
@@ -690,6 +740,7 @@ impl Window {
             vectors: zgui_paint::VectorCache::new(),
             vector_routes: rustc_hash::FxHashMap::default(),
             vector_routes_revision: 0,
+            layers_owed: Vec::new(),
             vello_initializers: Vec::new(),
             budgets: crate::budget::Budgets::new(),
             raster,
@@ -697,10 +748,11 @@ impl Window {
             backdrops: zgui_paint::BackdropMemory::default(),
             rigid_moves: zgui_layout::fragment::diff::RigidMoves::default(),
             damage_before_layout: DamageSet::new(),
+            damage_after_layout: DamageSet::new(),
             layout_passes: 0,
             scrolled_this_frame: Vec::new(),
             brushes_moved: false,
-            text_slots: rustc_hash::FxHashMap::default(),
+            text_slots: crate::window::brushes::TextSlots::default(),
             text,
             renderer,
             router: Router::new(),
@@ -710,6 +762,8 @@ impl Window {
             scroll_settings: zgui_platform::ScrollSettings::default(),
             scroll_frozen: false,
             panning: Vec::new(),
+            owed_scrolls: Vec::new(),
+            carried_scrolls: Vec::new(),
             long_press_due: None,
             editors: crate::editing::Editors::new(),
             carets: crate::caret::Carets::new(),
@@ -717,8 +771,10 @@ impl Window {
             dispatching: None,
             vertical_goal: None,
             selecting: None,
+            text_clicks: crate::window::pointer_text::TextClicks::default(),
             clipboard: Vec::new(),
             wants_paste: Vec::new(),
+            secure_changes,
             pastes: Vec::new(),
             ime: zgui_input::Ime::new(),
             queued: Vec::new(),
@@ -729,8 +785,11 @@ impl Window {
             viewport,
             scale,
             scheme: viewport.scheme,
+            translucent: false,
             occluded: false,
             surface_focused: true,
+            menu_keys: crate::desktop::MenuKeys::default(),
+            menu_fired: Vec::new(),
             extent: None,
             reconfigure: true,
             resizing: false,
@@ -870,6 +929,16 @@ impl Window {
         }
     }
 
+    /// Shares the shortcuts of the application menu's actions with this window.
+    pub(crate) fn set_menu_keys(&mut self, keys: crate::desktop::MenuKeys) {
+        self.menu_keys = keys;
+    }
+
+    /// The menu actions whose shortcut a key press ran since the last call.
+    pub(crate) fn take_menu_actions(&mut self) -> Vec<zgui_platform::MenuId> {
+        core::mem::take(&mut self.menu_fired)
+    }
+
     /// Takes whatever an editing command asked to be put on the clipboard.
     ///
     /// Taken rather than read, so that the same cut is never written twice: the second write would
@@ -1005,6 +1074,16 @@ impl Window {
         self.occluded
     }
 
+    /// Reads again whether the surface is maximised or full screen.
+    pub(crate) fn refresh_window_state(&self) {
+        self.handle.refresh_window_state();
+    }
+
+    /// Whether the surface has the keyboard, as the desktop last reported.
+    pub const fn is_surface_focused(&self) -> bool {
+        self.surface_focused
+    }
+
     /// How many configures moved the window's size without a pipeline run of their own.
     ///
     /// A resize is a level rather than a stream of events, so a configure that arrives before the
@@ -1095,6 +1174,26 @@ impl Window {
     /// The renderer, for a caller that wants to ask it something directly.
     pub fn renderer(&self) -> &dyn Renderer {
         self.renderer.as_ref()
+    }
+
+    /// The painter and the paint records it holds, for a memory report.
+    #[doc(hidden)]
+    pub fn painter(&self) -> &Painter {
+        &self.painter
+    }
+
+    /// How many paragraphs the text engine holds shaped, for a memory report.
+    #[doc(hidden)]
+    pub fn shaped_held(&self) -> crate::text::ShapedHeld {
+        self.text.shaped_held()
+    }
+
+    /// How many brush slots the text engine's table has in use, and how many keys resolve to
+    /// one, for a memory report.
+    #[doc(hidden)]
+    pub fn text_brushes_held(&mut self) -> (usize, usize) {
+        let table = self.text.text_paints();
+        (table.in_use(), table.keys())
     }
 
     /// The raster paths most recently selected by `node`'s own vector content.
@@ -1213,7 +1312,11 @@ impl Window {
     pub fn close(&mut self) {
         self.binding.shutting_down();
         self.embed.shutting_down();
-        self.view = None;
+        // Unmounting disposes of every scope the view made, in tree order, before this returns. A
+        // scope that a rebuild reused is reachable only through the view that holds it.
+        if let Some(mut view) = self.view.take() {
+            view.unmount(&self.dom_handle);
+        }
         self.timers.borrow_mut().forget(self.dom.document_id());
         if let Some(scope) = self.scope.take() {
             scope.unmount();
@@ -1223,8 +1326,29 @@ impl Window {
 }
 
 impl Window {
+    /// Draws this window translucent or opaque from the next configuration on.
+    ///
+    /// A translucent window configures its renderer with
+    /// [`RenderTarget::translucent`](zgui_render::RenderTarget::translucent) and paints with
+    /// ordinary text coverage, so every pixel it composes is a premultiplied colour that can be
+    /// composited over something else.
+    pub(crate) fn set_translucent(&mut self, translucent: bool) {
+        if self.translucent != translucent {
+            self.translucent = translucent;
+            self.reconfigure = true;
+        }
+    }
+
+    /// Returns `true` where this window is drawn translucent.
+    ///
+    /// A window is translucent when the attributes it was opened with asked for a transparent
+    /// surface.
+    pub fn is_translucent(&self) -> bool {
+        self.translucent
+    }
+
     /// Hands this window the application's cascade pool.
-    pub(crate) fn set_style_pool(&mut self, pool: Rc<zgui_style::engine::thread_pool::StylePool>) {
+    pub(crate) fn set_style_pool(&mut self, pool: Rc<crate::app::StylePoolCell>) {
         self.style_pool = Some(pool);
     }
 

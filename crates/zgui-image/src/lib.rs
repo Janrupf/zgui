@@ -20,6 +20,7 @@
 //! reported extent is the downscaled one. A caller that wants full-resolution zoomable imagery is
 //! outside what an `image` element promises and brings its own texture.
 
+#![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
 mod fused;

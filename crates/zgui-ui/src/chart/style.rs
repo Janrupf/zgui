@@ -63,10 +63,29 @@ style! { pub ChartStyle =>
     ":scope .zui-chart__label {
         position: absolute;
         color: var(--zui-color-muted-foreground);
+        white-space: nowrap;
     }"
+    // A value label ends at its `right` and is centred on its grid line. A category label is
+    // centred on its band.
+    ":scope .zui-chart__label[data-axis=\"value\"] { transform: translateY(-50%); }"
+    // Measures the value labels in the chart's own type: a 100px unit beside a column of the
+    // labels, never drawn.
+    ":scope > .zui-chart__probe {
+        position: absolute;
+        top: 0;
+        left: 0;
+        align-items: flex-start;
+        width: max-content;
+        visibility: hidden;
+        pointer-events: none;
+        white-space: nowrap;
+    }"
+    ":scope > .zui-chart__probe > .zui-chart__probe-unit { flex: none; width: 100px; height: 0; }"
+    ":scope .zui-chart__label[data-axis=\"category\"] { transform: translateX(-50%); }"
 
     // ---- the key -------------------------------------------------------------------------------
-    ":scope .zui-chart__legend {
+    // Unscoped, as the readout is, so a key drawn outside a chart looks the same as one inside.
+    ".zui-chart__legend {
         display: flex;
         flex-wrap: wrap;
         align-items: center;
@@ -74,16 +93,16 @@ style! { pub ChartStyle =>
         gap: var(--zui-space-lg);
         padding-top: var(--zui-space-md);
     }"
-    ":scope .zui-chart__legend[data-align=\"top\"] {
+    ".zui-chart__legend[data-align=\"top\"] {
         padding-top: 0;
         padding-bottom: var(--zui-space-md);
     }"
-    ":scope .zui-chart__key {
+    ".zui-chart__key {
         display: flex;
         align-items: center;
         gap: calc(var(--zui-space-base) * 1.5);
     }"
-    ":scope .zui-chart__swatch {
+    ".zui-chart__swatch {
         width: 8px;
         height: 8px;
         flex: none;

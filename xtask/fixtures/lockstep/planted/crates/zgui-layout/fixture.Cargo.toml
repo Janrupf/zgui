@@ -1,0 +1,8 @@
+[package]
+name = "zgui-layout"
+version.workspace = true
+edition = "2024"
+
+[dependencies]
+zgui-geom = { path = "../zgui-geom", version = "0.1.0" }
+cephal.workspace = true

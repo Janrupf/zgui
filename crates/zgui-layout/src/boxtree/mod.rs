@@ -16,6 +16,7 @@ pub mod classify;
 pub mod contents;
 pub mod order;
 pub mod patch;
+pub(crate) mod percent;
 pub mod pseudo;
 
 pub use crate::boxtree::build::{Owed, REBUILDS, build, retire};

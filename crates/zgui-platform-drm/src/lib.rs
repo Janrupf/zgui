@@ -173,7 +173,7 @@
 //! into graphics mode — `console` says what the pair does and what it does not.
 //!
 //! It also writes the displays it lit into the `Displays` it was given, for as long as it turns.
-//! That map and the renderer are one decision, so `App::run_drm` makes one map and hands it to
+//! That map and the renderer are one decision, so `zgui_console::RunDrm::run_drm` makes one map and hands it to
 //! both.
 //!
 //! `run` takes the graphics device beside the map, for the same reason and one more: the images a
@@ -189,7 +189,7 @@
 //!
 //! No graphics API in this workspace's dependency set reads those two variants yet. wgpu answers a
 //! DRM handle with "not a Vulkan-compatible handle", which is a true report of where the gap is.
-//! `App::run_drm` replaces the renderer factory with one that draws through this backend.
+//! `zgui_console::RunDrm::run_drm` replaces the renderer factory with one that draws through this backend.
 
 // Every item this doc names is Linux-only and the doc itself is not, so the names above are in
 // backticks rather than intra-doc links. A link to a `cfg`-gated item is broken on every other

@@ -29,10 +29,11 @@ pub mod snapshot;
 /// interchange vocabulary: they would otherwise need a second name to cross that edge.
 pub use accesskit::{Tree as A11yTree, TreeId, TreeUpdate};
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use accesskit::{Node, NodeId, Tree};
 use zgui_dom::{Document, NodeKey};
+use zgui_profile::Counter;
 
 use crate::build::pending::Pending;
 use crate::build::snapshot::Snapshots;
@@ -244,7 +245,10 @@ impl A11yBuilder {
                 continue;
             }
             let departed: Vec<NodeKey> = if world.is_projected(key) {
-                let still_here = project::children::of(world, key);
+                // A set rather than the list: a container with thousands of children asks this
+                // once per held child, and a scan per ask is quadratic in the container.
+                let still_here: HashSet<NodeId> =
+                    project::children::of(world, key).into_iter().collect();
                 self.held
                     .children_of(key)
                     .iter()
@@ -304,8 +308,9 @@ impl A11yBuilder {
             // Gone since the move was recorded, and already retired along with everything below it.
             return;
         }
-        let bounds = project::geometry::bounds_of(world, key);
-        let sent = self.held.remeasure(key, bounds);
+        zgui_profile::counter::bump(Counter::A11yRemeasured);
+        let geometry = project::geometry::measure(world, key);
+        let sent = self.held.remeasure(key, &geometry);
         self.file_by_space(world, key);
         if let Some(node) = sent {
             nodes.push((to_a11y(key), node));
@@ -333,6 +338,7 @@ impl A11yBuilder {
             // Gone, and already retired along with everything below it.
             return;
         };
+        zgui_profile::counter::bump(Counter::A11yProjected);
         let changed = self.held.record(key, &projected);
         self.file_by_space(world, key);
         if changed {

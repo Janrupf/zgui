@@ -47,9 +47,15 @@ pub struct Solution {
     pub placement: Placement,
     /// How far the surface still hangs outside the window after everything was tried.
     ///
-    /// Zero in every case that fits. Non-zero means the window is genuinely too small, and a
-    /// caller that wants to clamp the surface's own size reads this rather than measuring again.
+    /// Zero in every case that fits. Non-zero means the window is genuinely too small.
     pub overflow: f32,
+    /// The largest size the surface can have and stay inside the window, from where it went.
+    ///
+    /// Along the side's axis, the room between the anchor and the window's edge on the side it
+    /// went to, less the offset and the padding. Across it, the window less the padding at both
+    /// ends. Never negative. A surface capped to this fits, and solving again from the capped size
+    /// gives the same answer.
+    pub available: Size<DevicePx, Device>,
 }
 
 /// Places `floating` against `anchor`, inside `viewport`.
@@ -57,11 +63,14 @@ pub struct Solution {
 /// Three steps, in this order, because each depends on the last:
 ///
 /// 1. **place** the surface on the side and alignment asked for;
-/// 2. **flip** to the opposite side when that side has less room than the other — and only when
-///    the other side has *enough*, so a surface that fits nowhere stays where it was asked rather
-///    than flapping between two equally bad choices;
+/// 2. **flip** to the opposite side when the surface does not fit on the side asked for, and the
+///    other side either fits it or has more room — so a surface that fits nowhere goes to the
+///    bigger side, where [`Solution::available`] caps it the least;
 /// 3. **shift** along the anchor's edge until the surface is inside the window, which is what
 ///    keeps a menu under a button at the far right of the window on screen.
+///
+/// The answer is stable: the side is decided from the side asked for every time, and a surface
+/// capped to [`Solution::available`] is placed where its uncapped size was.
 ///
 /// ```
 /// use zgui::geom::{DevicePx, Point, Rect, Size};
@@ -94,15 +103,16 @@ pub fn solve(
     if options.flip {
         let asked = room_on(placement.side, anchor, viewport);
         let across = room_on(placement.side.opposite(), anchor, viewport);
-        let needed = extent(placement.side, floating) + options.offset;
-        // Only when the other side actually fits. Flipping to a side that is merely *less* short
-        // is how a surface in a window too small for it oscillates every frame.
-        if asked < needed && across >= needed {
+        let needed = extent(placement.side, floating) + options.offset + options.padding;
+        // To a side that fits, or that has more room. The rooms depend only on the anchor, so
+        // the answer does not change when the surface is capped to the room it was given.
+        if asked < needed && (across >= needed || across > asked) {
             placement = placement.flipped();
         }
     }
 
-    let mut origin = place(placement, anchor, floating, options.offset);
+    let available = available_on(placement.side, anchor, viewport, options);
+    let mut origin = place(placement, anchor, floating, available, options.offset);
     if options.shift {
         origin = shift_into(origin, floating, viewport, placement.side, options.padding);
     }
@@ -111,7 +121,57 @@ pub fn solve(
         origin,
         placement,
         overflow: overflow_of(origin, floating, viewport),
+        available,
     }
+}
+
+/// The largest surface that stays inside the window on `side` of `anchor`.
+fn available_on(
+    side: Side,
+    anchor: WindowRect,
+    viewport: WindowRect,
+    options: &PopperOptions,
+) -> Size<DevicePx, Device> {
+    let along = (room_on(side, anchor, viewport) - options.offset - options.padding).max(0.0);
+    let (width, height) = (viewport.size.width.0, viewport.size.height.0);
+    let across = |extent: f32| (extent - 2.0 * options.padding).max(0.0);
+    if side.is_vertical() {
+        Size::new(DevicePx(across(width)), DevicePx(along))
+    } else {
+        Size::new(DevicePx(along), DevicePx(across(height)))
+    }
+}
+
+/// The centre of `anchor`, measured from the corner of a surface at `origin` and held inside it.
+///
+/// An arrow on the surface points at this point. A surface that slides along the anchor's edge
+/// keeps its arrow on the anchor, and an anchor wider than the surface puts the arrow on the
+/// surface's nearest edge.
+///
+/// ```
+/// use zgui::geom::{DevicePx, Point, Rect, Size};
+/// use zgui_ui_primitives::popper::anchor_point;
+///
+/// let anchor = Rect::new(
+///     Point::new(DevicePx(100.0), DevicePx(40.0)),
+///     Size::new(DevicePx(60.0), DevicePx(20.0)),
+/// );
+/// let origin = Point::new(DevicePx(100.0), DevicePx(0.0));
+/// let point = anchor_point(anchor, origin, Size::new(DevicePx(200.0), DevicePx(30.0)));
+/// assert_eq!(point.x.0, 30.0);
+/// ```
+#[must_use]
+pub fn anchor_point(
+    anchor: WindowRect,
+    origin: Point<DevicePx, Device>,
+    floating: Size<DevicePx, Device>,
+) -> Point<DevicePx, Device> {
+    let x = anchor.origin.x.0 + anchor.size.width.0 / 2.0 - origin.x.0;
+    let y = anchor.origin.y.0 + anchor.size.height.0 / 2.0 - origin.y.0;
+    Point::new(
+        DevicePx(x.clamp(0.0, floating.width.0.max(0.0))),
+        DevicePx(y.clamp(0.0, floating.height.0.max(0.0))),
+    )
 }
 
 /// How much room there is between the anchor and the window's edge on `side`.
@@ -140,10 +200,14 @@ fn extent(side: Side, floating: Size<DevicePx, Device>) -> f32 {
 }
 
 /// The surface's corner for a placement, before anything is shifted.
+///
+/// Above or left of the anchor, the surface is placed from the smaller of its size and the room
+/// available, so its corner is where it will be once it is capped to that room.
 fn place(
     placement: Placement,
     anchor: WindowRect,
     floating: Size<DevicePx, Device>,
+    available: Size<DevicePx, Device>,
     offset: f32,
 ) -> Point<DevicePx, Device> {
     let (anchor_x, anchor_y) = (anchor.origin.x.0, anchor.origin.y.0);
@@ -153,14 +217,14 @@ fn place(
     let (x, y) = match placement.side {
         Side::Top => (
             along(placement.align, anchor_x, anchor_w, width),
-            anchor_y - height - offset,
+            anchor_y - height.min(available.height.0) - offset,
         ),
         Side::Bottom => (
             along(placement.align, anchor_x, anchor_w, width),
             anchor_y + anchor_h + offset,
         ),
         Side::Left => (
-            anchor_x - width - offset,
+            anchor_x - width.min(available.width.0) - offset,
             along(placement.align, anchor_y, anchor_h, height),
         ),
         Side::Right => (
@@ -245,7 +309,7 @@ fn overflow_of(
 mod tests {
     use zgui::geom::{DevicePx, Point, Rect, Size};
 
-    use super::{PopperOptions, Solution, WindowRect, solve};
+    use super::{PopperOptions, Solution, WindowRect, anchor_point, solve};
     use crate::popper::placement::{Align, Placement, Side};
 
     fn rect(x: f32, y: f32, width: f32, height: f32) -> WindowRect {
@@ -290,18 +354,81 @@ mod tests {
     }
 
     #[test]
-    fn a_surface_that_fits_nowhere_stays_where_it_was_asked_rather_than_flapping() {
-        // The oscillation this prevents has no still frame to catch it in: each frame the surface
-        // flips to the side with more room, which is then the side with less.
+    fn a_surface_that_fits_nowhere_goes_to_the_bigger_side_and_is_capped_there() {
+        // Below has 276 pixels and above has 300, so above caps it the least.
         let anchor = rect(100.0, 300.0, 80.0, 24.0);
         let taller_than_the_window = size(200.0, 700.0);
         let first = solved(anchor, taller_than_the_window);
-        assert_eq!(first.placement, Placement::BOTTOM, "it stayed put");
-        assert!(first.overflow > 0.0, "and said how badly it does not fit");
+        assert_eq!(first.placement.side, Side::Top);
+        assert_eq!(first.available.height.0, 300.0 - 4.0 - 8.0);
+        assert_eq!(
+            first.origin.y.0, 8.0,
+            "its top edge is at the padding, where the capped surface starts"
+        );
 
-        // Solving again from the answer gives the same answer, which is the whole property.
-        let second = solved(anchor, taller_than_the_window);
-        assert_eq!(first, second);
+        // Capped to the room it was given, it is solved to the same place: nothing moves between
+        // the frame that measured it uncapped and the frame that measured it capped.
+        let capped = size(200.0, first.available.height.0);
+        let second = solved(anchor, capped);
+        assert_eq!(first.placement, second.placement);
+        assert_eq!(first.origin, second.origin);
+        assert_eq!(first.available, second.available);
+        assert_eq!(second.overflow, 0.0);
+    }
+
+    #[test]
+    fn a_surface_that_fits_nowhere_and_was_asked_for_the_bigger_side_stays_there() {
+        let anchor = rect(100.0, 200.0, 80.0, 24.0);
+        let first = solved(anchor, size(200.0, 700.0));
+        assert_eq!(first.placement, Placement::BOTTOM);
+        let height = 600.0 - (200.0 + 24.0) - 4.0 - 8.0;
+        assert_eq!(first.available.height.0, height);
+
+        let second = solved(anchor, size(200.0, height));
+        assert_eq!(first.placement, second.placement);
+        assert_eq!(first.origin, second.origin);
+        assert_eq!(second.overflow, 0.0);
+    }
+
+    #[test]
+    fn the_room_available_is_measured_on_the_side_the_surface_went_to() {
+        let anchor = rect(300.0, 200.0, 100.0, 30.0);
+        let below = solved(anchor, size(200.0, 120.0));
+        assert_eq!(below.available.height.0, 600.0 - 230.0 - 4.0 - 8.0);
+        assert_eq!(below.available.width.0, 800.0 - 16.0);
+
+        let at = |side| {
+            solve(
+                anchor,
+                size(60.0, 40.0),
+                window(),
+                &PopperOptions {
+                    placement: Placement::new(side, Align::Center),
+                    ..PopperOptions::default()
+                },
+            )
+            .available
+        };
+        assert_eq!(at(Side::Top).height.0, 200.0 - 4.0 - 8.0);
+        assert_eq!(at(Side::Left).width.0, 300.0 - 4.0 - 8.0);
+        assert_eq!(at(Side::Left).height.0, 600.0 - 16.0);
+        assert_eq!(at(Side::Right).width.0, 800.0 - 400.0 - 4.0 - 8.0);
+    }
+
+    #[test]
+    fn the_room_available_is_never_negative() {
+        // An anchor right against the bottom edge, asked to stay below it.
+        let anchor = rect(100.0, 590.0, 80.0, 10.0);
+        let solution = solve(
+            anchor,
+            size(200.0, 100.0),
+            window(),
+            &PopperOptions {
+                flip: false,
+                ..PopperOptions::default()
+            },
+        );
+        assert_eq!(solution.available.height.0, 0.0);
     }
 
     #[test]
@@ -422,5 +549,28 @@ mod tests {
         assert_eq!(solution.placement.side, Side::Top);
         assert!(solution.origin.y.0 >= 50.0);
         assert!(solution.origin.x.0 >= 108.0);
+    }
+
+    #[test]
+    fn the_anchor_point_follows_a_surface_aligned_to_the_start() {
+        let anchor = rect(300.0, 200.0, 60.0, 20.0);
+        let floating = size(240.0, 30.0);
+        let options = PopperOptions {
+            placement: Placement::new(Side::Top, Align::Start),
+            ..PopperOptions::default()
+        };
+        let solution = solve(anchor, floating, window(), &options);
+        let point = anchor_point(anchor, solution.origin, floating);
+        assert_eq!(point.x.0, 30.0);
+        assert_eq!(point.y.0, 30.0);
+    }
+
+    #[test]
+    fn the_anchor_point_stays_inside_the_surface() {
+        let anchor = rect(0.0, 200.0, 600.0, 20.0);
+        let floating = size(100.0, 30.0);
+        let point = anchor_point(anchor, Point::new(DevicePx(0.0), DevicePx(160.0)), floating);
+        assert_eq!(point.x.0, 100.0);
+        assert_eq!(point.y.0, 30.0);
     }
 }

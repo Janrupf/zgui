@@ -101,7 +101,9 @@ pub use kurbo;
 pub use peniko;
 
 pub use crate::batch::{Batch, Batches};
-pub use crate::clip::{ClipLink, ClipNode, ClipTable, MaskSource, ResolvedClip, RoundedTest};
+pub use crate::clip::{
+    ClipLink, ClipNode, ClipTable, KeptClip, MaskSource, ResolvedClip, RoundedTest,
+};
 pub use crate::content::{Content, ContentHash};
 pub use crate::group::{BackdropCapture, BackdropFilter, Filter, GroupBoundary, read_extent};
 pub use crate::id::{
@@ -110,18 +112,23 @@ pub use crate::id::{
 pub use crate::ops::PaintOp;
 pub use crate::order::BoundsTree;
 pub use crate::paint::{
-    GradientKind, Paint, PaintKind, PaintRef, PaintTable, TextPaint, TextPaintTable,
+    GradientKind, Paint, PaintEntry, PaintKind, PaintOwner, PaintRef, PaintRewrite, PaintRole,
+    PaintTable, TextPaint, TextPaintTable,
 };
-pub use crate::pass::{Overlap, PassWarning, PlannedItem, PlannedPass, ScenePassPlan};
+pub use crate::pass::{
+    MarkBin, MarkPlan, Overlap, PassWarning, PlannedItem, PlannedPass, ScenePassPlan,
+};
 pub use crate::place::Placement;
 pub use crate::place::band::{Travel, Travels};
 pub use crate::prim::{
-    ColorSprite, CornerShape, Decoration, ExternalQuad, ExternalTextureId, MonoSprite,
-    PrimitiveKind, Quad, Resource, ShadedQuad, Shadow, SpriteTile, SubpixelSprite,
+    ColorSprite, CornerShape, Decoration, ExternalQuad, ExternalTextureId, MarkBox, MarkFlags,
+    MarkItem, MarkPayload, MonoSprite, PrimitiveKind, Quad, Resource, ShadedQuad, Shadow,
+    SpriteTile, SubpixelSprite,
 };
 pub use crate::resource::{ResourceGeneration, ResourceKey, ResourceKind, ResourceRegistry};
+pub use crate::scene::resolve::Settle;
 pub use crate::scene::{
-    ChunkPrims, ChunkSlot, ChunkUpload, OpaqueCover, Scene, SpatialFault, TableHolds,
+    ChunkNote, ChunkPrims, ChunkSlot, OpaqueCover, Scene, SpatialFault, TableHolds,
 };
 pub use crate::shader::{
     FrameClock, MAX_PARAMS_BYTES, ShaderDeclaration, ShaderField, ShaderId, ShaderMode,

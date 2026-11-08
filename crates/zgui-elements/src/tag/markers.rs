@@ -49,6 +49,10 @@ elements! {
     ///
     /// Every child is positioned against this element, so a badge over an avatar and an overlay
     /// over an image are one element each rather than a positioning context built by hand.
+    ///
+    /// The default sheet makes it a one-cell grid and puts every child element in that cell. Bare
+    /// text directly in a stack is an anonymous grid item: it goes in a new row below the cell.
+    /// Wrap such text in an element to layer it.
     Stack = stack, "stack";
 
     /// A run of text.

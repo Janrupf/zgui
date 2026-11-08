@@ -14,8 +14,12 @@ style! { pub AvatarStyle =>
         align-items: center;
         justify-content: center;
         flex: none;
-        width: 32px;
-        height: 32px;
+        --zui-avatar-size: max(
+            calc(var(--zui-space-base) * 8),
+            calc(var(--zui-type-size-sm) * 16 / 7)
+        );
+        width: var(--zui-avatar-size);
+        height: var(--zui-avatar-size);
         border-radius: var(--zui-radius-full);
         background-color: var(--zui-color-muted);
         color: var(--zui-color-muted-foreground);
@@ -25,8 +29,19 @@ style! { pub AvatarStyle =>
         line-height: var(--zui-type-leading-sm);
         user-select: none;
     }"
-    ":scope[data-size=\"sm\"] { width: 24px; height: 24px; font-size: var(--zui-type-size-xs); }"
-    ":scope[data-size=\"lg\"] { width: 40px; height: 40px; }"
+    // The disc follows the larger of the space unit and the type of its initials, so a theme with
+    // large type and a theme with tight spacing both keep two initials inside it. The default tokens
+    // give 32, 24 and 40px.
+    ":scope[data-size=\"sm\"] {
+        --zui-avatar-size: max(calc(var(--zui-space-base) * 6), calc(var(--zui-type-size-xs) * 2));
+        font-size: var(--zui-type-size-xs);
+    }"
+    ":scope[data-size=\"lg\"] {
+        --zui-avatar-size: max(
+            calc(var(--zui-space-base) * 10),
+            calc(var(--zui-type-size-sm) * 20 / 7)
+        );
+    }"
 
     ":scope > .zui-avatar__image {
         position: absolute;
@@ -80,7 +95,7 @@ style! { pub AvatarStyle =>
     // overlap legible rather than turning the row into one smear.
     ".zui-avatar-group { display: flex; flex-direction: row; align-items: center; }"
     ".zui-avatar-group > * { box-shadow: 0 0 0 2px var(--zui-color-background); }"
-    ".zui-avatar-group > *:not(:first-child) { margin-left: -8px; }"
+    ".zui-avatar-group > *:not(:first-child) { margin-left: calc(var(--zui-space-base) * -2); }"
 
     ".zui-avatar-group__count {
         position: relative;
@@ -88,8 +103,8 @@ style! { pub AvatarStyle =>
         flex: none;
         align-items: center;
         justify-content: center;
-        width: 32px;
-        height: 32px;
+        width: max(calc(var(--zui-space-base) * 8), calc(var(--zui-type-size-sm) * 16 / 7));
+        height: max(calc(var(--zui-space-base) * 8), calc(var(--zui-type-size-sm) * 16 / 7));
         border-radius: var(--zui-radius-full);
         background-color: var(--zui-color-muted);
         color: var(--zui-color-muted-foreground);
@@ -99,14 +114,14 @@ style! { pub AvatarStyle =>
     // The count takes the size of the faces beside it rather than one of its own, so a group never
     // ends in a disc that is the wrong size for the row it closes.
     ".zui-avatar-group[data-size=\"sm\"] > .zui-avatar-group__count {
-        width: 24px;
-        height: 24px;
+        width: max(calc(var(--zui-space-base) * 6), calc(var(--zui-type-size-xs) * 2));
+        height: max(calc(var(--zui-space-base) * 6), calc(var(--zui-type-size-xs) * 2));
         font-size: var(--zui-type-size-xs);
         --zui-icon-md: 12px;
     }"
     ".zui-avatar-group[data-size=\"lg\"] > .zui-avatar-group__count {
-        width: 40px;
-        height: 40px;
+        width: max(calc(var(--zui-space-base) * 10), calc(var(--zui-type-size-sm) * 20 / 7));
+        height: max(calc(var(--zui-space-base) * 10), calc(var(--zui-type-size-sm) * 20 / 7));
         --zui-icon-md: 20px;
     }"
 }

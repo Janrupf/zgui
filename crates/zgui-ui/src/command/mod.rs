@@ -1,27 +1,23 @@
 //! Everything that can be done, searched by typing.
 
 mod input;
+mod item;
 mod list;
+mod separator;
 mod style;
 
 /// What a palette says when the search finds nothing.
 pub use crate::combobox::ComboboxEmpty as CommandEmpty;
 /// The props of [`CommandEmpty`].
 pub use crate::combobox::ComboboxEmptyProps as CommandEmptyProps;
-/// One command. A [`ComboboxItem`](crate::ComboboxItem), whose `on_select` is what running it is.
-pub use crate::combobox::ComboboxItem as CommandItem;
-/// The props of [`CommandItem`].
-pub use crate::combobox::ComboboxItemProps as CommandItemProps;
 pub use crate::command::input::{CommandInput, CommandInputProps};
+pub use crate::command::item::{CommandItem, CommandItemProps};
 pub use crate::command::list::{
     CommandDialog, CommandDialogProps, CommandGroup, CommandGroupProps, CommandList,
     CommandListProps,
 };
+pub use crate::command::separator::{CommandSeparator, CommandSeparatorProps};
 pub use crate::command::style::CommandStyle;
-/// A rule between two groups of commands.
-pub use crate::menu::MenuSeparator as CommandSeparator;
-/// The props of [`CommandSeparator`].
-pub use crate::menu::MenuSeparatorProps as CommandSeparatorProps;
 /// The keystroke that runs a command without opening the palette.
 pub use crate::menu::MenuShortcut as CommandShortcut;
 /// The props of [`CommandShortcut`].

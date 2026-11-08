@@ -189,11 +189,6 @@ fn compose_into(
     let instances = buffers
         .instance_bind_group(gpu, pipelines.layouts(), 0)
         .expect("the quad pipeline draws instances");
-    // The draw order arrives as vertex input rather than through the bind group, so a draw built
-    // by hand binds it the way `frame::pass` does.
-    let remap = buffers
-        .remap_buffer(PipelineKind::Quad)
-        .expect("the quad pipeline has a draw order");
 
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -218,7 +213,8 @@ fn compose_into(
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &frame, &[globals]);
         pass.set_bind_group(1, &instances, &[]);
-        pass.set_vertex_buffer(0, remap.slice(..));
+        // The draw order, as the renderer binds it: this scene's lane starts at zero.
+        pass.set_vertex_buffer(0, buffers.orders[0].slice_from(0));
         pass.draw(0..4, 0..scene.primitives.quads.len() as u32);
     }
     gpu.queue().submit([encoder.finish()]);

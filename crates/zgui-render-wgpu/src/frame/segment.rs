@@ -3,10 +3,9 @@
 use core::ops::Range;
 
 use zgui_geom::{Device, Rect};
-use zgui_scene::ExternalTextureId;
+use zgui_scene::{Batch, ExternalTextureId};
 
 use crate::frame::target::TargetRef;
-use crate::pipeline::kind::PipelineKind;
 
 /// One draw of a planned pass.
 #[derive(Clone, Debug, PartialEq)]
@@ -18,20 +17,7 @@ pub enum PlannedDraw {
     /// mechanism rather than a description.
     Clear,
     /// One batch of the display list, drawn instanced out of the frame's buffers.
-    ///
-    /// The instances are a run of the frame's own order list rather than a range of the scene's,
-    /// because the ones that cannot reach this draw's scissor were left out when it was planned.
-    /// See [`DrawOrders`](crate::buffer::orders::DrawOrders).
-    Instances {
-        /// Which pipeline draws them.
-        kind: PipelineKind,
-        /// The atlas texture they read, packed as the display list packs it, for a sprite batch.
-        texture: Option<u32>,
-        /// The first of this draw's entries in the frame's order list.
-        first: u32,
-        /// How many instances it draws.
-        count: u32,
-    },
+    Batch(Batch),
     /// One filtering pass of the blur chain, reading `source`.
     Blur {
         /// What it reads.
@@ -40,21 +26,6 @@ pub enum PlannedDraw {
         params: u32,
         /// Whether this is the 2:1 downsample rather than one of the two axis passes.
         downsample: bool,
-    },
-    /// One run of rectangles drawn by an application's own primitive effect.
-    ///
-    /// Culled and drawn exactly as [`PlannedDraw::Instances`] is — a run of the frame's order list
-    /// — but through a pipeline this crate never enumerated and with a parameter block of its own,
-    /// so it is its own variant rather than a `kind` of that one.
-    Shaded {
-        /// The effect that draws them.
-        shader: zgui_scene::ShaderId,
-        /// The parameter block they are drawn with.
-        params: zgui_scene::ShaderParamsSlot,
-        /// The first of this draw's entries in the frame's order list.
-        first: u32,
-        /// How many instances it draws.
-        count: u32,
     },
     /// One filtering pass of an application's own shader, reading `source`.
     Effect {
@@ -80,6 +51,26 @@ pub enum PlannedDraw {
         texture: ExternalTextureId,
         /// The dynamic offset of its block.
         params: u32,
+    },
+    /// One payload kind of one mark item: painted into the target, or added into its bin.
+    Marks {
+        /// Which payload kind the instances walk.
+        kind: crate::pipeline::marks::MarkKind,
+        /// Whether the draw adds coverage into a bin page rather than painting.
+        coverage: bool,
+        /// The item's position in the draw-order remap, which names its payload ranges.
+        position: usize,
+        /// The dynamic offset of the item's block.
+        block: u32,
+        /// The instances the draw walks, as `[start, end)` from the item's payload start.
+        instances: [u32; 2],
+        /// The atlas texture a glyph item reads, packed as a sprite tile packs it.
+        texture: Option<u32>,
+    },
+    /// A union mark item painted through the coverage its prims summed into its bin.
+    MarksComposite {
+        /// The dynamic offset of the item's block.
+        block: u32,
     },
     /// One rasterised vector pass, composited back into the target.
     ///
@@ -157,6 +148,11 @@ pub enum Segment {
     Encoder(EncoderOp),
     /// A run of draws into one target.
     Pass(PlannedPass),
+    /// Rasterise this round of the vector plan before anything after it is recorded.
+    ///
+    /// The rasteriser submits work of its own into the layers the round before it used, so
+    /// everything recorded before this is submitted first.
+    Round(usize),
 }
 
 impl Segment {
@@ -164,7 +160,7 @@ impl Segment {
     pub fn pass(&self) -> Option<&PlannedPass> {
         match self {
             Self::Pass(pass) => Some(pass),
-            Self::Encoder(_) => None,
+            Self::Encoder(_) | Self::Round(_) => None,
         }
     }
 
@@ -172,7 +168,15 @@ impl Segment {
     pub fn encoder_op(&self) -> Option<EncoderOp> {
         match self {
             Self::Encoder(op) => Some(*op),
-            Self::Pass(_) => None,
+            Self::Pass(_) | Self::Round(_) => None,
+        }
+    }
+
+    /// The vector round this rasterises, if it is one.
+    pub fn round(&self) -> Option<usize> {
+        match self {
+            Self::Round(round) => Some(*round),
+            Self::Encoder(_) | Self::Pass(_) => None,
         }
     }
 }

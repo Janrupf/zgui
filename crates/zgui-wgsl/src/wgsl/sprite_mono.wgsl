@@ -9,7 +9,7 @@
 
 @group(1) @binding(0) var sprites: texture_2d<u32>;
 
-/// One sprite, which spans 5 texels of the arena.
+/// One `Sprite`, which the arena pads to 5 texels.
 fn load_sprite(slot: u32) -> Sprite {
     let base = slot * 5u;
     let t0 = textureLoad(sprites, table_texel(base + 0u), 0);
@@ -33,29 +33,27 @@ fn vs_mono_sprite(
     @builtin(vertex_index) vertex: u32,
     @location(0) slot: u32,
     @location(1) shift: vec2<f32>,
-) -> CoverageVarying {
+) -> SpriteVarying {
     let sprite = load_sprite(slot);
     let corner = unit_corner(vertex);
-    // The chunk's shift moves where the sprite is drawn; the coverage fragment reads only the
-    // atlas texel and the device position, so it is applied here and not carried across.
     let local = bounds_origin(sprite.bounds) + corner * bounds_size(sprite.bounds) + shift;
-    var out: CoverageVarying;
+    var out: SpriteVarying;
     out.position = to_clip_position(local, sprite.transform);
-    out.texel = tile_texel(corner, sprite.tile);
-    out.color = rgba_of(sprite.color);
-    out.tile_rect = tile_bounds(sprite.tile);
-    out.clip = sprite.clip;
+    out.v_tile = tile_bounds(sprite.tile);
+    out.texel = tile_texel(corner, out.v_tile);
+    out.v_color = rgba_of(sprite.color);
+    out.v_clip = sprite.clip;
     return out;
 }
 
 @fragment
-fn fs_mono_sprite(in: CoverageVarying) -> @location(0) vec4<f32> {
-    let clip = clip_coverage(device_position(in.position.xy), in.clip);
+fn fs_mono_sprite(in: SpriteVarying) -> @location(0) vec4<f32> {
+    let clip = clip_coverage(device_position(in.position.xy), in.v_clip);
     if clip <= 0.0 {
         return vec4<f32>(0.0);
     }
-    let color = in.color;
-    let sample = sample_atlas_rect(in.texel, in.tile_rect, 0.0).r;
+    let color = in.v_color;
+    let sample = sample_atlas(in.texel, in.v_tile, 0.0).r;
     let coverage = correct_coverage(sample, straight_rgb(color), globals.text.x);
     return color * coverage * clip;
 }

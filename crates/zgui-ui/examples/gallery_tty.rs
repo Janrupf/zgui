@@ -9,7 +9,7 @@
 //! **This one needs the device.** Switch to a spare terminal, log in, and run:
 //!
 //! ```text
-//! cargo build -p zgui-ui --release --example gallery_tty --features zgui/drm
+//! cargo build -p zgui-ui --release --example gallery_tty --features drm
 //! ./target/release/examples/gallery_tty
 //! ```
 //!
@@ -30,8 +30,11 @@ mod section;
 mod shell;
 
 use zgui::prelude::*;
+// `run_drm` is a trait method here: the console is a crate of its own rather than a feature of
+// the framework, so a program that wants the kernel's display names it.
 use zgui::reactive::RenderEffect;
 use zgui::{component, view};
+use zgui_console::RunDrm;
 
 use crate::app::GalleryProps;
 

@@ -147,14 +147,37 @@ fn routes(
         Some(zgui::render::VectorBackend::Other) => "general vector rasterizer",
         None => "general vector rasterizer (pending)",
     };
-    match (
+    let rest = match (
         atlas,
         routes.contains(zgui_paint::VectorRoute::GeneralRaster),
     ) {
-        (true, true) => format!("atlas / CPU mask + {general}"),
-        (true, false) => "atlas / CPU-rasterized mask".to_owned(),
-        (false, true) => general.to_owned(),
-        (false, false) => "none".to_owned(),
+        (true, true) => Some(format!("atlas / CPU mask + {general}")),
+        (true, false) => Some("atlas / CPU-rasterized mask".to_owned()),
+        (false, true) => Some(general.to_owned()),
+        (false, false) => None,
+    };
+    let labels: Vec<String> = [
+        routes
+            .contains(zgui_paint::VectorRoute::Analytic)
+            .then(|| "analytic quads".to_owned()),
+        routes
+            .contains(zgui_paint::VectorRoute::Marks)
+            .then(|| "marks".to_owned()),
+        routes
+            .contains(zgui_paint::VectorRoute::PathGlyphs)
+            .then(|| "path glyphs".to_owned()),
+        routes
+            .contains(zgui_paint::VectorRoute::CpuLayer)
+            .then(|| "CPU layer".to_owned()),
+        rest,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if labels.is_empty() {
+        "none".to_owned()
+    } else {
+        labels.join(" + ")
     }
 }
 
@@ -194,5 +217,44 @@ mod tests {
             routes(both, Some(zgui::render::VectorBackend::Vello)),
             "atlas / CPU mask + Vello"
         );
+
+        let mut analytic = zgui_paint::VectorRoutes::NONE;
+        analytic.insert(zgui_paint::VectorRoute::Analytic);
+        assert_eq!(routes(analytic, None), "analytic quads");
+        analytic.insert(zgui_paint::VectorRoute::AtlasMask);
+        assert_eq!(
+            routes(analytic, None),
+            "analytic quads + atlas / CPU-rasterized mask"
+        );
+        both.insert(zgui_paint::VectorRoute::Analytic);
+        assert_eq!(
+            routes(both, Some(zgui::render::VectorBackend::Vello)),
+            "analytic quads + atlas / CPU mask + Vello"
+        );
+        assert_eq!(routes(zgui_paint::VectorRoutes::NONE, None), "none");
+
+        let mut marks = zgui_paint::VectorRoutes::NONE;
+        marks.insert(zgui_paint::VectorRoute::Marks);
+        assert_eq!(routes(marks, None), "marks");
+        marks.insert(zgui_paint::VectorRoute::Analytic);
+        assert_eq!(routes(marks, None), "analytic quads + marks");
+        marks.insert(zgui_paint::VectorRoute::GeneralRaster);
+        assert_eq!(
+            routes(marks, Some(zgui::render::VectorBackend::Vello)),
+            "analytic quads + marks + Vello"
+        );
+
+        marks.insert(zgui_paint::VectorRoute::PathGlyphs);
+        assert_eq!(
+            routes(marks, Some(zgui::render::VectorBackend::Vello)),
+            "analytic quads + marks + path glyphs + Vello"
+        );
+
+        let mut layer = zgui_paint::VectorRoutes::NONE;
+        layer.insert(zgui_paint::VectorRoute::CpuLayer);
+        assert_eq!(routes(layer, None), "CPU layer");
+        let mut glyphs = zgui_paint::VectorRoutes::NONE;
+        glyphs.insert(zgui_paint::VectorRoute::PathGlyphs);
+        assert_eq!(routes(glyphs, None), "path glyphs");
     }
 }

@@ -10,9 +10,7 @@ pub(crate) mod layers;
 pub(crate) mod mutation;
 pub(crate) mod pinned;
 pub(crate) mod skips;
-pub(crate) mod spikes;
 pub(crate) mod tag_syntax;
-pub(crate) mod topo;
 pub(crate) mod unsafe_code;
 pub(crate) mod versions;
 
@@ -56,17 +54,10 @@ pub(crate) const CHECKS: &[Check] = &[
         description: "the two dependency lists that are pinned exactly, and the edge that must not exist",
         run: pinned::check,
     },
-    // Before `topo`, which asks a related question from a schedule a clone may not have. The layer
-    // headers are committed; `docs/planning/PHASES.md` is not.
     Check {
         name: "layers",
         description: "every dependency points at the crate's own layer or a lower one",
         run: layers::check,
-    },
-    Check {
-        name: "topo",
-        description: "the phase schedule is a topological order of the real manifest graph",
-        run: topo::check,
     },
     // Before the two checks that read the suite, because both of them are satisfied by a test that
     // exists and neither by one that runs.
@@ -77,7 +68,7 @@ pub(crate) const CHECKS: &[Check] = &[
     },
     Check {
         name: "counters",
-        description: "every frame counter is incremented by something, or listed as awaiting its stage",
+        description: "every frame counter is incremented by something, or listed as awaiting its stage, and no normal dependency turns the counters on",
         run: counters::check,
     },
     Check {
@@ -104,11 +95,6 @@ pub(crate) const CHECKS: &[Check] = &[
         name: "tag-syntax",
         description: "no view, in code or in a document, is written in the spelling the grammar replaced",
         run: tag_syntax::check,
-    },
-    Check {
-        name: "spikes",
-        description: "every spike names the phase that deletes it, and none outlives it",
-        run: spikes::check,
     },
 ];
 

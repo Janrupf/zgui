@@ -32,7 +32,14 @@ use crate::text::EditText;
 /// editor.apply(zgui_edit::editor::Command::Undo);
 /// assert_eq!(editor.text(), "hello", "one undo, however many letters it was");
 /// ```
-#[derive(Clone, Debug)]
+///
+/// # Secure
+///
+/// A [secure](Editor::set_secure) editor holds a value nobody may read off the screen: a
+/// password. It edits as usual, with three changes. Copy and cut do nothing and give no text.
+/// Word movement and word deletion act on the whole text, because word boundaries tell where the
+/// spaces are. [`Debug`] shows no text, history or composition.
+#[derive(Clone)]
 pub struct Editor {
     /// The text, split into paragraphs.
     text: EditText,
@@ -42,6 +49,29 @@ pub struct Editor {
     history: History,
     /// The composition in progress, if an input method has one.
     composing: Option<Composition>,
+    /// Whether the text is a secret.
+    secure: bool,
+}
+
+impl core::fmt::Debug for Editor {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.secure {
+            return formatter
+                .debug_struct("Editor")
+                .field("text", &"<redacted>")
+                .field("selection", &self.selection)
+                .field("secure", &true)
+                .finish_non_exhaustive();
+        }
+        formatter
+            .debug_struct("Editor")
+            .field("text", &self.text)
+            .field("selection", &self.selection)
+            .field("history", &self.history)
+            .field("composing", &self.composing)
+            .field("secure", &false)
+            .finish()
+    }
 }
 
 impl Editor {
@@ -52,7 +82,41 @@ impl Editor {
             selection: Selection::caret(0),
             history: History::new(),
             composing: None,
+            secure: false,
         }
+    }
+
+    /// Makes the text a secret, or a plain value again.
+    ///
+    /// The text, the selection, the history and a composition in progress stay as they are.
+    ///
+    /// ```
+    /// use zgui_edit::Editor;
+    /// use zgui_edit::editor::Command;
+    ///
+    /// let mut editor = Editor::new("hunter2");
+    /// editor.set_secure(true);
+    /// editor.apply(Command::SelectAll);
+    /// assert_eq!(editor.apply(Command::Copy).clipboard, None);
+    /// ```
+    pub fn set_secure(&mut self, on: bool) {
+        self.secure = on;
+    }
+
+    /// Whether the text is a secret.
+    pub fn is_secure(&self) -> bool {
+        self.secure
+    }
+
+    /// The selected text, when it may leave the editor.
+    ///
+    /// The one way selected text gets out of the model, for the clipboard or for anything else
+    /// that exports it. Nothing when the editor is secure or nothing is selected.
+    pub fn exportable_text(&self) -> Option<String> {
+        if self.secure {
+            return None;
+        }
+        self.selected_text()
     }
 
     /// The text.
@@ -202,11 +266,11 @@ impl Editor {
             Command::Redo => self.redo(),
             Command::Copy => Response {
                 handled: true,
-                clipboard: self.selected_text(),
+                clipboard: self.exportable_text(),
                 ..Response::default()
             },
             Command::Cut => {
-                let clipboard = self.selected_text();
+                let clipboard = self.exportable_text();
                 let mut response = if clipboard.is_some() {
                     self.replace_selection("", EditKind::Replace)
                 } else {
@@ -317,6 +381,18 @@ impl Editor {
         (!self.selection.is_caret()).then(|| self.text.slice(self.selection.range()))
     }
 
+    /// How far a movement or a deletion by `granularity` goes.
+    ///
+    /// A word is the whole text when the editor is secure: a caret that stops at word boundaries
+    /// tells where the spaces of a secret are.
+    fn reach(&self, granularity: Granularity) -> Granularity {
+        if self.secure && granularity == Granularity::Word {
+            Granularity::Document
+        } else {
+            granularity
+        }
+    }
+
     /// Replaces what is selected, recording one change.
     fn replace_selection(&mut self, with: &str, kind: EditKind) -> Response {
         let range = self.selection.range();
@@ -354,6 +430,7 @@ impl Editor {
         if !self.selection.is_caret() {
             return self.replace_selection("", EditKind::Replace);
         }
+        let granularity = self.reach(granularity);
         let content = self.text.text();
         let at = self.selection.focus;
         let other = match (granularity, forwards) {
@@ -392,6 +469,10 @@ impl Editor {
     /// Moves the caret.
     fn move_caret(&mut self, wanted: Motion) -> Response {
         let before = self.selection;
+        let wanted = Motion {
+            granularity: self.reach(wanted.granularity),
+            ..wanted
+        };
         let moved = motion::apply(&self.text, self.selection, wanted);
         self.put(moved);
         if self.selection != before {

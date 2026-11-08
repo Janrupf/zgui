@@ -68,15 +68,20 @@ pub(super) fn nearest_with_a_box(
 ///
 /// The walk starts *at* `from` and follows layout parents, which is the same chain the build
 /// descended: an out-of-flow ancestor is in it, because a box is taken out of its writer's layout
-/// list and not out of its own children's.
+/// list and not out of its own children's. When no box on it is positioned, the answer is the
+/// root's box, as it is for the build.
+///
+/// `None` when the chain ends somewhere other than the root, which means `from` is not in the tree.
 pub(super) fn containing_block(store: &LayoutStore, from: BoxKey) -> Option<BoxKey> {
     let mut next = Some(from);
+    let mut last = from;
     while let Some(key) = next {
         let node = store.get(key)?;
         if establishes_containing_block(classify(&node.style).positioned, node.fc) {
             return Some(key);
         }
+        last = key;
         next = node.parent;
     }
-    None
+    (store.root() == Some(last)).then_some(last)
 }

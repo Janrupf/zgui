@@ -1,6 +1,7 @@
-//! The rectangle primitives: quads, shaded quads, shadows and decoration lines.
+//! The rectangle primitives: quads, shaded quads, shadows and decoration lines, and the marks
+//! that draw recognised shapes.
 
-use zgui_scene::{ClipId, Decoration, Quad, Scene, ShadedQuad, Shadow};
+use zgui_scene::{ClipId, Decoration, MarkFlags, MarkItem, Quad, Scene, ShadedQuad, Shadow};
 
 use crate::text::number::{all_zero, float, list, rect};
 use crate::transcript::paint;
@@ -15,22 +16,10 @@ pub fn quad(scene: &Scene, quad: &Quad) -> String {
         paint::reference(&scene.paints, quad.fill)
     );
     if !all_zero(&quad.border) {
-        // One `stroke=` while the four sides agree, which is nearly every border there is, and the
-        // four spelled out when they do not. A border of one colour then reads as it always did.
-        let sides = quad.strokes;
-        let painted = if sides.iter().all(|side| *side == sides[0]) {
-            format!("stroke={}", paint::reference(&scene.paints, sides[0]))
-        } else {
-            let named: Vec<String> = sides
-                .iter()
-                .map(|side| paint::reference(&scene.paints, *side))
-                .collect();
-            format!("strokes=[{}]", named.join(" "))
-        };
         line.push_str(&format!(
-            " border={} {} style={}",
+            " border={} stroke={} style={}",
             list(&quad.border),
-            painted,
+            paint::reference(&scene.paints, quad.stroke),
             style::border(quad.style)
         ));
     }
@@ -106,7 +95,9 @@ pub fn shadow(scene: &Scene, shadow: &Shadow) -> String {
         line.push_str(&format!(" element_radii={}", list(&shadow.element_radii)));
     }
     if shadow.inset != 0 {
-        line.push_str(" inset");
+        // A drop shadow's shape is its bounds less the blur's reach. An inset shadow's hole is
+        // independent of its bounds, so it is printed.
+        line.push_str(&format!(" inset hole={}", rect(shadow.shape_bounds)));
     }
     line.push_str(&suffix(
         scene,
@@ -130,6 +121,60 @@ pub fn decoration(scene: &Scene, decoration: &Decoration) -> String {
         scene,
         ClipId(decoration.clip),
         scene.spatial.at(decoration.transform),
+    ));
+    line
+}
+
+/// Recognised shapes over a shared payload: the counts and the flags, never the payload.
+pub fn marks(scene: &Scene, mark: &MarkItem) -> String {
+    let cap = |shift: u32| match (mark.flags >> shift) & 3 {
+        MarkFlags::BUTT => "butt",
+        MarkFlags::SQUARE => "square",
+        MarkFlags::ROUND => "round",
+        _ => "<unknown>",
+    };
+    let mut line = format!(
+        "marks order={} bounds={} paint={} discs={} boxes={} vertices={}",
+        mark.order,
+        rect(mark.bounds),
+        paint::reference(&scene.paints, mark.paint),
+        mark.discs,
+        mark.boxes,
+        mark.vertices
+    );
+    if mark.glyphs > 0 {
+        line.push_str(&format!(" glyphs={} tiles={}", mark.glyphs, mark.tiles));
+    }
+    if mark.is_union() {
+        line.push_str(" union");
+    }
+    if mark.flags & MarkFlags::SCREEN != 0 {
+        line.push_str(" screen");
+    }
+    if mark.flags & MarkFlags::SQUARE_DISCS != 0 {
+        line.push_str(" square_discs");
+    }
+    if mark.axes != [1.0, 0.0, 0.0, 1.0] {
+        line.push_str(&format!(" axes={}", list(&mark.axes)));
+    }
+    if mark.vertices > 0 {
+        line.push_str(&format!(
+            " half_width={} caps={}/{}",
+            float(mark.half_width),
+            cap(MarkFlags::START_CAP_SHIFT),
+            cap(MarkFlags::END_CAP_SHIFT)
+        ));
+    }
+    if !all_zero(&mark.origin) {
+        line.push_str(&format!(" origin={}", list(&mark.origin)));
+    }
+    if !all_zero(&mark.paint_origin) {
+        line.push_str(&format!(" paint_origin={}", list(&mark.paint_origin)));
+    }
+    line.push_str(&suffix(
+        scene,
+        mark.clip_id(),
+        scene.spatial.at(mark.transform),
     ));
     line
 }

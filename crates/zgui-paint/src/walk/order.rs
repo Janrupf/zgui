@@ -76,6 +76,16 @@ pub struct Emission<'a> {
     /// `background-image` does not inherit, and a line box belongs to an anonymous box generated
     /// below whatever declared it.
     pub text_fill: Option<&'a crate::lower::background::GradientSpec>,
+    /// The parts of nested inline boxes a line paints, in tree order.
+    ///
+    /// Empty for every fragment that is not a line with [`FragmentFlags::INLINE_EFFECTS`]. Their
+    /// colours already carry the folded alpha.
+    ///
+    /// [`FragmentFlags::INLINE_EFFECTS`]: zgui_layout::fragment::FragmentFlags::INLINE_EFFECTS
+    pub inline: &'a [crate::emit::inline::InlinePaint],
+    /// Whether the fragment is the box of a nested inline box, whose decorations and outline the
+    /// lines it is on paint.
+    pub nested_inline: bool,
     /// Where glyphs come from.
     pub glyphs: &'a dyn GlyphSource,
     /// Where a run a custom element shaped itself gets its tiles.
@@ -104,12 +114,14 @@ pub struct Emission<'a> {
 }
 
 /// What one fragment emitted, including the path selected for vector content.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct FragmentEmission {
     /// How many primitives reached the scene.
     pub(crate) pushed: usize,
     /// Every vector path selected by the fragment's own content.
     pub(crate) vector_routes: vector::VectorRoutes,
+    /// What the layer route did for the fragment's drawing.
+    pub(crate) layer: vector::LayerOutcome,
 }
 
 /// Emits one fragment's own primitives, and returns how many were pushed.
@@ -129,8 +141,14 @@ pub(crate) fn fragment_tracked(
     let style = faded(emission.style, emission.alpha);
     let mut pushed = 0;
     // A box whose decorations draw nothing at all is the overwhelming majority of containers, and
-    // asking once is cheaper than three calls that each resolve a paint and push no primitive.
-    if !style.paints_nothing() {
+    // asking once is cheaper than three calls that each resolve a paint and push no primitive. A
+    // nested inline box draws its decorations on the lines it is on. A box whose animated colours
+    // are in owned slots is drawn at any alpha, so the slots have primitives to rewrite.
+    let draws = match emission.box_placement.owned {
+        Some((_, owned)) if owned.forces_box() => style.visible,
+        _ => !style.paints_nothing(),
+    };
+    if draws && !emission.nested_inline {
         pushed += box_::outer_shadows(scene, &style, emission.box_placement);
         pushed += box_::background_and_border(
             scene,
@@ -146,12 +164,13 @@ pub(crate) fn fragment_tracked(
     FragmentEmission {
         pushed,
         vector_routes: content.vector_routes,
+        layer: content.layer,
     }
 }
 
 /// Emits a fragment's outline, which is drawn after its descendants.
 pub fn outline(scene: &mut Scene, emission: &Emission<'_>) -> usize {
-    if vanished(emission.alpha) {
+    if vanished(emission.alpha) || emission.nested_inline {
         return 0;
     }
     let style = faded(emission.style, emission.alpha);
@@ -186,13 +205,29 @@ fn content_tracked(
         return FragmentEmission::default();
     }
     let mut routes = vector::VectorRoutes::NONE;
+    let mut layer = vector::LayerOutcome::default();
     let pushed = match fragment.kind {
         FragmentKind::Box => 0,
         FragmentKind::Line { paragraph, line } => {
+            // The backgrounds of the nested inline boxes first, under the selection and the
+            // glyphs.
+            let mut pushed = crate::emit::inline::boxes(
+                scene,
+                emission.inline,
+                emission.shaders,
+                emission.pointer,
+            );
             // The selection under the glyphs, the caret over them. Neither order is a preference:
             // a band drawn over opaque text hides the text it is meant to mark, and a caret drawn
             // under it disappears inside whichever letter it is sitting on.
-            let mut pushed = marks(scene, emission, paragraph, line, HighlightLayer::Behind);
+            pushed += marks(
+                scene,
+                emission,
+                fragment.box_,
+                paragraph,
+                line,
+                HighlightLayer::Behind,
+            );
             pushed += text::emit(
                 scene,
                 emission.glyphs,
@@ -202,10 +237,20 @@ fn content_tracked(
                 text::Inherited {
                     text_fill: emission.text_fill,
                     decorations: emission.decorations,
+                    inline: emission.inline,
                 },
                 emission.text_placement,
             );
-            pushed + marks(scene, emission, paragraph, line, HighlightLayer::InFront)
+            pushed += crate::emit::inline::outlines(scene, emission.inline);
+            pushed
+                + marks(
+                    scene,
+                    emission,
+                    fragment.box_,
+                    paragraph,
+                    line,
+                    HighlightLayer::InFront,
+                )
         }
         // A run is a style-uniform span *within* a line, and a fragment tree that splits lines that
         // far is what a rich-text editor needs rather than what a document produces. Until something
@@ -219,6 +264,7 @@ fn content_tracked(
             text::Inherited {
                 text_fill: emission.text_fill,
                 decorations: emission.decorations,
+                inline: &[],
             },
             emission.text_placement,
         ),
@@ -227,7 +273,7 @@ fn content_tracked(
                 scene,
                 source,
                 ReplacedPlacement {
-                    content_box: fragment.content_box,
+                    content_box: fragment.content_box(),
                     radii: box_::padding_radii(
                         emission.box_placement.radii,
                         emission.box_placement.border,
@@ -252,16 +298,17 @@ fn content_tracked(
             let Some(drawing) = emission.vectors.drawing(
                 node,
                 DrawingPlacement {
-                    content_box: fragment.content_box,
+                    content_box: fragment.content_box(),
                     scale: emission.scale,
                 },
             ) else {
                 return FragmentEmission::default();
             };
-            let emitted = vector::draw_with_masks_tracked(
+            // The layer reads the unfaded paint, and the sprite carries the folded opacity.
+            let emitted = vector::draw_drawing_tracked(
                 scene,
                 VectorId(fragment.key.index()),
-                &drawing.shapes,
+                &drawing,
                 style.shape,
                 emission.vector_masks,
                 VectorPlacement {
@@ -269,8 +316,16 @@ fn content_tracked(
                     transform: emission.box_placement.transform,
                     scale: emission.scale,
                 },
+                Some(vector::LayerInput {
+                    owner: VectorId(node.index() ^ (u32::from(node.generation().get()) << 24)),
+                    revision: emission.vectors.revision(node),
+                    paint: emission.style.shape,
+                    alpha: emission.alpha,
+                }),
+                style.vector_lod,
             );
             routes = emitted.routes;
+            layer = emitted.layer;
             emitted.pushed
         }
         // A custom element's primitives land here for the reason the vector arm's do: inside the
@@ -280,9 +335,12 @@ fn content_tracked(
             let Some((token, _, _)) = emission.custom_reference else {
                 return FragmentEmission::default();
             };
+            // The same question the text stage asks of this fragment: per-channel coverage
+            // survives an opaque destination on the pixel grid, and nothing else.
+            let text_subpixel = emission.text_placement.keeps_subpixel(scene);
             let mut painter = crate::content::custom::ScenePainter {
                 scene,
-                content_box: fragment.content_box,
+                content_box: fragment.content_box(),
                 clip: emission.box_placement.clip,
                 transform: emission.box_placement.transform,
                 alpha: emission.alpha,
@@ -290,9 +348,7 @@ fn content_tracked(
                 shape_paint: style.shape,
                 vector_masks: emission.vector_masks,
                 glyph_placements: emission.glyph_placements,
-                // The same question the text stage asks of this fragment: per-channel coverage
-                // survives an opaque destination under no transform, and nothing else.
-                text_subpixel: emission.text_placement.keeps_subpixel(),
+                text_subpixel,
                 vector_id: VectorId(fragment.key.index()),
                 shapes_pushed: 0,
                 vector_routes: vector::VectorRoutes::NONE,
@@ -306,13 +362,15 @@ fn content_tracked(
             scene,
             part,
             fragment.border_box,
-            emission.scrollbars,
+            scrollbar::resolve(emission.scrollbars, &style.scrollbar),
             emission.box_placement.clip,
+            emission.box_placement.transform,
         ),
     };
     FragmentEmission {
         pushed,
         vector_routes: routes,
+        layer,
     }
 }
 
@@ -320,6 +378,7 @@ fn content_tracked(
 fn marks(
     scene: &mut Scene,
     emission: &Emission<'_>,
+    owner: zgui_dom::side::BoxKey,
     paragraph: zgui_layout::fragment::ParagraphId,
     line: u16,
     layer: HighlightLayer,
@@ -327,6 +386,7 @@ fn marks(
     highlight::emit(
         scene,
         emission.highlights,
+        owner,
         paragraph,
         line,
         layer,
@@ -345,7 +405,7 @@ fn marks(
 /// This is how a folded group opacity is applied: multiplying it into each primitive's own paint
 /// produces the same pixels as compositing the subtree once, exactly when no two primitives in it
 /// overlap — and that condition is decided over the fragment tree before this is reached.
-fn faded(style: &PaintStyle, alpha: f32) -> PaintStyle {
+pub(crate) fn faded(style: &PaintStyle, alpha: f32) -> PaintStyle {
     if alpha >= 1.0 {
         return style.clone();
     }

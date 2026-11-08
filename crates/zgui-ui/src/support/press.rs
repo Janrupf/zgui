@@ -44,3 +44,36 @@ pub fn activate_on_press() -> impl Fn(&mut EventCx<'_, events::PointerDown>) + C
         },
     )
 }
+
+/// A `pointer_down` handler that clicks the element on the press and leaves focus where it is.
+///
+/// For an option of a list that a field drives, such as a combobox's. The option takes no focus,
+/// so the press would otherwise take focus away from the field, and the caret and the arrow keys
+/// would go with it.
+///
+/// ```
+/// # use zgui::prelude::*;
+/// # use zgui::{component, view};
+/// # use zgui_ui::support::activate_on_press_keeping_focus;
+/// # #[component]
+/// # fn Example() -> impl IntoView {
+/// view! {
+///     box(
+///         on:pointer_down = activate_on_press_keeping_focus(),
+///         on:click = move |_| { /* choose the option */ }
+///     ) {"Ireland"}
+/// }
+/// # }
+/// ```
+pub fn activate_on_press_keeping_focus()
+-> impl Fn(&mut EventCx<'_, events::PointerDown>) + Copy + 'static {
+    handler(
+        events::POINTER_DOWN,
+        move |ev: &mut EventCx<'_, events::PointerDown>| {
+            if ev.button == Some(PointerButton::Primary) {
+                ev.prevent_default();
+                ev.activate_now();
+            }
+        },
+    )
+}

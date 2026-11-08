@@ -15,6 +15,7 @@
 
 pub mod cadence;
 mod place;
+mod recolor;
 mod trace;
 
 use zgui_style::AnimationTime;
@@ -51,14 +52,15 @@ impl Window {
                 layout: &layout,
                 scale: self.scale,
                 damage: zgui_bits::DamageSet::new(),
+                painter: &self.painter,
             };
             let tick = self.animator.tick(&mut document, &report, &mut writing);
             (tick, writing.damage)
         };
 
-        // What the writes moved. Nothing else in the frame will put it in the set: the boxes that
-        // moved were not composed again, which is the whole saving, and the pass that would
-        // otherwise have absorbed their old and new rectangles never descended to them.
+        // What the writes moved and recoloured. Nothing else in the frame will put it in the set:
+        // the boxes that moved were not composed again, which is the whole saving, and the pass
+        // that would otherwise have absorbed their old and new rectangles never descended to them.
         self.damage.absorb_set(&moved);
 
         // Asking for a cascade is the engine's to do; deciding which elements need one is not, and
@@ -109,8 +111,12 @@ impl Window {
     /// A keyframe animation is started by the cascade. The tick runs before the cascade, so on the
     /// frame that starts one there is nothing to report and nothing to mark — and a loop with
     /// nothing marked parks for good. This is the only thing that gets the second frame.
+    ///
+    /// An animation whose keyframes the cascade gave new values is marked as well, so a tick
+    /// samples them. A finished animation that fills forwards is otherwise not ticked again.
     pub(crate) fn note_started_animations(&mut self) {
-        let running = self.engine.animations().running_elements();
+        let mut running = self.engine.animations().running_elements();
+        running.extend_from_slice(self.engine.refreshed_animations());
         if running.is_empty() {
             return;
         }

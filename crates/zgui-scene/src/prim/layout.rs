@@ -58,6 +58,7 @@ macro_rules! assert_instance_layout {
 
 use crate::paint::PaintRef;
 use crate::prim::decoration::Decoration;
+use crate::prim::marks::{MarkBox, MarkItem};
 use crate::prim::quad::Quad;
 use crate::prim::shaded::ShadedQuad;
 use crate::prim::shadow::Shadow;
@@ -79,7 +80,7 @@ assert_instance_layout!(
 
 assert_instance_layout!(
     Quad,
-    size = 132,
+    size = 108,
     align = 4,
     fields = [
         order @ 0, 4;
@@ -88,11 +89,11 @@ assert_instance_layout!(
         radii @ 24, 32;
         border @ 56, 16;
         fill @ 72, 8;
-        strokes @ 80, 32;
-        clip @ 112, 4;
-        transform @ 116, 4;
-        shape @ 120, 4;
-        paint_origin @ 124, 8;
+        stroke @ 80, 8;
+        clip @ 88, 4;
+        transform @ 92, 4;
+        shape @ 96, 4;
+        paint_origin @ 100, 8;
     ],
 );
 
@@ -118,20 +119,21 @@ assert_instance_layout!(
 
 assert_instance_layout!(
     Shadow,
-    size = 136,
+    size = 152,
     align = 4,
     fields = [
         order @ 0, 4;
         blur @ 4, 4;
         bounds @ 8, 16;
-        radii @ 24, 32;
-        element_bounds @ 56, 16;
-        element_radii @ 72, 32;
-        color @ 104, 16;
-        clip @ 120, 4;
-        transform @ 124, 4;
-        inset @ 128, 4;
-        shape @ 132, 4;
+        shape_bounds @ 24, 16;
+        radii @ 40, 32;
+        element_bounds @ 72, 16;
+        element_radii @ 88, 32;
+        color @ 120, 16;
+        clip @ 136, 4;
+        transform @ 140, 4;
+        inset @ 144, 4;
+        shape @ 148, 4;
     ],
 );
 
@@ -198,6 +200,38 @@ assert_instance_layout!(
     ],
 );
 
+assert_instance_layout!(
+    MarkItem,
+    size = 104,
+    align = 4,
+    fields = [
+        order @ 0, 4;
+        flags @ 4, 4;
+        bounds @ 8, 16;
+        paint @ 24, 8;
+        clip @ 32, 4;
+        transform @ 36, 4;
+        paint_origin @ 40, 8;
+        origin @ 48, 8;
+        discs @ 56, 4;
+        boxes @ 60, 4;
+        vertices @ 64, 4;
+        half_width @ 68, 4;
+        axes @ 72, 16;
+        glyphs @ 88, 4;
+        tiles @ 92, 4;
+        texture @ 96, 4;
+        first @ 100, 4;
+    ],
+);
+
+assert_instance_layout!(
+    MarkBox,
+    size = 64,
+    align = 4,
+    fields = [rect @ 0, 16; radii @ 16, 32; shape @ 48, 16],
+);
+
 /// The rectangle a `[x, y, width, height]` instance field describes.
 pub(crate) fn rect_of(bounds: [f32; 4]) -> Rect<DevicePx, Device> {
     Rect::new(
@@ -211,19 +245,22 @@ mod tests {
     use core::mem::offset_of;
 
     use crate::prim::{
-        ColorSprite, Decoration, MonoSprite, Quad, ShadedQuad, Shadow, SubpixelSprite,
+        ColorSprite, Decoration, MarkBox, MarkItem, MonoSprite, Quad, ShadedQuad, Shadow,
+        SubpixelSprite,
     };
 
     /// The table above is compile-time; this is the runtime half, so a failure names the type.
     #[test]
     fn the_table_matches_what_the_compiler_chose() {
-        assert_eq!(size_of::<Quad>(), 132);
+        assert_eq!(size_of::<Quad>(), 108);
         assert_eq!(size_of::<ShadedQuad>(), 112);
-        assert_eq!(size_of::<Shadow>(), 136);
+        assert_eq!(size_of::<Shadow>(), 152);
         assert_eq!(size_of::<Decoration>(), 56);
         assert_eq!(size_of::<MonoSprite>(), 72);
         assert_eq!(size_of::<SubpixelSprite>(), 72);
         assert_eq!(size_of::<ColorSprite>(), 108);
+        assert_eq!(size_of::<MarkItem>(), 104);
+        assert_eq!(size_of::<MarkBox>(), 64);
     }
 
     /// A subpixel sprite differs from a monochrome one only in which pipeline draws it, so the two

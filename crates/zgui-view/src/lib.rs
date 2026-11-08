@@ -45,8 +45,8 @@
 //! let count = window.with(|| RwSignal::new(0));
 //! let root = dom.create_element(ElementName::new("box"));
 //!
-//! // A closure is a reactive hole: one effect, and the node is written only when the value
-//! // actually changes.
+//! // A closure is a reactive hole: it runs again at the flush, and the node is written only when
+//! // the value actually changes.
 //! let mut state =
 //!     window.with(|| (move || count.get().to_string()).into_view().build(&mut cx.cx()));
 //! state.mount(&dom, root, None);
@@ -124,13 +124,15 @@ pub use crate::host::{
     TimerId, ViewHost, WindowShortcut,
 };
 pub use crate::id::{DOCUMENT_COUNT, DocumentId, NodeId};
-pub use crate::node_ref::{ListenerGuard, NodeRef, ObservationRegistry, focused_node};
+pub use crate::node_ref::{
+    ListenerGuard, NodeRef, ObservationRegistry, focus_is_text_entry, focused_node,
+};
 pub use crate::scroll::{ScrollBehavior, ScrollPosition, ScrollTarget};
 pub use crate::sheet::{Stylesheet, install_stylesheet, remove_stylesheet};
 pub use crate::time::{
     FrameHandle, IntervalHandle, TimeoutHandle, Timers, request_frame, set_interval, set_timeout,
 };
-pub use crate::value::{IntoReactiveValue, ReactiveValue};
+pub use crate::value::{IntoOptionalProp, IntoReactiveValue, ReactiveValue};
 pub use crate::view::{
     Anchor, AnyView, Children, ChildrenFn, ComponentMeta, Either, IntoView, Scoped, View,
 };

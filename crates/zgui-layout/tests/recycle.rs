@@ -217,20 +217,26 @@ fn a_pane_holding_a_run_of_text_beside_its_rows_is_rebuilt_whole() {
          cell { display: block }",
     );
     let mut store = fixture.box_tree();
+    let scroller = boxes(&store, &fixture, "scroller");
     let pane = shift(&mut fixture, "row0", "row8");
-    assert!(
-        patch::rebuild(&mut store, &fixture.document, &owes_children(pane)).is_some(),
-        "the pane's own subtree was refused as well, which rebuilds every box in the document"
+    // The narrow path declines, and the pane is made again whole: the change stays inside it.
+    let done = patch::rebuild(&mut store, &fixture.document, &owes_children(pane))
+        .expect("the pane's own subtree is confined");
+    assert_eq!(done.subtrees, 1, "the pane was not rebuilt as one subtree");
+    assert_eq!(
+        boxes(&store, &fixture, "scroller"),
+        scroller,
+        "the scroller was given new boxes for a change inside the pane"
     );
     assert_eq!(
         shape(&to_text(&store)),
         shape(&to_text(&fixture.box_tree())),
-        "the pane was made again and came out unlike the tree a build produces"
+        "the rebuilt pane is not the pane a build produces"
     );
 }
 
 #[test]
-fn a_row_that_arrives_inline_level_is_refused_rather_than_left_unwrapped() {
+fn a_row_that_arrives_inline_level_rebuilds_its_pane_rather_than_staying_unwrapped() {
     let _recording = Recording::begin();
     // An inline-level child of a block container is swept into an anonymous inline box with whatever
     // inline siblings it has. The rows already in the pane carry no mark, so a splice that put this
@@ -251,21 +257,26 @@ fn a_row_that_arrives_inline_level_is_refused_rather_than_left_unwrapped() {
          cell { display: block }",
     );
     let mut store = fixture.box_tree();
+    let scroller = boxes(&store, &fixture, "scroller");
     let pane = shift(&mut fixture, "row0", "row8");
-    assert!(
-        patch::rebuild(&mut store, &fixture.document, &owes_children(pane)).is_some(),
-        "the pane's own subtree was refused as well, which rebuilds every box in the document"
+    // The narrow path declines, and the pane is made again whole: the change stays inside it.
+    let done = patch::rebuild(&mut store, &fixture.document, &owes_children(pane))
+        .expect("the pane's own subtree is confined");
+    assert_eq!(done.subtrees, 1, "the pane was not rebuilt as one subtree");
+    assert_eq!(
+        boxes(&store, &fixture, "scroller"),
+        scroller,
+        "the scroller was given new boxes for a change inside the pane"
     );
     assert_eq!(
         shape(&to_text(&store)),
         shape(&to_text(&fixture.box_tree())),
-        "the arriving row is inline-level, so making the pane again has to wrap it in an anonymous \
-         box — and it came out unlike the tree a build produces"
+        "the rebuilt pane is not the pane a build produces"
     );
 }
 
 #[test]
-fn a_row_whose_children_take_its_place_is_refused_rather_than_dropped() {
+fn a_row_whose_children_take_its_place_rebuilds_its_pane_rather_than_being_dropped() {
     let _recording = Recording::begin();
     // `display: contents` puts the arriving row's *cell* into the pane's child list and the row
     // itself nowhere. One child is then not one box, which is the correspondence the narrow path
@@ -286,16 +297,21 @@ fn a_row_whose_children_take_its_place_is_refused_rather_than_dropped() {
          cell { display: block }",
     );
     let mut store = fixture.box_tree();
+    let scroller = boxes(&store, &fixture, "scroller");
     let pane = shift(&mut fixture, "row0", "row8");
-    assert!(
-        patch::rebuild(&mut store, &fixture.document, &owes_children(pane)).is_some(),
-        "the pane's own subtree was refused as well, which rebuilds every box in the document"
+    // The narrow path declines, and the pane is made again whole: the change stays inside it.
+    let done = patch::rebuild(&mut store, &fixture.document, &owes_children(pane))
+        .expect("the pane's own subtree is confined");
+    assert_eq!(done.subtrees, 1, "the pane was not rebuilt as one subtree");
+    assert_eq!(
+        boxes(&store, &fixture, "scroller"),
+        scroller,
+        "the scroller was given new boxes for a change inside the pane"
     );
     assert_eq!(
         shape(&to_text(&store)),
         shape(&to_text(&fixture.box_tree())),
-        "the arriving row's children take its place, so making the pane again has to put the cell \
-         in the pane's child list — and it came out unlike the tree a build produces"
+        "the rebuilt pane is not the pane a build produces"
     );
 }
 
@@ -416,41 +432,5 @@ fn a_removed_box_keeps_its_slot_until_the_frame_is_recycled() {
     assert!(
         !store.contains(key),
         "the recycling left the removed box resolvable, so its slot was never given back"
-    );
-}
-
-/// A container whose departed child's boxes are still in it can be made again.
-///
-/// The shape every overlay layer is in the moment a popup is dismissed: the popup's element is
-/// unmounted from the inside out, so nothing in it has a parent, while its boxes are still hanging
-/// under the layer waiting to be dropped. A confinement proof written in terms of ancestry reads
-/// each of those boxes as written somewhere else and hands the whole container back, which builds
-/// every box in the document — a third of a second, on every dismissal, in the middle of the
-/// closing animation.
-///
-/// The rows here are what a popup is in miniature: one child gone, its boxes still present, and no
-/// second reason to refuse. What the container owes is that the departed boxes go and the rest stay.
-#[test]
-fn a_container_holding_a_departed_child_s_boxes_is_made_again_rather_than_refused() {
-    let _recording = Recording::begin();
-    let mut fixture = port();
-    let mut store = fixture.box_tree();
-    shift(&mut fixture, "row0", "row8");
-
-    // Asked as an obligation on the rows rather than on the pane's child list, which is what sends
-    // it down the whole-subtree path instead of the child-by-child one.
-    let owed = Owed {
-        rebuilt: vec![element(&fixture, "row1")],
-        children: Vec::new(),
-    };
-    assert!(
-        patch::rebuild(&mut store, &fixture.document, &owed).is_some(),
-        "the departed row's leftover boxes made the pane unconfinable, so every box in the \
-         document is built instead"
-    );
-    assert_eq!(
-        shape(&to_text(&store)),
-        shape(&to_text(&fixture.box_tree())),
-        "the pane was made again and came out unlike the tree a build produces"
     );
 }

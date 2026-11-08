@@ -155,7 +155,7 @@ impl Animator {
                 }
                 None => Placed::Held,
             };
-            let tier = apply::element(document, element, placed);
+            let tier = apply::element(document, element, placed, place);
             if tier.is_overriding() {
                 // Counted only while it is still moving. An element reported because a finished
                 // animation is holding its last keyframe is not one the loop owes a frame for, and
@@ -201,7 +201,9 @@ impl Animator {
         // zero it entered from.
         for index in &self.overridden {
             if still_overridden.binary_search(index).is_err() {
-                retire::override_on(document, *index);
+                if let Some(was) = retire::override_on(document, *index) {
+                    place.uncolored(document.store().key_of(*index), &was);
+                }
                 if in_report.binary_search(index).is_err()
                     && document.store().try_core(*index).is_some()
                 {
@@ -260,15 +262,20 @@ impl Animator {
     /// frame for ever, with a populated animation table and a correct tick that is never called
     /// again.
     ///
-    /// Called after the restyle, with the elements the engine now holds animations for.
+    /// Called after each restyle of a frame, with the elements the engine now holds animations
+    /// for. An element an earlier call of the same frame marked is not counted again.
     pub fn note_started(&mut self, document: &mut Document, running: &[NodeIndex]) -> usize {
         let mut added = 0;
         for index in running {
             // Anything this frame's tick reported on has already been given whatever it is owed,
             // by the path it took. Marking it again here would make this the bit's second writer.
-            if self.reported.binary_search(index).is_ok()
-                || document.store().try_core(*index).is_none()
-            {
+            if self.reported.binary_search(index).is_ok() {
+                continue;
+            }
+            let Some(core) = document.store().try_core(*index) else {
+                continue;
+            };
+            if core.dirty().own().contains(zgui_bits::Dirty::ANIMATING) {
                 continue;
             }
             zgui_dom::dirty::propagate::mark(

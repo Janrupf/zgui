@@ -74,6 +74,8 @@ struct Drawn {
     /// nothing else. The position is what says whether the layout that placed it was recomputed,
     /// which no damage rectangle and no tile can show.
     sprites: Vec<Sprite>,
+    /// Every glyph sprite's box, in whole device pixels: the pixels the glyph can put ink on.
+    glyph_ink: Vec<Rect<i32, Device>>,
 }
 
 /// One glyph in a frame's display list.
@@ -132,7 +134,40 @@ impl Renderer for Recorder {
                 .iter()
                 .map(|sprite| Sprite {
                     tile: (sprite.tile.texture, sprite.tile.tile),
-                    x: sprite.bounds[0].floor() as i32,
+                    x: scene
+                        .spatial
+                        .resolve_at(sprite.transform)
+                        .map_or(sprite.ink(), |matrix| {
+                            zgui_geom::transformed_bounds(&matrix, sprite.ink())
+                        })
+                        .origin
+                        .x
+                        .0
+                        .floor() as i32,
+                })
+                .collect(),
+            glyph_ink: scene
+                .primitives
+                .mono_sprites
+                .iter()
+                .map(|sprite| {
+                    // Through the sprite's own coordinate system, which puts it on the device.
+                    let ink = scene
+                        .spatial
+                        .resolve_at(sprite.transform)
+                        .map_or(sprite.ink(), |matrix| {
+                            zgui_geom::transformed_bounds(&matrix, sprite.ink())
+                        });
+                    let (x, y) = (ink.origin.x.0, ink.origin.y.0);
+                    let (width, height) = (ink.size.width.0, ink.size.height.0);
+                    let (left, top) = (x.floor(), y.floor());
+                    Rect::new(
+                        Point::new(left as i32, top as i32),
+                        Size::new(
+                            ((x + width).ceil() - left) as i32,
+                            ((y + height).ceil() - top) as i32,
+                        ),
+                    )
                 })
                 .collect(),
         });
@@ -232,7 +267,7 @@ fn box_of_width(window: &zgui_runtime::Window, width: f32) -> Rect<i32, Device> 
             let Some(fragment) = layout.fragment(*frag) else {
                 continue;
             };
-            let box_of = fragment.border_box;
+            let box_of = fragment.on_device(fragment.border_box, &window.placements());
             if (box_of.size.width.0 - width).abs() < 0.5 {
                 found = Some(box_of);
             }
@@ -268,6 +303,19 @@ fn fragment_names(window: &zgui_runtime::Window) -> Vec<zgui_layout::FragKey> {
         .collect();
     keys.sort_by_key(|key| (key.index(), key.generation()));
     keys
+}
+
+/// The union of the glyph boxes `frames` drew inside `line`, or `None` when they drew none there.
+///
+/// This is what a change of text has to repaint: the glyphs it removed and the glyphs it added. The
+/// line box around them paints nothing of its own, so a damage that leaves its empty part alone is
+/// correct.
+fn glyph_ink_in(frames: &[Drawn], line: Rect<i32, Device>) -> Option<Rect<i32, Device>> {
+    frames
+        .iter()
+        .flat_map(|frame| frame.glyph_ink.iter().copied())
+        .filter(|glyph| glyph.intersects(line))
+        .reduce(|held, glyph| held.union(glyph))
 }
 
 /// The union of the rectangles a burst of frames was drawn against, and the area they covered.
@@ -465,6 +513,8 @@ fn a_counter_incrementing_damages_the_text_and_not_the_window() {
     let fragments = fragment_names(&app.app().windows()[0]);
     assert!(!boxes.is_empty() && !fragments.is_empty());
 
+    let line = box_of_width(&app.app().windows()[0], 40.0);
+    let before = glyph_ink_in(&log.borrow(), line);
     log.borrow_mut().clear();
     count.set(7);
     app.settle(8);
@@ -473,17 +523,22 @@ fn a_counter_incrementing_damages_the_text_and_not_the_window() {
     assert!(!frames.is_empty(), "the click produced no frame at all");
     let (bounds, area) = covered(&frames);
 
-    let text = box_of_width(&app.app().windows()[0], 40.0);
+    let after = glyph_ink_in(&frames, line);
+    let text = before
+        .into_iter()
+        .chain(after)
+        .reduce(|held, glyph| held.union(glyph))
+        .expect("the counter drew no glyph at all");
     let bounds = bounds.expect("the frames that followed the click damaged nothing at all");
     assert!(
         contains(bounds, text),
-        "the text at {text:?} was not inside the damage {bounds:?}, so the frame drew less than \
-         it had to"
+        "the old and new digits at {text:?} were not inside the damage {bounds:?}, so the frame \
+         drew less than it had to"
     );
     let text_area = i64::from(text.size.width) * i64::from(text.size.height);
     assert!(
         area >= text_area,
-        "the burst damaged {area} px, which is less than the {text_area} px the text occupies"
+        "the burst damaged {area} px, which is less than the {text_area} px the digits occupy"
     );
     assert!(
         area <= SURFACE_AREA / 20,
@@ -529,6 +584,7 @@ fn typing_one_character_does_not_rebuild_the_box_tree_above_it() {
         .expect("mounting drew a frame");
     assert_eq!(glyphs_before, 2, "two characters did not draw two glyphs");
 
+    let line = box_of_width(&app.app().windows()[0], 40.0);
     log.borrow_mut().clear();
     typed.set(String::from("abc"));
     app.settle(8);
@@ -539,17 +595,17 @@ fn typing_one_character_does_not_rebuild_the_box_tree_above_it() {
     // The lower bound before the upper one, and it is containment rather than "more than nothing":
     // a burst that damaged one pixel somewhere satisfies both `area > 0` and every ceiling below,
     // while the characters that changed stay on the screen as they were.
-    let text = box_of_width(&app.app().windows()[0], 40.0);
+    let text = glyph_ink_in(&frames, line).expect("the keystroke drew no glyph at all");
     let bounds = bounds.expect("the frames that followed the keystroke damaged nothing at all");
     assert!(
         contains(bounds, text),
-        "the text at {text:?} was not inside the damage {bounds:?}, so the frame drew less than \
-         it had to"
+        "the typed glyphs at {text:?} were not inside the damage {bounds:?}, so the frame drew \
+         less than it had to"
     );
     let text_area = i64::from(text.size.width) * i64::from(text.size.height);
     assert!(
         area >= text_area,
-        "the burst damaged {area} px, which is less than the {text_area} px the text occupies"
+        "the burst damaged {area} px, which is less than the {text_area} px the glyphs occupy"
     );
     assert!(
         area <= SURFACE_AREA / 20,
@@ -889,4 +945,129 @@ fn a_blinking_caret_in_a_moved_field_damages_the_pixels_it_is_drawn_on() {
         );
     }
     harness.shut_down();
+}
+
+/// A font size that moved keeps every box and every fragment.
+///
+/// A font change is classified as geometry: the boxes stay what they are and the text inside them
+/// is shaped again. Rebuilding the tree for it would take every fragment, every paint record and
+/// every hit entry with it — the whole-window repaint a keystroke used to cost.
+#[test]
+fn changing_the_root_font_size_does_not_rebuild_the_box_tree() {
+    let size = RwSignal::new(14.0f32);
+    let log = Log::default();
+    let mut app = mount(CSS, &log, move |cx: &mut BuildCx<'_>| {
+        Box::new(
+            zgui_elements::column()
+                .class("root")
+                .style_property("font-size", move || Some(format!("{}px", size.get())))
+                .child(zgui_elements::column().class("swatch"))
+                .child(zgui_elements::text().child("hello there"))
+                .into_view()
+                .build(cx),
+        )
+    });
+    app.settle(8);
+    assert_mounted_fully(&log);
+    let window_boxes = box_names(&app.app().windows()[0]);
+    let window_fragments = fragment_names(&app.app().windows()[0]);
+    let line_before = support::line_boxes(&app.app().windows()[0])[0];
+
+    let before = zgui_profile::counter::snapshot();
+    size.set(20.0);
+    app.settle(8);
+    let moved = before.delta(&zgui_profile::counter::snapshot());
+
+    assert_eq!(
+        box_names(&app.app().windows()[0]),
+        window_boxes,
+        "a font size that moved replaced the boxes instead of keeping them"
+    );
+    assert_eq!(
+        fragment_names(&app.app().windows()[0]),
+        window_fragments,
+        "the fragments were made again for boxes that were kept"
+    );
+    let line_after = support::line_boxes(&app.app().windows()[0])[0];
+    assert!(
+        line_after.size.height > line_before.size.height,
+        "the line is still {} tall at the larger size",
+        line_after.size.height.0
+    );
+    // The counters are shared with every other case in this target and none of them takes the
+    // lock, so the names above are the assertion; what was read is only kept for a debugger.
+    let _ = moved;
+}
+
+/// A window whose content is a tall painted panel, or a short line of text in its place.
+///
+/// The two shapes are what make the case: the panel is taller than what replaces it, and the box
+/// holding both is a fixed size that paints nothing. Nothing about the replacement, and nothing
+/// about the box above it, reaches the pixels the panel had below the new line — so the only thing
+/// that can damage them is the removal itself.
+const REMOVAL_CSS: &str = "root { display: block; width: 400px; height: 300px; padding: 100px }
+                           .port { display: block; width: 200px; height: 80px }
+                           .inner { display: block; width: 100% }
+                           text { display: block; width: 40px; height: 20px }
+                           .swatch { display: block; width: 30px; height: 60px;
+                                     background-color: #101010 }";
+
+/// A window whose panel stands while the signal says so, and is a line of text otherwise.
+fn window_removing(shown: RwSignal<bool>, log: &Log) -> zgui_platform_headless::Harness<Runtime> {
+    mount(REMOVAL_CSS, log, move |cx: &mut BuildCx<'_>| {
+        Box::new(
+            zgui_elements::column()
+                .class("root")
+                .child(
+                    zgui_elements::column()
+                        .class("port")
+                        .child(zgui_view::Dynamic::new(move || {
+                            if shown.get() {
+                                zgui_view::AnyView::new(
+                                    zgui_elements::column()
+                                        .class("inner")
+                                        .child(zgui_elements::column().class("swatch")),
+                                )
+                            } else {
+                                zgui_view::AnyView::new(zgui_elements::text().child("none"))
+                            }
+                        })),
+                )
+                .into_view()
+                .build(cx),
+        )
+    })
+}
+
+/// A subtree taken out of the document damages every pixel it covered.
+///
+/// The composition walk descends the boxes that are there now, so it never reaches a box that has
+/// left the tree. Where the thing that replaces it is smaller, the difference is pixels nobody
+/// draws over: the list that emptied keeps its last row on the screen until something else happens
+/// to damage that strip.
+#[test]
+fn a_subtree_that_left_the_document_damages_the_pixels_it_covered() {
+    let shown = RwSignal::new(true);
+    let log = Log::default();
+    let mut app = window_removing(shown, &log);
+    app.settle(8);
+    assert_mounted_fully(&log);
+
+    let panel = {
+        let window = app.app().windows().first().expect("a window");
+        box_of_width(window, 30.0)
+    };
+
+    log.borrow_mut().clear();
+    shown.set(false);
+    app.settle(8);
+    let frames = log.borrow().clone();
+    assert!(!frames.is_empty(), "taking the panel out drew no frame");
+    let (bounds, _area) = covered(&frames);
+    let bounds = bounds.expect("the frames damaged something");
+    assert!(
+        contains(bounds, panel),
+        "the frames that took the panel out were drawn against {bounds:?}, which leaves part of \
+         the {panel:?} it covered on the screen"
+    );
 }

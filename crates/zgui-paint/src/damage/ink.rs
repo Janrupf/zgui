@@ -68,7 +68,8 @@ impl ReadExtent {
 pub fn read_extent_of(store: &LayoutStore, frag: FragKey, scale: f32) -> Option<ReadExtent> {
     let fragment = store.fragment(frag)?;
     let node = store.get(fragment.box_)?;
-    let own = filter::own(&node.style, scale);
+    let declared = store.custom_properties(fragment.box_, &node.style);
+    let own = filter::own_with(&node.style, declared, scale);
     // A fragment carrying both is read as the stricter of the two: the content filter's own target
     // still has to be painted whole, and there is nothing to be gained by treating half a chain
     // one way and half the other.
@@ -78,7 +79,7 @@ pub fn read_extent_of(store: &LayoutStore, frag: FragKey, scale: f32) -> Option<
         Reads::OwnTarget
     };
     let mut chain = own;
-    chain.extend(filter::backdrop(&node.style, scale));
+    chain.extend(filter::backdrop_with(&node.style, declared, scale));
     if chain.is_empty() {
         return None;
     }

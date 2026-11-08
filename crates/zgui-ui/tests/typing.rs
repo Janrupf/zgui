@@ -31,7 +31,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use zgui::geom::{Device, DevicePx, Rect};
-use zgui::prelude::{GetUntracked, Set, UnsyncCallback};
+use zgui::prelude::{Get, GetUntracked, Set, Signal, UnsyncCallback};
 use zgui::reactive::RwSignal;
 use zgui::view;
 use zgui::view::{AnyView, NodeId, NodeRef};
@@ -402,5 +402,166 @@ fn a_field_with_no_placeholder_still_shows_a_caret_once_it_is_emptied() {
     assert!(
         phases[went_off..].iter().any(|drawn| *drawn),
         "the caret of an emptied field blinked off and never came back: {phases:?}"
+    );
+}
+
+// ---- a secure field -------------------------------------------------------------------------------
+
+/// What a secure field shows for [`TYPED`].
+const MASKED: &str = "\u{2022}\u{2022}\u{2022}";
+
+/// A secure field bound to a signal, a reveal switch, and the two lines it must look like.
+fn secure(
+    built: &Built,
+    value: RwSignal<String, zgui::reactive::LocalStorage>,
+    revealed: RwSignal<bool, zgui::reactive::LocalStorage>,
+) -> impl Fn() -> AnyView + use<> {
+    let built = built.clone();
+    move || {
+        let field = NodeRef::new();
+        let bullets = NodeRef::new();
+        let plain = NodeRef::new();
+        built.keep(&[field, bullets, plain]);
+        AnyView::new(view! {
+            ThemeProvider {
+                column(class = "page") {
+                    Input(
+                        node_ref = field,
+                        class = "field",
+                        label = "Password",
+                        value = value,
+                        secure = Signal::derive_local(move || !revealed.get())
+                    )
+                    text(node_ref = bullets, class = "reference") {{MASKED}}
+                    text(node_ref = plain, class = "reference") {{TYPED}}
+                }
+            }
+        })
+    }
+}
+
+/// The one caret drawn inside `node`, which has to be after its last glyph.
+fn caret_after_the_text(stage: &Stage, node: NodeId) {
+    let drawn = carets(stage, node);
+    assert_eq!(drawn.len(), 1, "a secure field draws exactly one caret");
+    let glyphs = stage.glyphs_in(stage.rect_of(node));
+    let last = glyphs.last().expect("the field drew its text");
+    assert!(
+        drawn[0].origin.x.0 >= last.bounds.origin.x.0 + last.bounds.size.width.0 - 1.0,
+        "the caret is not after the last character: {drawn:?} against {last:?}"
+    );
+}
+
+#[test]
+fn a_secure_field_draws_bullets_and_reveals_the_value_with_the_caret_where_it_was() {
+    let value: RwSignal<String, zgui::reactive::LocalStorage> = RwSignal::new_local(String::new());
+    let revealed: RwSignal<bool, zgui::reactive::LocalStorage> = RwSignal::new_local(false);
+    let built = Built::default();
+    let mut stage = staged!(secure(&built, value, revealed));
+    let field = built.node(0);
+    let bullets = built.node(1);
+    let plain = built.node(2);
+
+    stage.click(stage.centre_of(field));
+    stage.type_text(TYPED);
+    stage.settle();
+    stage.repaint();
+
+    assert_eq!(value.get_untracked(), TYPED, "the owner holds the value");
+    let shown = text_of(&stage, field);
+    assert_eq!(shown, MASKED);
+    assert!(
+        !shown.contains(['A', 'd', 'a']),
+        "a letter of the value is in the document"
+    );
+    assert_eq!(
+        spelling(&stage, field),
+        spelling(&stage, bullets),
+        "the field is not drawing one bullet per letter"
+    );
+    caret_after_the_text(&stage, field);
+    let value_tiles = spelling(&stage, plain);
+    assert_eq!(value_tiles.len(), 3, "the reference line drew its letters");
+
+    revealed.set(true);
+    stage.settle();
+    stage.repaint();
+    assert_eq!(text_of(&stage, field), TYPED);
+    assert_eq!(
+        spelling(&stage, field),
+        value_tiles,
+        "the revealed field is not drawing the value"
+    );
+    caret_after_the_text(&stage, field);
+}
+
+// ---- a value loaded into a focused field ------------------------------------------------------
+
+/// A field driven by a signal, with two static lines below it.
+fn loaded(
+    built: &Built,
+    value: RwSignal<String, zgui::reactive::LocalStorage>,
+) -> impl Fn() -> AnyView + use<> {
+    let built = built.clone();
+    move || {
+        let field = NodeRef::new();
+        let first = NodeRef::new();
+        let second = NodeRef::new();
+        built.keep(&[field, first, second]);
+        AnyView::new(view! {
+            ThemeProvider {
+                column(class = "page") {
+                    Input(
+                        node_ref = field,
+                        class = "field",
+                        label = "Name",
+                        value = value,
+                        on_change = UnsyncCallback::new(move |text: String| value.set(text))
+                    )
+                    text(node_ref = first, class = "reference") {{TYPED}}
+                    text(node_ref = second, class = "reference") {"Other words here"}
+                }
+            }
+        })
+    }
+}
+
+#[test]
+fn a_full_redraw_after_a_value_is_loaded_into_a_focused_field_draws_the_lines_below_it() {
+    let value: RwSignal<String, zgui::reactive::LocalStorage> = RwSignal::new_local(String::new());
+    let built = Built::default();
+    let mut stage = staged!(loaded(&built, value));
+    let field = built.node(0);
+    let first = built.node(1);
+    let second = built.node(2);
+
+    stage.click(stage.centre_of(field));
+    stage.type_text("qqq");
+    stage.settle();
+    stage.repaint();
+    let first_tiles = spelling(&stage, first);
+    let second_tiles = spelling(&stage, second);
+    assert_eq!(first_tiles.len(), 3, "the first line drew its letters");
+    assert!(!second_tiles.is_empty(), "the second line drew its letters");
+
+    // Loaded with no clock movement since the last full redraw, so the next one is paced.
+    value.set("Grace".to_owned());
+    stage.settle();
+    stage.repaint();
+    assert_eq!(text_of(&stage, field), "Grace");
+    assert_eq!(
+        spelling(&stage, field).len(),
+        5,
+        "the field draws the loaded value"
+    );
+    assert_eq!(
+        spelling(&stage, first),
+        first_tiles,
+        "the first line lost its letters"
+    );
+    assert_eq!(
+        spelling(&stage, second),
+        second_tiles,
+        "the second line lost its letters"
     );
 }

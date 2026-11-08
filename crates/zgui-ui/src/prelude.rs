@@ -82,12 +82,12 @@ pub use crate::command::{
     CommandShortcutProps,
 };
 pub use crate::context_menu::{
-    ContextMenu, ContextMenuContent, ContextMenuContentProps, ContextMenuProps, ContextMenuTrigger,
-    ContextMenuTriggerProps,
+    ContextMenu, ContextMenuContent, ContextMenuContentProps, ContextMenuPlace, ContextMenuProps,
+    ContextMenuTrigger, ContextMenuTriggerProps,
 };
 pub use crate::data_table::{
-    Column, ColumnResizer, ColumnResizerProps, DataModel, DataTable, DataTableProps, Page,
-    RowMatch, SortState,
+    Column, ColumnResizer, ColumnResizerProps, DataModel, DataTable, DataTableProps, GripEdge,
+    Page, RowMatch, SortState,
 };
 pub use crate::date_picker::{DatePicker, DatePickerProps};
 pub use crate::dialog::{
@@ -204,8 +204,8 @@ pub use crate::tabs::{
 };
 pub use crate::textarea::{Textarea, TextareaProps};
 pub use crate::toast::{
-    Toast, ToastAction, ToastCorner, ToastItem, ToastItemProps, ToastKind, ToastQueue, Toaster,
-    ToasterProps, use_toaster,
+    Toast, ToastAction, ToastActionTone, ToastCorner, ToastItem, ToastItemProps, ToastKind,
+    ToastQueue, Toaster, ToasterProps, use_toaster,
 };
 pub use crate::toggle::{Toggle, ToggleProps, ToggleSize, ToggleVariant};
 pub use crate::tooltip::{

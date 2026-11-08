@@ -6,7 +6,7 @@ use zgui::{component, view};
 use crate::settings::context::SettingsGroupContext;
 use crate::settings::style;
 
-/// The heading over a [`SettingsGroup`](crate::SettingsGroup).
+/// The heading over a [`SettingsGroup`](crate::settings::SettingsGroup).
 ///
 /// ```
 /// # use zgui::prelude::*;

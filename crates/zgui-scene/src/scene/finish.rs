@@ -1,12 +1,17 @@
 //! Finishing a frame: planning the vector passes and sorting the remap lists into draw order.
 
+use std::borrow::Cow;
+
 use zgui_bits::DamageSet;
+use zgui_geom::{Device, DevicePx, Rect};
 use zgui_profile::{Counter, counter};
 
+use crate::pass::ScenePassPlan;
 use crate::pass::coalesce::{self, Event, Input};
 use crate::pass::overlap::Overlap;
-use crate::prim::PrimitiveKind;
+use crate::prim::{MarkItem, PrimitiveKind};
 use crate::scene::Scene;
+use crate::spatial::{Placements, SpatialId};
 
 impl Scene {
     /// Finishes the frame: plans the vector passes against `damage` and sorts the remap lists
@@ -23,12 +28,81 @@ impl Scene {
         // Before the sort, because the waiting list is indexed into the arrays and the sort key's
         // first component after draw order is the texture, which a placeholder does not have.
         self.refuse_unresolved();
+        self.keep_placements();
         // Before the sort as well: the sweep is over the emission stream, and the log's indices
         // are the arrays' own for the whole of the frame — nothing rewrites them.
         self.plan_vector_passes(damage, overlap);
+        let mut marks = core::mem::take(&mut self.mark_plan);
+        self.plan_marks(damage, &mut marks);
+        self.mark_plan = marks;
         self.sort_remap();
         self.finished = true;
         self.check_order_overlap();
+    }
+
+    /// Plans the union bins for marks against `damage` into `plan`.
+    ///
+    /// [`Scene::finish`] plans them against the frame's damage. A renderer that redraws more than
+    /// that plans them again here, against what it redraws.
+    pub fn plan_marks(&self, damage: &DamageSet, plan: &mut crate::pass::MarkPlan) {
+        let placements = self.placements();
+        crate::pass::marks::plan(
+            crate::pass::marks::Input {
+                ops: &self.ops,
+                primitives: &self.primitives,
+                spatial: &self.spatial,
+                placements: &placements,
+                viewport: self.viewport,
+                damage,
+            },
+            plan,
+        );
+    }
+
+    /// Every slot's matrix under the tree as it stands.
+    ///
+    /// [`Scene::finish`] resolves them and keeps them until the tree is next written, across frames
+    /// too, so a renderer reading them after the finish borrows that copy. After a write this
+    /// resolves them again.
+    pub fn placements(&self) -> Cow<'_, Placements> {
+        if self.kept_stamp == self.spatial.writes() {
+            debug_assert!(
+                self.kept_placements.same_as(&Placements::of(&self.spatial)),
+                "the kept placements are stale at stamp {}",
+                self.kept_stamp,
+            );
+            Cow::Borrowed(&self.kept_placements)
+        } else {
+            Cow::Owned(Placements::of(&self.spatial))
+        }
+    }
+
+    /// Resolves every slot's matrix again if the tree was written since they were last resolved.
+    ///
+    /// Only for a frame with a reader: vector items or union marks. A frame of quads and text
+    /// keeps the old copy, and [`Scene::placements`] resolves on demand.
+    fn keep_placements(&mut self) {
+        let read = !self.primitives.vectors.is_empty()
+            || self.primitives.marks.iter().any(MarkItem::is_union);
+        let stamp = self.spatial.writes();
+        if read && self.kept_stamp != stamp {
+            self.kept_placements.take(&self.spatial);
+            self.kept_stamp = stamp;
+        }
+    }
+
+    /// Writes this frame's vector passes into `plan` with none of them cut to the damage.
+    ///
+    /// [`Scene::finish`] cuts a pass outside every group to the frame's damage. A renderer that
+    /// redraws more than that draws the passes from here. The passes and their order stay the same,
+    /// so each composite still sorts where the display list puts it.
+    pub fn plan_uncut_passes(&self, plan: &mut ScenePassPlan) {
+        coalesce::uncut(
+            &self.pass_plan,
+            &self.primitives.vectors,
+            self.viewport,
+            plan,
+        );
     }
 
     /// Sorts every remap list into draw order, leaving the arrays as they were pushed.
@@ -83,6 +157,9 @@ impl Scene {
                 (sprite.order, texture, tile)
             },
         );
+        sort_lane(&mut self.remap.marks, &self.primitives.marks, |mark| {
+            (mark.order, 0, 0)
+        });
         sort_lane(
             &mut self.remap.externals,
             &self.primitives.externals,
@@ -134,6 +211,22 @@ impl Scene {
         // agrees with draw order wherever the question can matter: anything overlapping something
         // already pushed was given a strictly higher order than it, so for every overlapping pair
         // the two orders are the same order.
+        //
+        // Every rectangle is compared on the device. A primitive records its ink in the space it
+        // is drawn under, and a vector item's device ink was taken when it was emitted, which a
+        // replay carries past a later move of an enclosing space. So both are placed here, under
+        // the matrices this frame draws with, which `finish_with` resolved before this.
+        debug_assert_eq!(
+            self.kept_stamp,
+            self.spatial.writes(),
+            "a frame with vectors keeps placements"
+        );
+        let placements = &self.kept_placements;
+        for item in &mut self.primitives.vectors {
+            if let Some(ink) = placed(placements, item.transform, item.local_ink) {
+                item.ink = ink;
+            }
+        }
         let events: Vec<Event> = self
             .ops
             .iter()
@@ -142,8 +235,12 @@ impl Scene {
                 // A group marker is where the renderer changes target, which a pass may not span.
                 // It is emphatically not an occluder: what a group covers is irrelevant to the
                 // question, and treating it as one let a pass run straight through the boundary.
-                PrimitiveKind::GroupStart | PrimitiveKind::GroupEnd => Event::Boundary,
-                _ => Event::Occluder(self.ink_of(*op)),
+                PrimitiveKind::GroupStart => Event::Boundary { opens: true },
+                PrimitiveKind::GroupEnd => Event::Boundary { opens: false },
+                _ => {
+                    let ink = self.ink_of(*op);
+                    Event::Occluder(placed(placements, self.space_of_op(*op), ink).unwrap_or(ink))
+                }
             })
             .collect();
 
@@ -153,6 +250,13 @@ impl Scene {
                 vectors: &self.primitives.vectors,
                 damage,
                 viewport: self.viewport,
+                // A backdrop widens what the renderer redraws past the damage, and a cut pass
+                // would leave the widened part of its drawings unpainted.
+                cut: if self.primitives.backdrops.is_empty() {
+                    damage.bounds()
+                } else {
+                    None
+                },
                 overlap,
             },
             &mut self.clips,
@@ -167,6 +271,19 @@ impl Scene {
         counter::add(Counter::VelloPasses, self.pass_plan.passes.len() as u64);
         counter::add(Counter::VectorClipLayers, self.pass_plan.clip_layers as u64);
     }
+}
+
+/// `local` on the device, under the two-dimensional matrix `space` resolves to.
+///
+/// `None` for no space, a space nothing occupies and a matrix that leaves the plane. The caller then
+/// keeps the rectangle it has, which is what the item was emitted with.
+fn placed(
+    placements: &Placements,
+    space: Option<SpatialId>,
+    local: Rect<DevicePx, Device>,
+) -> Option<Rect<DevicePx, Device>> {
+    let affine = placements.get(space?)?.to_affine2()?;
+    Some(affine.transform_rect(local))
 }
 
 /// Fills `lane` with every index of `values`, sorted by `key`.

@@ -50,6 +50,9 @@ pub struct LoweringKey {
     /// The two maps of custom properties in scope, out of which the vector paint properties are
     /// resolved.
     pub custom: (StructPtr, StructPtr),
+    /// `color-scheme`, for a scroll container: the identity of its inherited UI group. Zero for
+    /// every other box, which reads nothing from that group.
+    pub scrollbar: StructPtr,
 }
 
 impl LoweringKey {
@@ -66,13 +69,19 @@ impl LoweringKey {
             box_: StructPtr::of(style.get_box()),
             inherited_text: StructPtr::of(style.get_inherited_text()),
             custom: StructPtr::custom_properties(style),
+            scrollbar: if zgui_layout::scroll_region::is_scroll_container(style) {
+                StructPtr::of(style.get_inherited_ui())
+            } else {
+                StructPtr(0)
+            },
         }
     }
 
     /// Every property group this key names, for a caller checking it against a wider key.
     ///
     /// The custom-property maps are left out: they are a derived identity rather than a group
-    /// address, so an address-by-address comparison has nothing to find them under.
+    /// address, so an address-by-address comparison has nothing to find them under. The scrollbar
+    /// field is left out too, because it is zero for every box that is not a scroll container.
     pub fn group_identities(&self) -> [StructPtr; 9] {
         [
             self.background,

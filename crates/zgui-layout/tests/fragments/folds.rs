@@ -75,6 +75,77 @@ fn a_blending_descendant_is_folded_all_the_way_up() {
 }
 
 #[test]
+fn a_backdrop_reader_is_folded_up_to_strict_ancestors_only() {
+    // A backdrop root isolates only for a reader strictly below it, so a box that reads the
+    // backdrop itself does not count as its own reader.
+    let mut fixture = Fixture::new(
+        Element::new("root").children(vec![
+            Element::new("panel").children(vec![
+                Element::new("card").children(vec![Element::new("badge").classes(&["frost"])]),
+            ]),
+            Element::new("wrap").children(vec![Element::new("blend")]),
+        ]),
+        "root { display: block; width: 200px }
+         panel { display: block }
+         card { display: block; height: 40px; backdrop-filter: blur(4px) }
+         badge { display: block; height: 10px }
+         .frost { backdrop-filter: blur(2px) }
+         wrap { display: block }
+         blend { display: block; height: 20px; mix-blend-mode: multiply }",
+    );
+    let mut store = fixture.box_tree();
+    let mut content = measurer();
+    let mut frame = lay_out(&mut store, &mut content, 200.0, 200.0);
+    let flags = |store: &zgui_layout::tree::store::LayoutStore, fixture: &Fixture, name: &str| {
+        own_fragment(store, box_named(store, fixture, name)).flags
+    };
+    let below = FragmentFlags::READS_BACKDROP_BELOW;
+    for (name, filters, reader_below) in [
+        ("root", false, true),
+        ("panel", false, true),
+        ("card", true, true),
+        ("badge", true, false),
+        ("wrap", false, true),
+        ("blend", false, false),
+    ] {
+        let flags = flags(&store, &fixture, name);
+        assert_eq!(
+            flags.contains(FragmentFlags::FILTERS_BACKDROP),
+            filters,
+            "`{name}` filters its backdrop"
+        );
+        assert_eq!(
+            flags.contains(below),
+            reader_below,
+            "`{name}` has a backdrop reader strictly below it"
+        );
+    }
+
+    let badge = fixture
+        .document
+        .store()
+        .core(fixture.root)
+        .first_child()
+        .and_then(|panel| fixture.document.store().core(panel).first_child())
+        .and_then(|card| fixture.document.store().core(card).first_child())
+        .expect("the badge");
+    fixture.edit_and_restyle(|edit| {
+        edit.remove_class(badge, zgui_interned::ClassName::new("frost"));
+    });
+    let mut store = fixture.box_tree();
+    let mut content = measurer();
+    relayout(&mut frame, &mut store, &mut content, 200.0, 200.0);
+    assert!(
+        !flags(&store, &fixture, "card").contains(below),
+        "the card lost its only reader"
+    );
+    assert!(
+        flags(&store, &fixture, "panel").contains(below),
+        "the card still reads the backdrop under the panel"
+    );
+}
+
+#[test]
 fn overlapping_children_make_a_subtree_not_disjoint() {
     // The fold is `own ink disjoint from every child's, the children's pairwise disjoint, and every
     // child disjoint in itself`. The middle clause is the one that discriminates here, so the
@@ -140,7 +211,7 @@ fn subtree_disjoint_is_independent_of_the_damage_set() {
                 &mut content,
                 zgui_layout::DeviceStyle::default(),
             );
-            assert!(tree.layout_root(taffy::Size {
+            assert!(tree.layout_root(cephal::Size {
                 width: 200.0,
                 height: 200.0
             }));

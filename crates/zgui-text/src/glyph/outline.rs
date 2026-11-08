@@ -20,6 +20,7 @@ use std::sync::Arc;
 use kurbo::BezPath;
 
 use crate::font::face::FaceId;
+use crate::glyph::instance::VariationInstance;
 
 /// Everything that decides what one glyph's curves are.
 ///
@@ -34,6 +35,8 @@ pub struct OutlineKey {
     pub glyph: u16,
     /// The size in device pixels, as bits, so that the key hashes and compares exactly.
     pub size_bits: u32,
+    /// The point in a variable face's design space the curves are drawn at.
+    pub instance: VariationInstance,
     /// Synthetic slant in degrees, as bits, for an italic no face covers.
     ///
     /// Part of the curve rather than of the transform: the shear is about each glyph's own origin,
@@ -43,12 +46,14 @@ pub struct OutlineKey {
 }
 
 impl OutlineKey {
-    /// A key with no synthesis, which is what a face that covers the requested style needs.
+    /// A key with no synthesis at the face's default instance, which is what a static face that
+    /// covers the requested style needs.
     pub fn new(face: FaceId, glyph: u16, size: f32) -> Self {
         Self {
             face,
             glyph,
             size_bits: size.to_bits(),
+            instance: VariationInstance::DEFAULT,
             synthetic_slant_bits: 0.0f32.to_bits(),
         }
     }

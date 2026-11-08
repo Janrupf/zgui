@@ -47,6 +47,8 @@ pub(crate) struct Setup {
     pub labelled_by: Option<NodeRef>,
     /// What it is, for a reader.
     pub role: Role,
+    /// Whether its value is a secret, when the caller said anything about it.
+    pub secure: Option<Signal<bool, LocalStorage>>,
 }
 
 /// The two things a field's view needs, once everything else has been wired up.
@@ -70,10 +72,35 @@ impl Setup {
             .or_else(|| self.default_value.clone())
             .unwrap_or_default();
         self.follow_the_caller();
+        // A field that can be secure is built empty. A text child is the view's own text, and the
+        // view would hold the value; the editing model loads it and masks it instead.
+        let initial = if self.secure.is_some() {
+            self.load_once(initial);
+            String::new()
+        } else {
+            initial
+        };
         Wired {
             own: self.attrs(),
             initial,
         }
+    }
+
+    /// Loads the starting value of a field the caller does not bind, once its element exists.
+    ///
+    /// A bound field needs nothing here: [`follow_the_caller`](Setup::follow_the_caller) loads
+    /// the caller's value.
+    fn load_once(&self, initial: String) {
+        if self.value.is_bound() || initial.is_empty() {
+            return;
+        }
+        let element = self.element;
+        let load = RenderEffect::new(move |_| {
+            if element.get().is_some() {
+                element.set_value(&initial);
+            }
+        });
+        zgui::reactive::on_cleanup_local(move || drop(load));
     }
 
     /// Keeps a bound field's element in step with what the caller holds.
@@ -89,10 +116,15 @@ impl Setup {
         // Text the element already holds does nothing, so the ordinary loop — a keystroke
         // announced, the caller's value moving, the value arriving back here — leaves the caret
         // exactly where the person is typing.
+        //
+        // The handle is read here, and so subscribed to: it binds as the element is built, which
+        // is after this effect's first run. The run the binding wakes carries the caller's text
+        // into an element that a build before this one left holding something else.
         let follow = RenderEffect::new(move |_| {
-            if let Some(text) = value.get() {
-                element.set_value(&text);
-            }
+            let (Some(text), Some(_)) = (value.get(), element.get()) else {
+                return;
+            };
+            element.set_value(&text);
         });
         // Held for as long as the field is: an effect whose handle is dropped stops running, and a
         // field bound to a dropped one follows its signal precisely once.
@@ -107,10 +139,21 @@ impl Setup {
             required,
             invalid,
             role,
+            secure,
             ..
         } = *self;
 
-        let mut semantics = A11yBinding::new(role)
+        let semantics = match secure {
+            Some(secure) => A11yBinding::with_role(move || {
+                if secure.get() {
+                    Role::PasswordInput
+                } else {
+                    role
+                }
+            }),
+            None => A11yBinding::new(role),
+        };
+        let mut semantics = semantics
             .disabled(move || disabled.get())
             .read_only(move || read_only.get())
             .required(move || required.get())
@@ -136,7 +179,13 @@ impl Setup {
             semantics = semantics.labelled_by(target);
         }
 
-        let own = Attrs::new()
+        let mut own = Attrs::new();
+        if let Some(secure) = secure {
+            own = own.attribute(zgui::view::AttrName::new("secure"), move || {
+                secure.get().then(String::new)
+            });
+        }
+        let own = own
             .class_toggle(zgui::view::ClassName::new("zui-field"), true)
             .state(UiState::DISABLED, move || disabled.get())
             .state(UiState::READ_ONLY, move || read_only.get())

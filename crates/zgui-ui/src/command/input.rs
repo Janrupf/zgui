@@ -6,7 +6,7 @@ use zgui::{component, view};
 use zgui_ui_icons::prelude::*;
 use zgui_ui_icons::set::ui::SEARCH;
 
-use crate::combobox::ComboboxInputProps;
+use crate::combobox::ComboboxFieldProps;
 use crate::command::SHEET;
 use crate::command::style::CommandStyle;
 
@@ -16,8 +16,9 @@ use crate::command::style::CommandStyle;
 /// typed, and a rule underneath dividing the question from the answers. What the eye reads as the
 /// search box is the whole band, and a bordered field drawn inside it would be a box in a box.
 ///
-/// The typing itself is a [`ComboboxInput`](crate::ComboboxInput)'s — narrowing a list and letting
-/// the arrows walk what is left is the same question a combobox answers, and it is answered once.
+/// The typing itself is the field of a [`ComboboxInput`](crate::ComboboxInput), without its frame
+/// and its chevron — narrowing a list and letting the arrows walk what is left is the same question
+/// a combobox answers, and it is answered once.
 ///
 /// ```
 /// # use zgui::prelude::*;
@@ -62,8 +63,8 @@ pub fn CommandInput(
     view! {
         row(class = "zui-command__field") {
             Icon(icon = SEARCH)
-            ComboboxInput(
-                placeholder = placeholder.unwrap_or_default(),
+            ComboboxField(
+                placeholder = placeholder,
                 disabled = disabled,
                 label = label,
                 labelled_by = labelled_by,

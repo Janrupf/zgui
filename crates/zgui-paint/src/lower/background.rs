@@ -10,10 +10,11 @@ use zgui_color::{Color, GradientStop, Interpolation};
 use zgui_css::parity::Support;
 use zgui_css::values::color::{AbsoluteColor, ColorValue, current, to_color, to_interpolation};
 use zgui_css::values::image::{
-    AngleOrPercentageValue, GradientFlags, GradientItemValue, GradientValue,
-    HorizontalPositionKeyword, ImageValue, LineDirectionValue, VerticalPositionKeyword,
+    AngleOrPercentageValue, CircleValue, EllipseValue, EndingShapeValue, GradientFlags,
+    GradientItemValue, GradientValue, HorizontalPositionKeyword, ImageValue, LineDirectionValue,
+    ShapeExtent, VerticalPositionKeyword,
 };
-use zgui_css::values::length::{LengthPercentage, evaluate_at};
+use zgui_css::values::length::{LengthPercentage, evaluate_at, percent};
 use zgui_css::{ComputedStyle, register_properties};
 use zgui_geom::CssPx;
 
@@ -57,20 +58,74 @@ impl BackgroundStyle {
 }
 
 /// Which shape a gradient's ramp follows, in the terms CSS states it in.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum GradientShape {
     /// A ramp along a line at `angle` radians clockwise from pointing up.
     Linear {
         /// The gradient line's direction, in radians clockwise from twelve o'clock.
         angle: f32,
     },
-    /// A ramp outwards from the box's centre, reaching its end at the farthest corner.
-    Radial,
-    /// A ramp swept from `from_angle` radians clockwise from twelve o'clock.
+    /// A ramp outwards from `at` to the ending shape.
+    Radial {
+        /// The ending shape and its size.
+        ending: RadialEnding,
+        /// The centre, against the box.
+        at: GradientCenter,
+    },
+    /// A ramp swept from `from_angle` radians clockwise from twelve o'clock, around `at`.
     Conic {
         /// Where the sweep starts, in radians.
         from_angle: f32,
+        /// The centre, against the box.
+        at: GradientCenter,
     },
+}
+
+/// A gradient's centre, as offsets from the box's top left corner.
+///
+/// A percentage is of the box's width or height.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GradientCenter {
+    /// The horizontal offset.
+    pub x: LengthPercentage,
+    /// The vertical offset.
+    pub y: LengthPercentage,
+}
+
+impl GradientCenter {
+    /// The centre of the box, which is the initial value.
+    pub fn middle() -> Self {
+        Self {
+            x: percent(0.5),
+            y: percent(0.5),
+        }
+    }
+}
+
+/// The ending shape of a radial gradient, and its size.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RadialEnding {
+    /// A circle of a fixed radius, in CSS pixels.
+    CircleRadius(CssPx),
+    /// A circle that reaches a side or a corner of the box.
+    CircleExtent(Extent),
+    /// An ellipse of two radii. A percentage is of the box's width or height.
+    EllipseRadii(LengthPercentage, LengthPercentage),
+    /// An ellipse that reaches a side or a corner of the box.
+    EllipseExtent(Extent),
+}
+
+/// How far a radial gradient's ending shape reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Extent {
+    /// To the side nearest to the centre.
+    ClosestSide,
+    /// To the side farthest from the centre.
+    FarthestSide,
+    /// Through the corner nearest to the centre.
+    ClosestCorner,
+    /// Through the corner farthest from the centre, which is the initial value.
+    FarthestCorner,
 }
 
 /// One gradient, with everything that does not depend on the box resolved.
@@ -180,30 +235,70 @@ fn gradient_of(gradient: &GradientValue, current: &AbsoluteColor) -> GradientSpe
             repeating: flags.contains(GradientFlags::REPEATING),
         },
         GradientValue::Radial {
+            shape,
+            position,
             color_interpolation_method,
             items,
             flags,
             ..
         } => GradientSpec {
-            shape: GradientShape::Radial,
+            shape: GradientShape::Radial {
+                ending: ending_of(shape),
+                at: GradientCenter {
+                    x: position.horizontal.clone(),
+                    y: position.vertical.clone(),
+                },
+            },
             stops: stops_of(items, current, along),
             interpolation: to_interpolation(color_interpolation_method),
             repeating: flags.contains(GradientFlags::REPEATING),
         },
         GradientValue::Conic {
             angle,
+            position,
             color_interpolation_method,
             items,
             flags,
-            ..
         } => GradientSpec {
             shape: GradientShape::Conic {
                 from_angle: angle.radians(),
+                at: GradientCenter {
+                    x: position.horizontal.clone(),
+                    y: position.vertical.clone(),
+                },
             },
             stops: stops_of(items, current, around),
             interpolation: to_interpolation(color_interpolation_method),
             repeating: flags.contains(GradientFlags::REPEATING),
         },
+    }
+}
+
+/// A radial gradient's ending shape.
+fn ending_of(shape: &EndingShapeValue) -> RadialEnding {
+    match shape {
+        EndingShapeValue::Circle(CircleValue::Radius(radius)) => {
+            RadialEnding::CircleRadius(CssPx(radius.0.px()))
+        }
+        EndingShapeValue::Circle(CircleValue::Extent(extent)) => {
+            RadialEnding::CircleExtent(extent_of(*extent))
+        }
+        EndingShapeValue::Ellipse(EllipseValue::Radii(x, y)) => {
+            RadialEnding::EllipseRadii(x.0.clone(), y.0.clone())
+        }
+        EndingShapeValue::Ellipse(EllipseValue::Extent(extent)) => {
+            RadialEnding::EllipseExtent(extent_of(*extent))
+        }
+    }
+}
+
+/// An extent keyword. `contain` and `cover` are the legacy names of two of them.
+fn extent_of(extent: ShapeExtent) -> Extent {
+    match extent {
+        ShapeExtent::ClosestSide | ShapeExtent::Contain => Extent::ClosestSide,
+        ShapeExtent::FarthestSide => Extent::FarthestSide,
+        ShapeExtent::ClosestCorner => Extent::ClosestCorner,
+        ShapeExtent::FarthestCorner | ShapeExtent::Cover => Extent::FarthestCorner,
     }
 }
 

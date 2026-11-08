@@ -3,6 +3,13 @@ name = "zgui-ui-primitives"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Headless interaction primitives for zgui-ui"
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+include.workspace = true
 
 # L8 — product. Every dependency is inherited: `foo.workspace = true`.
 #

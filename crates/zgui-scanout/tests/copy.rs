@@ -9,6 +9,8 @@
 //! `ZGUI_SCANOUT_NODE` names the node to use; without it every `card*` under `/dev/dri` is tried in
 //! turn.
 
+// The subject is a Linux graphics interface, so there is nothing to ask elsewhere.
+#![cfg(target_os = "linux")]
 #![allow(
     unsafe_code,
     reason = "the test maps a buffer through its descriptor to fill it and to count what moved"

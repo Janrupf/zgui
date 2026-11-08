@@ -95,7 +95,7 @@ fn budget(interval: Duration) -> Duration {
 ///
 /// What it guarantees is one frame deep — the frame after a dear one is never pushed past the
 /// interval, because the dear one's cost is still whole. Beyond that it is an estimate, and the
-/// gate is what catches a spike nothing could have predicted.
+/// gate is what catches a slow frame nothing could have predicted.
 const DECAY: f32 = 0.98;
 
 /// When a frame that has been asked for is allowed to start, and how that moment is arrived at.
@@ -408,7 +408,7 @@ mod tests {
 
     /// The frame after a dear one is never pushed past the interval.
     ///
-    /// This is the guarantee, and it is one frame deep on purpose. A spike nothing has seen before
+    /// This is the guarantee, and it is one frame deep on purpose. A slow frame nothing has seen before
     /// cannot be reserved for and the gate is what catches it; what can be reserved for is the next
     /// one, and frames that cost a lot arrive in runs — a fling mounting rows, a drag relaying out,
     /// a document whose icons all re-encode at once.

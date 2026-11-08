@@ -10,6 +10,12 @@ the sprite atlas allocator, and the accompanying WGSL shaders — are derived
 from that work and have been modified. Files containing derived code retain
 an attribution header identifying their origin.
 
+This product also includes software developed as part of the Servo project's
+style engine, stylo (https://github.com/servo/stylo), licensed under the Mozilla
+Public License, Version 2.0. The per-element step of the style traversal is
+derived from that work and has been modified. The MPL-2.0 applies to that file
+alone, and the file carries its notice.
+
 This product also includes software developed as part of the Windows Terminal
 project (https://github.com/microsoft/terminal), Copyright (c) Microsoft
 Corporation, licensed under the MIT License. The gamma-correction ratio table
@@ -29,7 +35,6 @@ fails the build.
 | `crates/zgui-geom/src/snap/stroke.rs` | the GPUI project | Apache-2.0 |
 | `crates/zgui-scene/src/order/tree.rs` | the GPUI project | Apache-2.0 |
 | `crates/zgui-color/src/gamma.rs` | the Windows Terminal project | MIT |
-| `crates/zgui-layout/src/inline/leaf_shell.rs` | the taffy project | MIT |
 | `crates/zgui-wgsl/src/wgsl/sdf.wgsl` | the GPUI project | Apache-2.0 |
 | `crates/zgui-wgsl/src/wgsl/blur.wgsl` | the GPUI project | Apache-2.0 |
 | `crates/zgui-wgsl/src/wgsl/paint.wgsl` | the GPUI project | Apache-2.0 |
@@ -41,6 +46,7 @@ fails the build.
 | `crates/zgui-wgsl/src/wgsl/subpixel.wgsl` | the GPUI project | Apache-2.0 |
 | `crates/zgui-wgsl/src/wgsl/text.wgsl` | the Windows Terminal project | MIT |
 | `crates/zgui-drm/src/sys.rs` | the Linux kernel DRM uapi headers | MIT |
+| `crates/zgui-style/src/driver/recalc.rs` | stylo, the Servo project | MPL-2.0 |
 
 ## Vendored kernel headers
 
@@ -76,3 +82,4 @@ They are not linked into any library and are not redistributed as part of a buil
 | `crates/zgui-text-parley/tests/fonts/NotoSans-Regular.ttf` | Noto Sans | The Noto Project Authors | SIL Open Font License 1.1 |
 | `crates/zgui-text-parley/tests/fonts/NotoSansArabic-Regular.ttf` | Noto Sans Arabic | The Noto Project Authors | SIL Open Font License 1.1 |
 | `crates/zgui-text-parley/tests/fonts/NotoZnamennyMusicalNotation-Regular.ttf` | Noto Znamenny Musical Notation | The Noto Project Authors | SIL Open Font License 1.1 |
+| `crates/zgui-text-parley/tests/fonts/RubikSubset-Variable.ttf` | Rubik (variable, subset to eight letters) | The Rubik Project Authors | SIL Open Font License 1.1 |

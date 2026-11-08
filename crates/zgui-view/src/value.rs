@@ -29,6 +29,60 @@ pub mod marker {
     pub struct Related;
     /// A closure choosing which element a relation names, or none.
     pub struct RelatedChoice;
+    /// A closure computing an `R` that converts into the value wanted.
+    pub struct DerivedInto<R>(core::marker::PhantomData<R>);
+    /// A value given where an optional one was wanted.
+    pub struct Given;
+    /// An `Option` given where an optional value was wanted.
+    pub struct Maybe;
+}
+
+/// The values written where an optional `T` is wanted that stand for a present one.
+///
+/// Sealed, and listed one by one rather than for everything that converts into `T`: a blanket
+/// list would also hold `T` itself, which the constant conversion already takes through
+/// `T: Into<Option<T>>`, and an owned `String` written where an `Option<String>` is wanted would
+/// then have two meanings.
+pub trait PresentAs<T>: sealed::Present<T> {
+    /// The present value.
+    fn present(self) -> T;
+}
+
+/// What closes [`PresentAs`] to the impls here.
+mod sealed {
+    /// A source [`PresentAs`](super::PresentAs) is implemented for.
+    pub trait Present<T> {}
+}
+
+/// Implements [`PresentAs`] for sources that convert with `Into`.
+macro_rules! present_as {
+    ($target:ty: $($source:ty),+ $(,)?) => {
+        $(
+            impl sealed::Present<$target> for $source {}
+            impl PresentAs<$target> for $source {
+                fn present(self) -> $target {
+                    self.into()
+                }
+            }
+        )+
+    };
+}
+
+present_as!(String: &str, &mut str, Box<str>, std::borrow::Cow<'_, str>, char);
+present_as!(zgui_vocab::SharedString: &str, String);
+
+impl sealed::Present<String> for zgui_vocab::SharedString {}
+impl PresentAs<String> for zgui_vocab::SharedString {
+    fn present(self) -> String {
+        self.as_str().to_owned()
+    }
+}
+
+impl<T: Clone> sealed::Present<T> for &T {}
+impl<T: Clone> PresentAs<T> for &T {
+    fn present(self) -> T {
+        self.clone()
+    }
 }
 
 /// A value a binding writes: either fixed, or computed each time the binding runs.
@@ -85,6 +139,10 @@ where
 /// and for every readable reactive value. `M` is the marker that tells those three apart and is
 /// always inferred.
 ///
+/// A binding runs a closure again under the view's owner, with no cleanup between runs. A memo,
+/// signal, context or cleanup that the closure creates is kept until the view is unmounted, once
+/// for each run. Create those outside the closure.
+///
 /// ```
 /// use zgui_reactive::{Mounted, RwSignal, install};
 /// use zgui_view::{IntoReactiveValue, ReactiveValue};
@@ -116,14 +174,53 @@ impl<T, U: Into<T>> IntoReactiveValue<T, marker::Constant> for U {
     }
 }
 
+/// Anything that can be written where an optional `T` is wanted.
+///
+/// Implemented for anything that converts into `T`, which is present, and for an `Option` of
+/// anything that converts into `T`, which can be absent. The second form lets a component that
+/// wraps another one pass on its own optional prop. `M` is the marker that tells the two apart and
+/// is always inferred.
+///
+/// ```
+/// use zgui_view::IntoOptionalProp;
+///
+/// fn label<M>(value: impl IntoOptionalProp<String, M>) -> Option<String> {
+///     value.into_optional_prop()
+/// }
+///
+/// assert_eq!(label("Name"), Some("Name".to_owned()));
+/// assert_eq!(label(Some("Name")), Some("Name".to_owned()));
+/// assert_eq!(label(None::<String>), None);
+/// ```
+pub trait IntoOptionalProp<T, M> {
+    /// Converts.
+    fn into_optional_prop(self) -> Option<T>;
+}
+
+impl<T, U: Into<T>> IntoOptionalProp<T, marker::Given> for U {
+    fn into_optional_prop(self) -> Option<T> {
+        Some(self.into())
+    }
+}
+
+impl<T, U: Into<T>> IntoOptionalProp<T, marker::Maybe> for Option<U> {
+    fn into_optional_prop(self) -> Option<T> {
+        self.map(Into::into)
+    }
+}
+
 /// A present value, written where an optional one was wanted.
 ///
 /// `attr:data-part="root"` and `style:gap="1rem"` are what an author writes, and an attribute or a
 /// declaration is optional because writing `None` is how one is removed. This is what closes the
 /// gap between the two, so that saying nothing about absence means presence.
-impl<T, U: Into<T>> IntoReactiveValue<Option<T>, marker::Present> for U {
+///
+/// The value itself, `Some(value)` and anything else that converts into `Option<T>` take the
+/// constant conversion; this one takes what [`PresentAs`] lists, such as a `&str` written where an
+/// `Option<String>` is wanted.
+impl<T, U: PresentAs<T>> IntoReactiveValue<Option<T>, marker::Present> for U {
     fn into_reactive_value(self) -> ReactiveValue<Option<T>> {
-        ReactiveValue::Constant(Some(self.into()))
+        ReactiveValue::Constant(Some(self.present()))
     }
 }
 
@@ -221,6 +318,36 @@ impl<T, F: Fn() -> T + 'static> IntoReactiveValue<T, marker::Derived> for F {
     }
 }
 
+/// A closure returning text, written where a shared string is wanted: `move || "Pause"`.
+impl<F> IntoReactiveValue<zgui_vocab::SharedString, marker::DerivedInto<&'static str>> for F
+where
+    F: Fn() -> &'static str + 'static,
+{
+    fn into_reactive_value(self) -> ReactiveValue<zgui_vocab::SharedString> {
+        ReactiveValue::Dynamic(Rc::new(move || self().into()))
+    }
+}
+
+/// A closure returning an owned string, written where a shared string is wanted.
+impl<F> IntoReactiveValue<zgui_vocab::SharedString, marker::DerivedInto<String>> for F
+where
+    F: Fn() -> String + 'static,
+{
+    fn into_reactive_value(self) -> ReactiveValue<zgui_vocab::SharedString> {
+        ReactiveValue::Dynamic(Rc::new(move || self().into()))
+    }
+}
+
+/// A closure returning static text, written where an owned string is wanted.
+impl<F> IntoReactiveValue<String, marker::DerivedInto<&'static str>> for F
+where
+    F: Fn() -> &'static str + 'static,
+{
+    fn into_reactive_value(self) -> ReactiveValue<String> {
+        ReactiveValue::Dynamic(Rc::new(move || self().to_owned()))
+    }
+}
+
 impl<T, G> IntoReactiveValue<T, marker::Reactive> for G
 where
     G: Get<Value = T> + Copy + 'static,
@@ -294,6 +421,31 @@ mod tests {
         signal.set(9);
         assert_eq!(bound.get(), 9);
         node.unmount();
+    }
+
+    #[test]
+    fn an_owned_string_is_present_where_an_optional_one_is_wanted() {
+        fn optional<M>(source: impl IntoReactiveValue<Option<String>, M>) -> Option<String> {
+            source.into_reactive_value().get()
+        }
+        assert_eq!(optional(String::from("a")), Some("a".to_owned()));
+        assert_eq!(optional("b"), Some("b".to_owned()));
+        assert_eq!(optional(&String::from("c")), Some("c".to_owned()));
+        assert_eq!(optional(None::<String>), None);
+    }
+
+    #[test]
+    fn a_closure_returning_text_is_a_shared_string() {
+        fn shared<M>(
+            source: impl IntoReactiveValue<zgui_vocab::SharedString, M>,
+        ) -> ReactiveValue<zgui_vocab::SharedString> {
+            source.into_reactive_value()
+        }
+        let label = shared(|| "Pause");
+        assert!(!label.is_constant());
+        assert_eq!(label.get().as_str(), "Pause");
+        assert_eq!(shared(|| String::from("Play")).get().as_str(), "Play");
+        assert_eq!(shared("Stop").get().as_str(), "Stop");
     }
 
     #[test]

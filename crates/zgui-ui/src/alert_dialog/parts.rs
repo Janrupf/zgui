@@ -113,8 +113,7 @@ pub fn AlertDialogTrigger(
 /// The answer that goes ahead, and closes the alert dialog.
 ///
 /// Whatever it is that is going ahead is the caller's `on:click`; this closes the surface. Both
-/// run, the caller's first, because a component's own listener and a caller's accumulate rather
-/// than replacing each other.
+/// run, the caller's first, so the caller still reads the state that opened the dialog.
 ///
 /// ```
 /// # use zgui::prelude::*;
@@ -137,6 +136,12 @@ pub fn AlertDialogAction(
     /// How big it is.
     #[prop(default = ButtonSize::Md)]
     size: ButtonSize,
+    /// Whether it can be pressed. A disabled control does not close the dialog.
+    #[prop(into, default = Signal::stored_local(false))]
+    disabled: Signal<bool, LocalStorage>,
+    /// Where to record the button, for a caller that focuses it.
+    #[prop(optional)]
+    node_ref: Option<NodeRef>,
     /// Classes merged after the button's own.
     #[prop(into, optional)]
     class: Classes,
@@ -149,14 +154,19 @@ pub fn AlertDialogAction(
     let state = OverlayState::current();
     view! {
         Button(
+            node_ref = node_ref.unwrap_or_default(),
             variant = variant,
             size = size,
+            disabled = disabled,
+            {..attrs},
             on:click = move |_| {
+                if disabled.get_untracked() {
+                    return;
+                }
                 if let Some(state) = state {
                     state.close();
                 }
             },
-            {..attrs},
             class = class
         ) {
             {children.into_view_once()}
@@ -164,7 +174,8 @@ pub fn AlertDialogAction(
     }
 }
 
-/// The answer that changes nothing, and closes the alert dialog.
+/// The answer that changes nothing, and closes the alert dialog. A caller's `on:click` runs
+/// before it closes.
 ///
 /// ```
 /// # use zgui::prelude::*;
@@ -187,6 +198,9 @@ pub fn AlertDialogCancel(
     /// How big it is.
     #[prop(default = ButtonSize::Md)]
     size: ButtonSize,
+    /// Whether it can be pressed. A disabled control does not close the dialog.
+    #[prop(into, default = Signal::stored_local(false))]
+    disabled: Signal<bool, LocalStorage>,
     /// Classes merged after the button's own.
     #[prop(into, optional)]
     class: Classes,
@@ -201,12 +215,16 @@ pub fn AlertDialogCancel(
         Button(
             variant = variant,
             size = size,
+            disabled = disabled,
+            {..attrs},
             on:click = move |_| {
+                if disabled.get_untracked() {
+                    return;
+                }
                 if let Some(state) = state {
                     state.close();
                 }
             },
-            {..attrs},
             class = class
         ) {
             {children.into_view_once()}

@@ -23,8 +23,15 @@ use crate::world::World;
 /// — the editing model writes it there and nothing else keeps a copy. A field that declared one as
 /// well would be a second answer to the same question, drifting from the first the moment somebody
 /// types; so a field declares no value and this reads the real one.
-const HOLDS_ITS_TEXT_AS_A_VALUE: [Role; 3] =
-    [Role::TextInput, Role::MultilineTextInput, Role::SearchInput];
+///
+/// A password field's text is the bullets the editing model writes in place of its value, so its
+/// value here is the bullets too.
+const HOLDS_ITS_TEXT_AS_A_VALUE: [Role; 4] = [
+    Role::TextInput,
+    Role::MultilineTextInput,
+    Role::SearchInput,
+    Role::PasswordInput,
+];
 
 /// Names `into` from the element's own text, unless the element named itself.
 ///
@@ -81,6 +88,36 @@ mod tests {
     use crate::world::World;
 
     #[test]
+    fn a_password_field_holds_its_text_as_its_value_and_has_no_name_from_it() {
+        let mut document = Document::new();
+        let field = document.append(
+            document.document_index(),
+            NodeKind::Element,
+            ElementName::new("field"),
+        );
+        let text = document.append(field, NodeKind::Text, ElementName::new("#text"));
+        document
+            .edit(&EverythingMatters, |edit| {
+                edit.set_text(text, "\u{2022}\u{2022}\u{2022}");
+            })
+            .expect("not poisoned");
+        let layout = LayoutStore::new(document.store().document());
+        let world = World {
+            document: &document,
+            layout: &layout,
+            placements: &zgui_scene::Placements::EMPTY,
+            scale: 1.0,
+            focus: None,
+            scroll: None,
+        };
+        let declared = zgui_vocab::Semantics::new(accesskit::Role::PasswordInput);
+        let mut node = accesskit::Node::new(accesskit::Role::PasswordInput);
+        super::apply(&world, document.store().key_of(field), &declared, &mut node);
+        assert_eq!(node.value(), Some("\u{2022}\u{2022}\u{2022}"));
+        assert_eq!(node.label(), None, "a password field is named by its label");
+    }
+
+    #[test]
     fn an_element_is_named_by_the_text_directly_inside_it_and_not_by_a_subtree() {
         let mut document = Document::new();
         let root = document.append(
@@ -105,6 +142,7 @@ mod tests {
             placements: &zgui_scene::Placements::EMPTY,
             scale: 1.0,
             focus: None,
+            scroll: None,
         };
         assert_eq!(
             from_content(&world, document.store().key_of(root)).as_deref(),
@@ -127,6 +165,7 @@ mod tests {
             placements: &zgui_scene::Placements::EMPTY,
             scale: 1.0,
             focus: None,
+            scroll: None,
         };
         assert_eq!(from_content(&world, document.store().key_of(root)), None);
     }

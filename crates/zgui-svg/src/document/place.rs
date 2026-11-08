@@ -19,7 +19,7 @@ pub(crate) fn axis_scales(matrix: kurbo::Affine) -> (f64, f64) {
 ///
 /// What a stroke width is scaled by. A matrix that scales the two axes differently has no single
 /// stroke width, and this takes the one that preserves the area the stroke covers.
-pub(crate) fn uniform_scale(matrix: kurbo::Affine) -> f64 {
+pub fn uniform_scale(matrix: kurbo::Affine) -> f64 {
     matrix.determinant().abs().sqrt()
 }
 
@@ -51,7 +51,7 @@ fn gradient(source: &Gradient, matrix: kurbo::Affine) -> Gradient {
 }
 
 /// One paint, placed. Colours do not move; ramps do.
-fn paint(source: &Paint, matrix: kurbo::Affine) -> Paint {
+pub fn paint(source: &Paint, matrix: kurbo::Affine) -> Paint {
     match source {
         Paint::Solid(ink) => Paint::Solid(*ink),
         Paint::Gradient(ramp) => Paint::Gradient(gradient(ramp, matrix)),
@@ -86,7 +86,7 @@ pub fn shape(source: &Shape, matrix: kurbo::Affine) -> Shape {
 ///
 /// Every length in it, not only the width: a dash pattern that did not scale with the drawing
 /// would turn one icon into a different picture at every size it is drawn at.
-fn scaled(style: &kurbo::Stroke, scale: f64) -> kurbo::Stroke {
+pub fn scaled(style: &kurbo::Stroke, scale: f64) -> kurbo::Stroke {
     let mut scaled = style.clone();
     scaled.width *= scale;
     scaled.dash_offset *= scale;

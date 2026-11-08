@@ -1,8 +1,9 @@
 //! The workspace's gate runner.
 //!
-//! `cargo xtask ci` runs the full definition of done; `cargo xtask lint` runs clippy over the
+//! `cargo xtask ci` runs the full definition of done, and `cargo xtask ci --hosted` runs it
+//! without the steps a hosted machine cannot pass; `cargo xtask lint` runs clippy over the
 //! workspace in both profiles, which `ci` also does; `cargo xtask wall-clock` runs the wall-clock
-//! budgets in an optimised build, which `ci` also does; `cargo xtask perf` runs the five end-to-end
+//! budgets in an optimised build, which `ci` also does; `cargo xtask perf` runs the seven end-to-end
 //! scenarios against their bands and regenerates `docs/performance.md`, which `ci` also does;
 //! `cargo xtask docs` runs the documentation gate; `cargo xtask release` checks that the tree can
 //! be published in lockstep and that its public surface still keeps the last release's promise;
@@ -74,9 +75,9 @@ fn main() -> ExitCode {
     };
 
     let outcome = match command {
-        Command::Ci => ci::run(&root),
+        Command::Ci { hosted } => ci::run(&root, hosted),
         Command::Lint => lint::run(&root),
-        Command::WallClock => wall_clock::run(&root),
+        Command::WallClock => wall_clock::run(&root, false),
         Command::Perf => perf::run(&root),
         Command::PerfPacing { size, seconds } => perf::pacing(&root, &size, seconds),
         Command::Growth => growth::run(&root),
@@ -90,7 +91,7 @@ fn main() -> ExitCode {
         Command::A11yGeom => oracle::run(&root, "a11y-geom"),
         Command::Verify => verify::run(&root),
         Command::Docs => docs::run(&root),
-        Command::Release => release::run(&root),
+        Command::Release => release::run(&root, release::Packaging::Built),
         Command::Ledger { only } => ledger::run(&root, only.as_deref()),
         Command::LedgerSelfTest => ledger::self_test::run(&root),
         Command::Tsan => tsan::run(&root),

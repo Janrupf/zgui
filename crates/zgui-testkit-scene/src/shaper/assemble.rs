@@ -53,14 +53,23 @@ pub fn geometry(
         let offset = align_offset(request, CssPx(width + indent)).0 + indent;
         let baseline = CssPx(top.0 + ascent.0);
 
-        let mut pen = offset;
+        // A box sits before the character at its offset, after every character and box before it.
+        let mut boxes_before = 0.0;
         for geometry in on_line {
+            let text_before: f32 = clusters[start..end]
+                .iter()
+                .filter(|held| held.offset < geometry.offset)
+                .map(|held| held.advance.0)
+                .sum();
             boxes.push(InlineBoxPlacement {
                 id: geometry.id,
-                origin: Point::new(CssPx(pen), CssPx(baseline.0 - geometry.shaper_height().0)),
+                origin: Point::new(
+                    CssPx(offset + text_before + boxes_before),
+                    CssPx(baseline.0 - geometry.shaper_height().0),
+                ),
                 line: index,
             });
-            pen += geometry.width.0;
+            boxes_before += geometry.width.0;
         }
 
         widest = widest.max(width + indent);

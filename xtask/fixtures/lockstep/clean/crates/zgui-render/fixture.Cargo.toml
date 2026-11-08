@@ -1,0 +1,13 @@
+[package]
+name = "zgui-render"
+version.workspace = true
+edition = "2024"
+
+[dependencies]
+zgui-geom = { path = "../zgui-geom", version = "0.1.0" }
+cephal.workspace = true
+
+# A development dependency with no version is stripped from the published manifest, so it may
+# name a member that is not published.
+[dev-dependencies]
+zgui-console = { path = "../zgui-console" }

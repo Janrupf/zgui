@@ -16,15 +16,18 @@
 
 mod apply;
 pub mod extent;
+mod gesture;
 mod glide;
 mod motion;
 
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use zgui_dom::NodeKey;
 use zgui_geom::{Device, DevicePx, Point, Size};
 use zgui_layout::LayoutStore;
 use zgui_layout::scroll_region::ScrollOffsets;
 
+use crate::chain;
 use crate::elastic::Overscroll;
 use crate::motion::Motion;
 use crate::report::Scrolled;
@@ -55,6 +58,8 @@ pub struct Scroller {
     motions: FxHashMap<NodeKey, Motion>,
     /// What has moved since the last drain.
     moved: Vec<Scrolled>,
+    /// The touchpad gesture in progress, if one is.
+    gesture: Option<gesture::Gesture>,
 }
 
 impl Scroller {
@@ -92,7 +97,7 @@ impl Scroller {
     /// Both a running motion and a displacement waiting to relax count. Leaving the second out is
     /// a list that stays stretched past its end until something else happens to ask for a frame.
     pub fn is_animating(&self) -> bool {
-        !self.motions.is_empty() || !self.elastic.is_empty()
+        !self.motions.is_empty() || self.elastic.values().any(|edge| !edge.is_gripped())
     }
 
     /// Whether nothing is displaced past its end.
@@ -150,8 +155,8 @@ impl Scroller {
     ///
     /// It is *not a scroll position*: it is a rigid translation of a whole scrollport, added after
     /// the grid snap, taken equally by both edges of every box below it. No size changes, nothing
-    /// is broken anywhere else, and the offsetting path composes it exactly at any fraction — see
-    /// [`Fragment::subtree_rigid`](zgui_layout::Fragment::subtree_rigid).
+    /// is broken anywhere else, and the port's content space carries it exactly at any fraction —
+    /// see `zgui_layout::fragment::scroll_nodes`.
     ///
     /// It is *slower than a pixel per frame for most of its length*. A return covers the band in
     /// about a third of a second, which on a two-hundred-and-forty hertz output is around eighty
@@ -191,11 +196,92 @@ impl Scroller {
         self.motions.insert(container, motion);
     }
 
-    /// How far one container may be scrolled, which is zero for one that does not scroll.
-    fn limit_for(&self, store: &LayoutStore, container: NodeKey) -> Point<DevicePx, Device> {
+    /// How far a person may scroll one container, which is zero on an axis that does not scroll.
+    fn hand_limit_for(&self, store: &LayoutStore, container: NodeKey) -> Point<DevicePx, Device> {
         zgui_layout::scroll_region::region_of_element(store, container)
-            .map(|region| region.limit())
+            .map(|region| region.hand_limit())
             .unwrap_or(Point::new(DevicePx(0.0), DevicePx(0.0)))
+    }
+
+    /// The size of one container's scrollport, which the elastic band is measured against.
+    fn extent_for(&self, store: &LayoutStore, container: NodeKey) -> Size<DevicePx, Device> {
+        zgui_layout::scroll_region::region_of_element(store, container)
+            .map(|region| region.scrollport.size)
+            .unwrap_or(Size::new(DevicePx(0.0), DevicePx(0.0)))
+    }
+
+    /// Gives `delta` to the edges of `chain` that it pulls back towards their ends.
+    ///
+    /// Returns what is left of `delta` for the offsets, and adds each container whose edge moved
+    /// to `moved`.
+    fn unwind(
+        &mut self,
+        store: &LayoutStore,
+        chain: &[NodeKey],
+        delta: Size<DevicePx, Device>,
+        moved: &mut SmallVec<[NodeKey; 2]>,
+    ) -> Size<DevicePx, Device> {
+        let mut left = delta;
+        for container in chain.iter().copied() {
+            let edge = self.overscroll_of(container);
+            if edge.arrived() && !edge.is_gripped() {
+                continue;
+            }
+            let (unwound, rest) = edge.unwound_by(left, self.extent_for(store, container));
+            left = rest;
+            if unwound != edge {
+                self.displace(container, unwound);
+                if !moved.contains(&container) {
+                    moved.push(container);
+                }
+            }
+        }
+        left
+    }
+
+    /// Pulls the edges of `chain` past their ends by `left`, the part of a scroll no container
+    /// absorbed.
+    ///
+    /// Each axis displaces the outermost container that a person can scroll on that axis. An axis
+    /// that no container in the chain scrolls does not stretch, so content that fits its
+    /// scrollport stays still. Returns the containers that moved.
+    fn stretch_past_end(
+        &mut self,
+        store: &LayoutStore,
+        chain: &[NodeKey],
+        left: Size<DevicePx, Device>,
+    ) -> SmallVec<[NodeKey; 2]> {
+        let mut moved: SmallVec<[NodeKey; 2]> = SmallVec::new();
+        let outermost = |scrolls: &dyn Fn(Point<DevicePx, Device>) -> bool| {
+            chain
+                .iter()
+                .rev()
+                .copied()
+                .find(|container| scrolls(self.hand_limit_for(store, *container)))
+        };
+        let across = outermost(&|limit| limit.x.0 > 0.0);
+        let down = outermost(&|limit| limit.y.0 > 0.0);
+        for (container, pull) in [
+            (across, Size::new(left.width, DevicePx(0.0))),
+            (down, Size::new(DevicePx(0.0), left.height)),
+        ] {
+            let Some(container) = container else {
+                continue;
+            };
+            if chain::negligible(pull) {
+                continue;
+            }
+            let edge = self
+                .overscroll_of(container)
+                .pulled_by(pull, self.extent_for(store, container));
+            if edge != self.overscroll_of(container) {
+                self.displace(container, edge);
+                if !moved.contains(&container) {
+                    moved.push(container);
+                }
+            }
+        }
+        moved
     }
 
     /// Sets one container's displaced edge, forgetting it when it has come all the way back.
@@ -215,6 +301,9 @@ mod tests {
     use zgui_geom::{Device, DevicePx, Point, Size};
 
     use super::{Overscroll, Scroller};
+
+    /// A scrollport 600 device pixels tall.
+    const PORT: Size<DevicePx, Device> = Size::new(DevicePx(400.0), DevicePx(600.0));
 
     fn key(index: u32) -> NodeKey {
         NodeKey::new(
@@ -240,7 +329,7 @@ mod tests {
     fn a_displacement_is_carried_per_container_and_not_shared() {
         let mut scroller = Scroller::new();
         let pull =
-            |by: f32| Overscroll::default().pulled_by(Size::new(DevicePx(0.0), DevicePx(by)));
+            |by: f32| Overscroll::default().pulled_by(Size::new(DevicePx(0.0), DevicePx(by)), PORT);
         scroller.displace(key(1), pull(20.0));
         scroller.displace(key(2), pull(30.0));
         assert!(scroller.elastic_of(key(1)).height.0 > 0.0);
@@ -268,7 +357,7 @@ mod tests {
         let frame = core::time::Duration::from_micros(4_167);
         scroller.displace(
             container,
-            Overscroll::default().pulled_by(Size::new(DevicePx(0.0), DevicePx(400.0))),
+            Overscroll::default().pulled_by(Size::new(DevicePx(0.0), DevicePx(400.0)), PORT),
         );
 
         let mut composed = vec![scroller.composed().of(container).y];
@@ -309,7 +398,7 @@ mod tests {
             .place(container, Point::new(DevicePx(0.0), DevicePx(120.4)));
         scroller.displace(
             container,
-            Overscroll::default().pulled_by(Size::new(DevicePx(0.0), DevicePx(50.0))),
+            Overscroll::default().pulled_by(Size::new(DevicePx(0.0), DevicePx(50.0)), PORT),
         );
         assert_ne!(
             scroller.composed().of(container).y.0.fract(),

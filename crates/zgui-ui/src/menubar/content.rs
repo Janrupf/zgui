@@ -7,7 +7,7 @@ use zgui::prelude::*;
 use zgui::reactive::{RenderEffect, UnsyncCallback};
 use zgui::{component, view};
 use zgui_ui_primitives::prelude::*;
-use zgui_ui_primitives::{Orientation, Placement, RovingContext};
+use zgui_ui_primitives::{Align, Orientation, Placement, RovingContext, Side};
 
 use crate::menu::MenuTypeaheadProps;
 use crate::menubar::arrows::MenubarArrowsProps;
@@ -53,8 +53,9 @@ use crate::menubar::{MenubarMenuContext, SHEET};
 /// [`MenuTypeahead`](crate::MenuTypeahead), the same one a dropdown menu is built on.
 #[component]
 pub fn MenubarContent(
-    /// Where the surface is asked to go, before it is kept on screen.
-    #[prop(default = Placement::BOTTOM)]
+    /// Where the surface is asked to go, before it is kept on screen. Below the trigger, from its
+    /// start edge, by default.
+    #[prop(default = Placement::new(Side::Bottom, Align::Start))]
     placement: Placement,
     /// Classes merged after the surface's own.
     #[prop(into, optional)]

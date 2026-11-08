@@ -2,6 +2,7 @@
 
 pub mod atlas;
 pub mod image;
+pub mod instance;
 pub mod key;
 pub mod outline;
 pub mod owned;
@@ -12,6 +13,7 @@ pub mod run;
 
 pub use crate::glyph::atlas::AtlasGlyph;
 pub use crate::glyph::image::{GlyphFormat, GlyphImage};
+pub use crate::glyph::instance::VariationInstance;
 pub use crate::glyph::key::{GlyphKey, RasterStyle, SubpixelOffset};
 pub use crate::glyph::outline::{GlyphOutline, OutlineKey};
 pub use crate::glyph::owned::ShapedRunOwned;

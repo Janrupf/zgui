@@ -26,6 +26,8 @@ pub(super) struct Branch<K: 'static> {
     hole: Rc<RefCell<Hole<AnyViewState>>>,
     /// The scope the content belongs to.
     owner: Owner,
+    /// The scope of the branch that shows, a child of `owner`, replaced with the branch.
+    shown: Rc<RefCell<Option<Owner>>>,
     /// The effect. Dropping it stops the hole updating.
     effect: Option<RenderEffect<K>>,
 }
@@ -39,10 +41,21 @@ impl<K: PartialEq + 'static> Branch<K> {
     ) -> Self {
         let owner = cx.owner().child();
         let hole = Rc::new(RefCell::new(Hole::new(cx.dom())));
-        let effect = Self::watch(Rc::clone(&hole), &owner, select, content, cx, None);
+        let shown = Rc::new(RefCell::new(None));
+        let effect = Self::watch(
+            Rc::clone(&hole),
+            &owner,
+            Rc::clone(&shown),
+            select,
+            content,
+            cx,
+            None,
+            false,
+        );
         Self {
             hole,
             owner,
+            shown,
             effect: Some(effect),
         }
     }
@@ -50,7 +63,9 @@ impl<K: PartialEq + 'static> Branch<K> {
     /// Replaces the closures behind this hole, keeping the content that is already there.
     ///
     /// The new effect starts from the selection the old one last computed, so a rebuild whose
-    /// selection did not change moves no node and runs no cleanup.
+    /// selection did not change moves no node. It still rebuilds that content in place: a rebuild
+    /// comes from the component around the hole, which cleaned its scope first, and everything the
+    /// branch made went with it.
     pub(super) fn restart(
         &mut self,
         select: impl FnMut() -> K + 'static,
@@ -63,30 +78,59 @@ impl<K: PartialEq + 'static> Branch<K> {
         self.effect = Some(Self::watch(
             Rc::clone(&self.hole),
             &owner,
+            Rc::clone(&self.shown),
             select,
             content,
             cx,
             previous,
+            true,
         ));
     }
 
     /// The effect that keeps one hole in line with one selector.
+    ///
+    /// Each branch is built in a scope of its own, a child of `owner`, and that scope goes when the
+    /// branch does. The effect's own scope is cleaned every time the selector runs again, so a
+    /// branch built in it would lose what it made — the default of a prop, a stored value — on
+    /// every write the selector reads, while its nodes stayed on the screen.
+    #[allow(clippy::too_many_arguments)]
     fn watch(
         hole: Rc<RefCell<Hole<AnyViewState>>>,
         owner: &Owner,
+        shown: Rc<RefCell<Option<Owner>>>,
         mut select: impl FnMut() -> K + 'static,
         content: impl Fn(&K) -> AnyView + 'static,
         cx: &mut BuildCx<'_>,
         initial: Option<K>,
+        refresh: bool,
     ) -> RenderEffect<K> {
-        let scoped = cx.to_owned_cx().with_owner(owner.clone());
+        let scoped = cx.to_owned_cx();
+        let parent = owner.clone();
+        let mut refresh = refresh;
         owner.with(|| {
             RenderEffect::new_with_value(
                 move |last: Option<K>| {
                     let next = select();
                     if last.as_ref() != Some(&next) {
-                        let built = content(&next).build(&mut scoped.cx());
+                        let scope = parent.child();
+                        let within = scoped.with_owner(scope.clone());
+                        let built = scope.with(|| content(&next).build(&mut within.cx()));
                         hole.borrow_mut().set(scoped.dom(), Some(built));
+                        if let Some(gone) = shown.borrow_mut().replace(scope) {
+                            gone.cleanup();
+                        }
+                    } else if core::mem::take(&mut refresh) {
+                        let scope = shown
+                            .borrow_mut()
+                            .get_or_insert_with(|| parent.child())
+                            .clone();
+                        let within = scoped.with_owner(scope.clone());
+                        let mut hole = hole.borrow_mut();
+                        if let Some(existing) = hole.content_mut() {
+                            scope.with_cleanup(|| {
+                                content(&next).rebuild(existing, &mut within.cx());
+                            });
+                        }
                     }
                     next
                 },

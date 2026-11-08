@@ -34,6 +34,34 @@ pub fn is_custom(store: &DocumentStore, node: NodeKey) -> bool {
     reference(store, node).is_some()
 }
 
+/// The custom properties the implementation `node` names says it reads, as [`custom::READS`]
+/// holds them.
+///
+/// Nothing when it did not say, which is every name.
+pub fn reads(store: &DocumentStore, node: NodeKey) -> Option<&str> {
+    match store
+        .columns()
+        .props
+        .get(node)?
+        .get(PropKey::new(custom::READS))
+    {
+        Some(PropValue::Text(text)) => Some(text.as_str()),
+        _ => None,
+    }
+}
+
+/// The readers set of a [`custom::READS`] list: the bits of each name, and every name when an
+/// entry is a prefix, which no set of name bits can stand for.
+pub fn reads_bloom(reads: &str) -> u64 {
+    reads.split_ascii_whitespace().fold(0, |bits, entry| {
+        if entry.ends_with('*') {
+            crate::side::readers::ALL
+        } else {
+            bits | crate::side::readers::name_bits(entry)
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use zgui_interned::ElementName;

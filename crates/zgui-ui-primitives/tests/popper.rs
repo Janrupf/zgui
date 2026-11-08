@@ -235,3 +235,70 @@ fn moving_the_anchor_moves_the_surface_with_it() {
         "300 + 24 + the 4px offset"
     );
 }
+
+#[test]
+fn a_surface_taller_than_the_room_is_told_the_room_and_capping_it_writes_nothing_more() {
+    let (harness, anchor, positioner) = open(Placement::BOTTOM, true);
+    let anchor_node = anchor.get_untracked().expect("bound");
+    let positioner_node = positioner.get_untracked().expect("bound");
+    let root = harness.window.dom.root(positioner_node);
+
+    harness
+        .window
+        .dom
+        .deliver(root, ObservedValue::BorderBox(rect(0.0, 0.0, 800.0, 600.0)));
+    harness.window.dom.deliver(
+        anchor_node,
+        ObservedValue::BorderBox(rect(100.0, 300.0, 80.0, 24.0)),
+    );
+    harness
+        .window
+        .dom
+        .deliver(positioner_node, content_size(200.0, 700.0));
+    harness.window.frame();
+
+    let node = positioner.get_untracked().expect("bound");
+    let style = |name: &str| harness.window.dom.tree().style_property(node, name);
+    assert_eq!(
+        attribute(&harness, positioner, "data-side").as_deref(),
+        Some("top"),
+        "above has more room than below"
+    );
+    assert_eq!(
+        style("--zui-popper-available-height").as_deref(),
+        Some("288px"),
+        "300 above the anchor, less the 4px offset and the 8px padding"
+    );
+    assert_eq!(
+        style("--zui-popper-available-width").as_deref(),
+        Some("784px")
+    );
+    assert_eq!(style("top").as_deref(), Some("8px"));
+
+    // The sheet caps the surface to what it was told, and the capped size is delivered. Only the
+    // anchor's centre, which is held inside the surface, may follow the new height.
+    let layout = |style: &dyn Fn(&str) -> Option<String>| {
+        [
+            "left",
+            "top",
+            "--zui-popper-available-width",
+            "--zui-popper-available-height",
+        ]
+        .map(style)
+    };
+    let before = layout(&style);
+    harness
+        .window
+        .dom
+        .deliver(positioner_node, content_size(200.0, 288.0));
+    harness.window.frame();
+    assert_eq!(
+        layout(&style),
+        before,
+        "the capped surface is placed where the uncapped one was"
+    );
+    assert_eq!(
+        attribute(&harness, positioner, "data-side").as_deref(),
+        Some("top")
+    );
+}

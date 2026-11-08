@@ -3,6 +3,13 @@ name = "zgui-platform-wayland"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Native Wayland platform backend for zgui"
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+include.workspace = true
 
 # L2 — backends. Every dependency is inherited: `foo.workspace = true`.
 #
@@ -12,7 +19,10 @@ license.workspace = true
 # seam: frames paced against the compositor's own callbacks, a surface that says when it stops
 # being drawn, presentation that never blocks the thread reading input, and the shell protocols a
 # pop-up or a panel is made of.
-[dependencies]
+#
+# Everything is gated on the platforms with a Wayland compositor, so a Windows or macOS build of the
+# workspace compiles this crate as an empty one.
+[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 accesskit.workspace = true
 accesskit_unix.workspace = true
 calloop.workspace = true
@@ -31,7 +41,7 @@ zgui-platform = { path = "../zgui-platform", version = "0.1.0" }
 zgui-profile = { path = "../zgui-profile", version = "0.1.0" }
 zgui-vocab = { path = "../zgui-vocab", version = "0.1.0" }
 
-[dev-dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dev-dependencies]
 # The renderer whose surface handles this backend hands over, and the runtime driven across it.
 # Both are here so the seams this crate opens have a consumer inside the workspace.
 tracing.workspace = true
@@ -80,9 +90,22 @@ path = "tests/wake_signal.rs"
 harness = false
 
 [[test]]
-name = "declined_redraw"
-path = "tests/declined_redraw.rs"
+name = "output_rate"
+path = "tests/output_rate.rs"
 harness = false
+
+# A declined redraw must not wait out the watchdog's grace, which only a wall-clock bound can see.
+# Behind its feature so that an unoptimised run cannot read an unoptimised time as a regression; the
+# gate runs it in release.
+[[test]]
+name = "wall_clock"
+path = "tests/wall_clock.rs"
+harness = false
+required-features = ["wall-clock"]
+
+[features]
+# Compiles the wall-clock target. Off by default; the gate switches it on and runs it in release.
+wall-clock = []
 
 [lints]
 workspace = true

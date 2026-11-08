@@ -72,6 +72,20 @@ impl ListboxLabels {
         StoredValue::new_local(watching);
     }
 
+    /// Learns that `value` reads as `text`, and keeps it.
+    pub fn remember(&self, value: &str, text: &str) {
+        if text.is_empty()
+            || self
+                .known
+                .with_untracked(|known| known.get(value).is_some_and(|held| held == text))
+        {
+            return;
+        }
+        self.known.update(|known| {
+            known.insert(value.to_owned(), text.to_owned());
+        });
+    }
+
     /// What `value` reads as, when anything has ever said.
     #[must_use]
     pub fn of(&self, value: &str) -> Option<String> {

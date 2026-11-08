@@ -22,11 +22,13 @@
 //! removed, an inline run that should have been wrapped again and was not. So every case this
 //! cannot prove is a case it declines.
 //!
-//! The largest thing it declines today is a box whose *layout* parent and *paint* parent are two
-//! different boxes — an out-of-flow box positioned against something further up than the element it
-//! was written inside. Replacing such a box means repairing two lists that are reached two
-//! different ways, and only one of them is reachable from the box being replaced. It is a rebuild
-//! from the root instead, which is correct and slower.
+//! The largest thing it declines today is the replacement of a box whose *layout* parent and
+//! *paint* parent are two different boxes — an out-of-flow box positioned against something further
+//! up than the element it was written inside. Replacing such a box means repairing two lists that
+//! are reached two different ways, and only one of them is reachable from the box being replaced. It
+//! is a rebuild from the root instead, which is correct and slower. A container that gains or loses
+//! such a child does not need that: it rewrites its own paint list, and the child goes into or out of
+//! the layout list of its containing block.
 
 mod children;
 mod confine;
@@ -68,7 +70,9 @@ pub struct Rebuilt {
 ///
 /// Panics if `owed` names a node that is not live in `document`.
 pub fn rebuild(store: &mut LayoutStore, document: &Document, owed: &Owed) -> Option<Rebuilt> {
+    let _tag = zgui_profile::alloc_tag::enter(zgui_profile::alloc_tag::Tag::BoxTree);
     let targets = target::containers(document, owed)?;
+    let targets = target::with_boxes(store, document, targets)?;
     let mut done = Rebuilt::default();
     for target in targets {
         // A container whose child list moved is asked the narrower question first: make the boxes of
@@ -148,28 +152,21 @@ fn one(store: &mut LayoutStore, document: &Document, target: NodeIndex) -> Optio
         });
         return None;
     };
-    let held = match confine::confined(store, document, target, old) {
-        Ok(held) => held,
-        Err(refused) => {
-            zgui_profile::latency::note_with("b.unspliced", || {
-                let blame = match refused {
-                    confine::Unheld::LaidOutFromOutside(index)
-                    | confine::Unheld::WrittenElsewhere(index) => named(document, index),
-                    confine::Unheld::Missing | confine::Unheld::InTwoPlaces => String::new(),
-                };
-                let kind = match refused {
-                    confine::Unheld::Missing => "Missing",
-                    confine::Unheld::InTwoPlaces => "InTwoPlaces",
-                    confine::Unheld::LaidOutFromOutside(_) => "LaidOutFromOutside",
-                    confine::Unheld::WrittenElsewhere(_) => "WrittenElsewhere",
-                };
-                format!("Unconfinable({} {kind} {blame})", named(document, target))
-            });
-            return None;
-        }
+    let Some(held) = confine::confined(store, document, target, old) else {
+        zgui_profile::latency::note_with("b.unspliced", || {
+            format!("Unconfinable({})", named(document, target))
+        });
+        return None;
     };
+    // `replace` repairs the lists of one box. An out-of-flow box painted by another box is in two.
+    if held.painter != held.parent {
+        zgui_profile::latency::note_with("b.unspliced", || {
+            format!("InTwoPlaces({})", named(document, target))
+        });
+        return None;
+    }
     let removed = u32::try_from(held.subtree.len()).unwrap_or(u32::MAX);
-    let containing_block = place::containing_block(store, held.parent);
+    let containing_block = place::containing_block(store, held.parent)?;
     let parent_style = document
         .store()
         .core(target)
@@ -242,8 +239,8 @@ fn one(store: &mut LayoutStore, document: &Document, target: NodeIndex) -> Optio
 ///
 /// **Is it in the same list?** A box that is out of flow is laid out by the ancestor that positions
 /// it and painted where it was written, and one that is in flow is laid out by the container it was
-/// written in. The old box hangs under exactly one box in both orders — [`confine::confined`] made
-/// sure of that — so the new box has to want to hang under that same one: its containing block if
+/// written in. The old box hangs under exactly one box in both orders — `one` refuses a box that
+/// another box paints — so the new box has to want to hang under that same one: its containing block if
 /// it is out of flow, and the box its own element's parent generated if it is not.
 ///
 /// **Is it the same kind of participant?** A box that is block-level where the old one was
@@ -259,13 +256,13 @@ fn takes_the_same_part(
     old: BoxKey,
     built: &Subtree,
     held: &confine::Held,
-    containing_block: Option<BoxKey>,
+    containing_block: BoxKey,
 ) -> bool {
     if built.root.participation == Participation::Contents {
         return false;
     }
     let hangs_right = if built.root.out_of_flow {
-        containing_block == Some(held.parent)
+        containing_block == held.parent
     } else {
         written_under(store, document, target, held.parent)
     };

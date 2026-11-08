@@ -6,34 +6,13 @@ pub mod effect_filter;
 pub mod external;
 pub mod kind;
 pub mod layout;
+pub mod marks;
 pub mod vector;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use crate::effect::{EffectProgram, Effects};
 use crate::gpu::device::Gpu;
-
-/// The draw order, as one slot number an instance with the chunk shift resolved beside it.
-///
-/// A draw binds this at the offset its own range starts at and draws from instance zero, so no
-/// pipeline asks for a non-zero base instance — which OpenGL has only from 4.2, and the oldest
-/// device this runs on is 3.3. The stride is [`OrderEntry`](crate::buffer::persist::OrderEntry)'s.
-pub(crate) const REMAP: [wgpu::VertexBufferLayout<'static>; 1] = [wgpu::VertexBufferLayout {
-    array_stride: size_of::<crate::buffer::persist::OrderEntry>() as u64,
-    step_mode: wgpu::VertexStepMode::Instance,
-    attributes: &[
-        wgpu::VertexAttribute {
-            format: wgpu::VertexFormat::Uint32,
-            offset: 0,
-            shader_location: 0,
-        },
-        wgpu::VertexAttribute {
-            format: wgpu::VertexFormat::Float32x2,
-            offset: size_of::<u32>() as u64,
-            shader_location: 1,
-        },
-    ],
-}];
 use crate::gpu::pipeline_cache::PipelineCache;
 use crate::pipeline::kind::PipelineKind;
 use crate::pipeline::layout::Layouts;
@@ -52,8 +31,11 @@ pub struct Pipelines {
     layouts: Layouts,
     /// One compiled shader module per source module.
     modules: BTreeMap<Module, wgpu::ShaderModule>,
-    /// The pipelines, by kind and attachment format.
-    built: HashMap<(PipelineKind, wgpu::TextureFormat), wgpu::RenderPipeline>,
+    /// The pipelines, by attachment format and then by kind.
+    ///
+    /// A frame draws into two or three formats, so a format is found by a scan and a kind by its
+    /// index. A draw asks for its pipeline every time it is issued.
+    built: Vec<(wgpu::TextureFormat, Box<KindTable>)>,
     /// The persisted compilation cache, when the driver offers one.
     cache: PipelineCache,
     /// Whether the device can blend against a second colour output.
@@ -85,7 +67,7 @@ impl Pipelines {
         Self {
             layouts: Layouts::new(gpu),
             modules: BTreeMap::new(),
-            built: HashMap::new(),
+            built: Vec::new(),
             cache: PipelineCache::load(gpu),
             dual_source_blending: gpu.capabilities().subpixel_text,
             effects: Effects::new(),
@@ -179,6 +161,12 @@ impl Pipelines {
         &self.layouts
     }
 
+    /// The persisted compilation cache.
+    #[cfg(test)]
+    pub(crate) fn cache(&self) -> &PipelineCache {
+        &self.cache
+    }
+
     /// The pipeline for `kind` drawing into an attachment of `format`, building it if needed.
     ///
     /// Returns `None` for a pipeline the device cannot support, which is the per-channel coverage
@@ -196,8 +184,16 @@ impl Pipelines {
         if !kind.suits(format) {
             return None;
         }
-        let key = (kind, format);
-        if !self.built.contains_key(&key) {
+        let column = match self.built.iter().position(|(held, _)| *held == format) {
+            Some(column) => column,
+            None => {
+                self.built
+                    .push((format, Box::new(core::array::from_fn(|_| None))));
+                self.built.len() - 1
+            }
+        };
+        let index = kind as usize;
+        if self.built[column].1[index].is_none() {
             let source = kind.module();
             let module = self.modules.entry(source).or_insert_with(|| {
                 gpu.device()
@@ -211,16 +207,28 @@ impl Pipelines {
                     })
             });
             let pipeline = build(gpu, &self.layouts, &self.cache, kind, format, module);
-            self.built.insert(key, pipeline);
+            self.built[column].1[index] = Some(pipeline);
         }
-        self.built.get(&key)
+        self.built[column].1[index].as_ref()
     }
 
-    /// Writes the compilation cache back, if there is one to write.
+    /// Whether the pipeline for `kind` drawing into `format` exists, without building it.
+    #[cfg(test)]
+    pub(crate) fn is_built(&self, kind: PipelineKind, format: wgpu::TextureFormat) -> bool {
+        self.built
+            .iter()
+            .find(|(held, _)| *held == format)
+            .is_some_and(|(_, table)| table[kind as usize].is_some())
+    }
+
+    /// Writes the compilation cache back when a pipeline built since the last write added data.
     pub fn persist(&self) {
         self.cache.store();
     }
 }
+
+/// The pipelines of one attachment format, indexed by kind.
+type KindTable = [Option<wgpu::RenderPipeline>; PipelineKind::ALL.len()];
 
 /// Builds one pipeline.
 fn build(
@@ -237,6 +245,17 @@ fn build(
     }
     if kind.is_instanced() {
         bind_group_layouts.push(Some(&layouts.instances));
+        if kind.samples_atlas() {
+            bind_group_layouts.push(Some(&layouts.sampled));
+        }
+    } else if kind.draws_marks() {
+        bind_group_layouts.push(Some(&layouts.instances));
+        bind_group_layouts.push(Some(if kind == PipelineKind::MarksComposite {
+            &layouts.mark_composite
+        } else {
+            &layouts.marks
+        }));
+        // A glyph reads its cells out of an atlas texture, bound after its payload.
         if kind.samples_atlas() {
             bind_group_layouts.push(Some(&layouts.sampled));
         }
@@ -263,12 +282,15 @@ fn build(
                 entry_point: Some(kind.vertex_entry()),
                 compilation_options: Default::default(),
                 // Every primitive is four corners of a unit square expanded in the vertex stage,
-                // so the only vertex data is one slot number an instance, which is the draw order.
-                // The instance itself is read from the arena at that slot.
-                //
-                // A pipeline that draws no instances — the blit, the clear, a composite — takes
-                // none of it and is given an empty list.
-                buffers: if kind.is_instanced() { &REMAP } else { &[] },
+                // so the only vertex data is the draw order: one entry an instance, naming the
+                // arena slot its record is at and the shift its chunk moved by. It is vertex
+                // input rather than a storage buffer because a GL 3.3 context has none, and
+                // fetching it this way takes an indirection out of the vertex stage besides.
+                buffers: if kind.takes_order() {
+                    ORDER_LAYOUT
+                } else {
+                    &[]
+                },
             },
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleStrip,
@@ -290,3 +312,25 @@ fn build(
             cache: cache.handle(),
         })
 }
+
+/// The draw order, as one instance-stepped vertex buffer.
+///
+/// `slot` is the arena slot the record is at and `shift` is how far its chunk moved this frame,
+/// resolved on the host so that neither a remap nor an offsets table is read here. The stride is
+/// [`OrderEntry`](crate::buffer::persist::OrderEntry)'s own, and the two have to agree.
+pub(crate) const ORDER_LAYOUT: &[wgpu::VertexBufferLayout<'static>] = &[wgpu::VertexBufferLayout {
+    array_stride: 12,
+    step_mode: wgpu::VertexStepMode::Instance,
+    attributes: &[
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Uint32,
+            offset: 0,
+            shader_location: 0,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x2,
+            offset: 4,
+            shader_location: 1,
+        },
+    ],
+}];

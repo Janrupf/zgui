@@ -70,7 +70,7 @@ struct Bound {
 /// window.unmount();
 /// assert_eq!(node_ref.get(), None, "and reading it afterwards is not a panic");
 /// ```
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 pub struct NodeRef(RwSignal<Option<Bound>, LocalStorage>);
 
 impl NodeRef {
@@ -91,9 +91,24 @@ impl NodeRef {
         }));
     }
 
-    /// Unbinds this handle, which is what a view does as it unmounts the element.
+    /// Unbinds this handle.
     pub fn unbind(&self) {
         self.0.try_set(None);
+    }
+
+    /// Unbinds this handle while it is bound to `node`.
+    ///
+    /// An element calls this as the view that built it goes away. A handle that a newer element
+    /// bound in the meantime keeps that element, so the order in which an old build is dropped and
+    /// a new one is built does not matter.
+    pub fn release(&self, node: NodeId) {
+        let bound_here = self
+            .0
+            .try_with_untracked(|bound| bound.as_ref().is_some_and(|bound| bound.node == node))
+            .unwrap_or(false);
+        if bound_here {
+            self.0.try_set(None);
+        }
     }
 
     /// The node, once it exists — and `None` after the view that made it went away.
@@ -111,9 +126,15 @@ impl NodeRef {
         self.get_untracked().is_some()
     }
 
-    /// What is bound, when anything is.
+    /// What is bound, when anything is and its node still exists.
+    ///
+    /// A node the document has dropped reads as unbound, so no imperative call hands the backend
+    /// a node it no longer knows.
     fn bound(&self) -> Option<Bound> {
-        self.0.try_get_untracked().flatten()
+        self.0
+            .try_get_untracked()
+            .flatten()
+            .filter(|bound| bound.dom.is_live(bound.node))
     }
 
     // ---- one-shot reads, from the last completed frame ------------------------------------
@@ -185,6 +206,9 @@ impl NodeRef {
     }
 
     /// Asks for a scroll.
+    ///
+    /// Carried out after the next frame's layout pass, so a node added in the same reactive flush
+    /// is measured where that layout puts it. See [`ViewHost::scroll_to`](crate::ViewHost::scroll_to).
     pub fn scroll_to(&self, target: ScrollTarget, behavior: ScrollBehavior) {
         if let Some(bound) = self.bound() {
             bound.host.scroll_to(bound.node, target, behavior);
@@ -205,6 +229,15 @@ impl NodeRef {
     pub fn contains(&self, other: NodeId) -> bool {
         self.bound()
             .is_some_and(|bound| bound.host.contains(bound.node, other))
+    }
+
+    /// Whether this node is `ancestor` or sits inside it.
+    ///
+    /// The reverse of [`NodeRef::contains`]: a registry of parts asks it to find the parts inside
+    /// a node it only knows by id, such as the element that holds focus.
+    pub fn is_within(&self, ancestor: NodeId) -> bool {
+        self.bound()
+            .is_some_and(|bound| bound.host.contains(ancestor, bound.node))
     }
 
     /// Whether this node comes before `other` in tree order.
@@ -293,7 +326,12 @@ impl NodeRef {
 
     // ---- observation: geometry as a reactive input ------------------------------------------
 
-    /// Observes this node's border box.
+    /// Observes this node's border box, where it is drawn in the window.
+    ///
+    /// The box is in window device pixels, with this node's own transform and every ancestor's
+    /// applied, so a scaled node reports its scaled extent. A transformed box is reported as the
+    /// smallest upright rectangle containing it. For the size of the content area before any
+    /// transform, observe [`NodeRef::observe_content_size`].
     ///
     /// The signal carries the value as of the last completed layout and is written during the
     /// frame that changes it, before anything is painted — so a view that repositions itself from
@@ -306,6 +344,15 @@ impl NodeRef {
     /// starts one by accident.
     pub fn observe_border_box(&self) -> Signal<Option<Rect<DevicePx, Device>>, LocalStorage> {
         self.observe_border_box_while(|| true)
+    }
+
+    /// Observes the size of this node's border box.
+    ///
+    /// The size [`NodeRef::observe_border_box`] carries, without the position, so a node that
+    /// only moves wakes nothing. Prefer it whenever the position is not read: moving one edge of a
+    /// panel moves everything inside the panel.
+    pub fn observe_border_size(&self) -> Signal<Option<Size<DevicePx, Device>>, LocalStorage> {
+        self.observe_border_size_while(|| true)
     }
 
     /// Observes the size of this node's content area.
@@ -332,6 +379,17 @@ impl NodeRef {
     ) -> Signal<Option<Rect<DevicePx, Device>>, LocalStorage> {
         let value = self.observe(Observed::BorderBox, active);
         Signal::derive_local(move || value.get().and_then(|value| value.as_border_box()))
+    }
+
+    /// Observes the size of this node's border box for as long as `active` answers true.
+    ///
+    /// Until the first value of a new watch arrives the signal reads `None`.
+    pub fn observe_border_size_while(
+        &self,
+        active: impl Fn() -> bool + 'static,
+    ) -> Signal<Option<Size<DevicePx, Device>>, LocalStorage> {
+        let value = self.observe(Observed::BorderSize, active);
+        Signal::derive_local(move || value.get().and_then(|value| value.as_border_size()))
     }
 
     /// Observes the size of this node's content area for as long as `active` answers true.
@@ -572,6 +630,23 @@ pub fn focused_node() -> Signal<Option<NodeId>, LocalStorage> {
     }
 }
 
+/// Whether the keyboard of this window is in an element a person types into.
+///
+/// What an application-wide chord asks before it acts on a key that carries no modifier: a window
+/// whose focus is in a field must give <kbd>Delete</kbd> and <kbd>Escape</kbd> to the field, and a
+/// window with focus anywhere else may take them for a command of its own.
+///
+/// False outside a window's scope, and false while nothing holds focus.
+#[must_use]
+pub fn focus_is_text_entry() -> bool {
+    let Some(host) = current_host() else {
+        return false;
+    };
+    host.focused()
+        .get_untracked()
+        .is_some_and(|node| host.is_text_entry(node))
+}
+
 #[cfg(test)]
 mod tests {
     use zgui_geom::{DevicePx, Point, Rect, Size};
@@ -609,6 +684,7 @@ mod tests {
         assert_eq!(node_ref.bounds(), None);
         assert_eq!(node_ref.focusables(), Vec::new());
         assert!(!node_ref.contains(a_box(&f)));
+        assert!(!node_ref.is_within(a_box(&f)));
         f.window.unmount();
     }
 
@@ -622,6 +698,27 @@ mod tests {
 
         component.unmount();
         assert_eq!(node_ref.get(), None);
+        f.window.unmount();
+    }
+
+    #[test]
+    fn releasing_a_node_unbinds_only_a_handle_still_bound_to_it() {
+        let f = Fixture::new();
+        let (old, new) = (a_box(&f), a_box(&f));
+        let node_ref = f.window.with(NodeRef::new);
+
+        node_ref.bind(old, &f.dom, f.cx.host());
+        node_ref.release(old);
+        assert_eq!(
+            node_ref.get(),
+            None,
+            "the handle was bound to the released node"
+        );
+
+        node_ref.bind(old, &f.dom, f.cx.host());
+        node_ref.bind(new, &f.dom, f.cx.host());
+        node_ref.release(old);
+        assert_eq!(node_ref.get(), Some(new), "a newer node keeps its handle");
         f.window.unmount();
     }
 

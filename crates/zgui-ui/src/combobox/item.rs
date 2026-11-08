@@ -10,9 +10,9 @@ use zgui_ui_icons::set::mark::CHECK;
 
 use crate::combobox::SHEET;
 use crate::combobox::style::ComboboxStyle;
-use crate::listbox::{Listbox, ListboxOption, use_listbox_option};
+use crate::listbox::{Listbox, ListboxCatalogue, ListboxGroup, ListboxOption, use_listbox_option};
 use crate::select::{SHEET as SELECT_SHEET, SelectStyle};
-use crate::support::activate_on_press;
+use crate::support::activate_on_press_keeping_focus;
 
 /// One option of a [`Combobox`](crate::Combobox).
 ///
@@ -62,6 +62,47 @@ pub fn ComboboxItem(
     /// What it shows.
     children: ChildrenFn,
 ) -> impl IntoView {
+    view! {
+        ComboboxEntry(
+            value = value,
+            text = text,
+            disabled = disabled,
+            on_select = on_select,
+            mark = true,
+            {..attrs},
+            class = class
+        ) {
+            {children.view()}
+        }
+    }
+}
+
+/// One option of any listbox that a typed filter narrows: a combobox's, or a palette's.
+///
+/// While the filter excludes it, nothing is mounted and nothing is registered.
+#[component]
+pub(crate) fn ComboboxEntry(
+    /// What choosing it reports.
+    value: String,
+    /// What it reads as and is searched by; the value when `None`.
+    #[prop(optional)]
+    text: Option<String>,
+    /// Whether it can be chosen.
+    disabled: Signal<bool, LocalStorage>,
+    /// Told when it is chosen.
+    #[prop(optional)]
+    on_select: Option<zgui::reactive::UnsyncCallback<()>>,
+    /// Whether the chosen option shows a tick.
+    mark: bool,
+    /// Classes merged after the option's own.
+    #[prop(into, optional)]
+    class: Classes,
+    /// Anything else the caller forwarded.
+    #[prop(attrs)]
+    attrs: Attrs,
+    /// What it shows.
+    children: ChildrenFn,
+) -> impl IntoView {
     install_stylesheet(SHEET, ComboboxStyle::CSS);
     // A combobox's rows are a select's rows, so they are drawn by a select's rules — which have to
     // be installed here as well. A component that borrowed the classes and not the sheet would be
@@ -69,6 +110,14 @@ pub fn ComboboxItem(
     install_stylesheet(SELECT_SHEET, SelectStyle::CSS);
     let listbox = Listbox::current();
     let reads_as = text.unwrap_or_else(|| value.clone());
+    // In the catalogue of a closed list, it only says what its value reads as. Its text is known
+    // without an element, so it builds none.
+    if let Some(listbox) = listbox
+        && ListboxCatalogue::is_current()
+    {
+        listbox.remember(&value, &reads_as);
+        return AnyView::new(());
+    }
     let survives = {
         let reads_as = reads_as.clone();
         move || listbox.is_none_or(|listbox| listbox.matches(&reads_as))
@@ -76,7 +125,7 @@ pub fn ComboboxItem(
 
     let held = StoredValue::new_local((value, reads_as, on_select, class, attrs, children));
 
-    view! {
+    AnyView::new(view! {
         Show(when = survives, fallback = || ()) {
             {move || {
                 let (value, reads_as, on_select, class, attrs, children) = held.get_value();
@@ -86,6 +135,7 @@ pub fn ComboboxItem(
                         text = reads_as,
                         disabled = disabled,
                         on_select = on_select,
+                        mark = mark,
                         class = class,
                         {..attrs}
                     ) {
@@ -94,7 +144,7 @@ pub fn ComboboxItem(
                 }
             }}
         }
-    }
+    })
 }
 
 /// The option itself, mounted only while its text survives the filter.
@@ -112,6 +162,8 @@ fn ComboboxOption(
     disabled: Signal<bool, LocalStorage>,
     /// Told when it is chosen.
     on_select: Option<zgui::reactive::UnsyncCallback<()>>,
+    /// Whether the chosen option shows a tick.
+    mark: bool,
     /// Classes merged after the option's own.
     #[prop(into, optional)]
     class: Classes,
@@ -127,6 +179,11 @@ fn ComboboxOption(
         option = option.on_select(on_select);
     }
     let registered = use_listbox_option(option);
+    if registered.is_some()
+        && let Some(group) = ListboxGroup::current()
+    {
+        group.count_in();
+    }
 
     let value = StoredValue::new_local(value);
     let chosen =
@@ -152,7 +209,7 @@ fn ComboboxOption(
     view! {
         box(
             node_ref = node,
-            on:pointer_down = activate_on_press(),
+            on:pointer_down = activate_on_press_keeping_focus(),
             on:click = move |_| {
                 if let Some((listbox, id)) = registered {
                     listbox.take(id);
@@ -169,11 +226,13 @@ fn ComboboxOption(
             {..attrs},
             class = class
         ) {
-            box(class = "zui-select__indicator") {
-                Show(when = chosen, fallback = || ()) {
-                    Icon(icon = CHECK)
+            if move || mark {
+                box(class = "zui-select__indicator") {
+                    Show(when = chosen, fallback = || ()) {
+                        Icon(icon = CHECK)
+                    }
                 }
-            }
+            } else {}
             {children.into_view_once()}
         }
     }

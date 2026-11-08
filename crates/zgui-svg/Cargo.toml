@@ -3,6 +3,13 @@ name = "zgui-svg"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "SVG documents as drawable zgui content"
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+include.workspace = true
 
 # L4 — engines. Every dependency is inherited: `foo.workspace = true`.
 [dependencies]

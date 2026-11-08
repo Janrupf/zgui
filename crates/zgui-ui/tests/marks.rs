@@ -104,12 +104,14 @@ fn middle(rect: Rect<DevicePx, Device>) -> (f32, f32) {
 
 /// Asserts that the mark the box is showing is in the middle of it, and inside it.
 ///
-/// Exactly one drawing, because the mark that is not showing is faded to nothing and a primitive
+/// Exactly one shape, because the mark that is not showing is faded to nothing and a primitive
 /// faded to nothing is never pushed. Two would mean the hidden mark is being drawn over the shown
 /// one, which is what a control with a mark visibly off to one side looks like from the outside.
+/// A tick arrives as a coverage sprite and a dash as a quad, so the shapes are read rather than
+/// the vector items; the box's own background is not one of them.
 fn assert_centred(stage: &Stage, node: NodeId, what: &str) {
     let box_ = stage.rect_of(node);
-    let drawings = stage.drawings_in(box_);
+    let drawings = stage.shapes_in(box_);
     assert_eq!(
         drawings.len(),
         1,

@@ -15,14 +15,14 @@
 //! distinct content and [`break_lines`](MeasureContent::break_lines) once per width, and a
 //! measurer that fused them would turn every width probe back into a full pass.
 
-use taffy::{AvailableSpace, Size};
+use cephal::{AvailableSpace, Size};
 use zgui_css::ComputedStyle;
 use zgui_dom::side::BoxKey;
 use zgui_text::{
     BreakRequest, BrokenParagraph, Brush, ContentWidths, ParagraphContent, ParagraphKey,
     ShapedClusters, StrutMetrics,
 };
-use zgui_text_style::{TextPaint, TextStyle};
+use zgui_text_style::{BreakingKey, TextPaint, TextStyle};
 
 /// What is being asked of the content, and under what constraints.
 #[derive(Clone, Copy, Debug)]
@@ -136,11 +136,37 @@ pub trait MeasureContent: ShapedClusters {
         shaped
     }
 
+    /// Shapes `content` under `variant`, a [variant](ParagraphKey::variant) of its own key `base`,
+    /// or reports the result already held under `variant`.
+    ///
+    /// The copy has a break of its own, for a context whose lines differ from those of another
+    /// context with equal content. `None` when the measurer holds no such copies; the context then
+    /// shares the form under `base`.
+    fn shape_variant(
+        &mut self,
+        base: ParagraphKey,
+        variant: ParagraphKey,
+        content: &ParagraphContent<'_>,
+    ) -> Option<ShapedSummary> {
+        let _ = (base, variant, content);
+        None
+    }
+
     /// Breaks an already shaped paragraph into lines.
     ///
     /// A key that names nothing has no lines, which is what a measurer with no text engine behind
     /// it answers to everything.
     fn break_lines(&mut self, key: ParagraphKey, request: &BreakRequest<'_>) -> BrokenParagraph;
+
+    /// Which break the shaped form of the paragraph `key` currently reflects.
+    ///
+    /// `None` when the measurer holds no such paragraph or keeps no laid-out form. A measurer that
+    /// forwards to another must forward this too: `None` stops the layout pass from putting a form
+    /// back on its kept lines after a probe moved it.
+    fn breaks_reflect(&self, key: ParagraphKey) -> Option<BreakingKey> {
+        let _ = key;
+        None
+    }
 
     /// The strut of a block whose root text style is `style`.
     ///
@@ -225,8 +251,21 @@ impl MeasureContent for Box<dyn WorkerMeasure> {
         (**self).shape_keyed(key, content)
     }
 
+    fn shape_variant(
+        &mut self,
+        base: ParagraphKey,
+        variant: ParagraphKey,
+        content: &ParagraphContent<'_>,
+    ) -> Option<ShapedSummary> {
+        (**self).shape_variant(base, variant, content)
+    }
+
     fn break_lines(&mut self, key: ParagraphKey, request: &BreakRequest<'_>) -> BrokenParagraph {
         (**self).break_lines(key, request)
+    }
+
+    fn breaks_reflect(&self, key: ParagraphKey) -> Option<BreakingKey> {
+        (**self).breaks_reflect(key)
     }
 
     fn strut(&mut self, style: &TextStyle) -> StrutMetrics {
@@ -364,7 +403,7 @@ mod tests {
 
     #[test]
     fn the_empty_measurer_reports_nothing_rather_than_refusing() {
-        use taffy::{AvailableSpace, Size};
+        use cephal::{AvailableSpace, Size};
         use zgui_arena::{DomainId, Generation};
         use zgui_css::StyleDraft;
         use zgui_dom::side::BoxKey;

@@ -5,7 +5,10 @@ use std::sync::{Arc, Mutex};
 use swash::FontRef;
 use swash::scale::{Render, ScaleContext, Source, StrikeWith};
 use swash::zeno::{Angle, Format, Transform, Vector};
-use zgui_text::{FaceId, GlyphImage, GlyphKey, GlyphOutline, GlyphRaster, OutlineKey, RasterStyle};
+use zgui_text::{
+    FaceId, GlyphImage, GlyphKey, GlyphOutline, GlyphRaster, OutlineKey, RasterStyle,
+    VariationInstance,
+};
 
 use crate::raster::faces::FaceBytes;
 use crate::raster::image::convert;
@@ -70,21 +73,42 @@ impl Rasteriser {
     }
 }
 
-impl GlyphRaster for Rasteriser {
-    fn raster(&self, key: &GlyphKey) -> Option<GlyphImage> {
+impl Rasteriser {
+    /// Rasterises one glyph through `context`.
+    fn raster_with(&self, context: &mut ScaleContext, key: &GlyphKey) -> Option<GlyphImage> {
         let (blob, index) = self.faces.get(&self.fonts, key.face)?;
         let font = FontRef::from_index(blob.data(), index as usize)?;
+        let coords = self.fonts.variation_coords(key.instance);
+        let mut scaler = context
+            .builder_with_id(font, identity(key.face, index, key.instance))
+            .size(key.size())
+            .hint(true)
+            .normalized_coords(coords.as_deref().unwrap_or_default())
+            .build();
+        let image = renderer(key).render(&mut scaler, key.glyph)?;
+        Some(convert(&image))
+    }
+}
+
+impl GlyphRaster for Rasteriser {
+    fn raster(&self, key: &GlyphKey) -> Option<GlyphImage> {
         let mut context = self
             .scale
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut scaler = context
-            .builder_with_id(font, identity(key.face, index))
-            .size(key.size())
-            .hint(true)
-            .build();
-        let image = renderer(key).render(&mut scaler, key.glyph)?;
-        Some(convert(&image))
+        self.raster_with(&mut context, key)
+    }
+
+    /// Rasterises the batch through a context of its own, so batches on other threads do not wait
+    /// for the shared one.
+    ///
+    /// The context lives for the batch only. A batch sorted by face and size prepares each face's
+    /// hinting state once.
+    fn raster_many(&self, keys: &[GlyphKey]) -> Vec<Option<GlyphImage>> {
+        let mut context = ScaleContext::new();
+        keys.iter()
+            .map(|key| self.raster_with(&mut context, key))
+            .collect()
     }
 
     fn outline(&self, key: &OutlineKey) -> Option<GlyphOutline> {
@@ -93,7 +117,9 @@ impl GlyphRaster for Rasteriser {
         // wanted unhinted and unshifted, and the scaler that produces tiles is configured for
         // neither.
         let font = skrifa::FontRef::from_index(blob.data(), index).ok()?;
-        self.outlines.get(&font, key)
+        let coords = self.fonts.variation_coords(key.instance);
+        self.outlines
+            .get(&font, key, coords.as_deref().unwrap_or_default())
     }
 }
 
@@ -104,8 +130,13 @@ impl GlyphRaster for Rasteriser {
 /// scaler built per glyph shares nothing with the one before it and runs the face's `fpgm` and
 /// `prep` control programs again for every single glyph. A face handle and the index within its
 /// collection are exactly the pair that names a face, so they are what the identity is made of.
-fn identity(face: FaceId, index: u32) -> [u64; 2] {
-    [u64::from(face.0), u64::from(index)]
+/// The variation instance joins them, so the state prepared for one instance is never reused for
+/// another.
+fn identity(face: FaceId, index: u32, instance: VariationInstance) -> [u64; 2] {
+    [
+        u64::from(face.0),
+        u64::from(index) | (u64::from(instance.0) << 32),
+    ]
 }
 
 /// The render configured for one key.
@@ -131,7 +162,7 @@ fn renderer(key: &GlyphKey) -> Render<'static> {
         // A synthesised italic leans the glyph forward, which is a shear along x by the angle the
         // face would have been drawn at.
         render.transform(Some(Transform::skew(
-            Angle::from_degrees(-slant),
+            Angle::from_degrees(slant),
             Angle::ZERO,
         )));
     }

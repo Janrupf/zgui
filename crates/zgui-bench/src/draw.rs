@@ -60,6 +60,12 @@ impl Renderer for NullRenderer {
         true
     }
 
+    /// Yes, for the same reason: a resize that a real renderer answers from the picture it kept
+    /// narrows the frame's damage, and what follows from that is what this harness measures.
+    fn composed_survives_configure(&self) -> bool {
+        true
+    }
+
     fn capabilities(&self) -> zgui::render::RenderCapabilities {
         zgui::render::RenderCapabilities::MINIMAL
     }
@@ -172,8 +178,10 @@ pub(crate) fn renderer(
         )
         .map_err(AppError::GpuUnavailable)?;
     zgui_render_vector_vello::attach(&mut gpu, target.size);
-    Ok(Box::new(crate::verify::Listed {
-        inner: Box::new(gpu),
-        full,
-    }))
+    let inner: Box<dyn Renderer> = if crate::gpu_time::enabled() {
+        Box::new(crate::gpu_time::Timed::new(gpu))
+    } else {
+        Box::new(gpu)
+    };
+    Ok(Box::new(crate::verify::Listed { inner, full }))
 }

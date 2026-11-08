@@ -56,7 +56,7 @@ impl WindowHandle {
     /// # let _ = window.move_drag_handler();
     /// # }
     /// ```
-    pub fn move_drag_handler(&self) -> impl Fn(&mut EventCx<'_, events::PointerDown>) + 'static {
+    pub fn move_drag_handler(&self) -> impl Fn(&mut EventCx<'_, events::PointerDown>) + use<> {
         let window = self.clone();
         let last: LastPress = Rc::new(Cell::new(None));
         handler(
@@ -76,7 +76,7 @@ impl WindowHandle {
                 if again {
                     // The gesture is over either way: a third press is a new one.
                     last.set(None);
-                    window.toggle_maximized();
+                    window.title_bar_double_click();
                 } else {
                     last.set(Some((now, at)));
                     window.begin_move_drag();
@@ -104,9 +104,7 @@ impl WindowHandle {
     /// # let _ = window.no_drag_handler();
     /// # }
     /// ```
-    pub fn no_drag_handler(
-        &self,
-    ) -> impl Fn(&mut EventCx<'_, events::PointerDown>) + Copy + 'static {
+    pub fn no_drag_handler(&self) -> impl Fn(&mut EventCx<'_, events::PointerDown>) + Copy + use<> {
         handler(
             events::POINTER_DOWN,
             move |ev: &mut EventCx<'_, events::PointerDown>| ev.stop_propagation(),
@@ -124,7 +122,7 @@ impl WindowHandle {
     pub fn resize_drag_handler(
         &self,
         edge: zgui_platform::ResizeEdge,
-    ) -> impl Fn(&mut EventCx<'_, events::PointerDown>) + 'static {
+    ) -> impl Fn(&mut EventCx<'_, events::PointerDown>) + use<> {
         let window = self.clone();
         handler(
             events::POINTER_DOWN,

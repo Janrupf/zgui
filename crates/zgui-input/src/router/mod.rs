@@ -580,6 +580,7 @@ impl Router {
                     .iter()
                     .find(|(id, _)| *id == event.id)
                     .map(|(_, node)| *node),
+                event.button,
             ),
             _ => None,
         }

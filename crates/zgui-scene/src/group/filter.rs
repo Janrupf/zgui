@@ -61,6 +61,12 @@ impl Filter {
     /// more expands damage for pixels that cannot be seen.
     pub const BLUR_EXTENT: f32 = 3.0;
 
+    /// How far a blur's resampling reads past its kernel, in device pixels.
+    ///
+    /// A blur runs at half resolution: a 2:1 downsample, then a bilinear upsample. Each reads one
+    /// half-resolution texel, two device pixels, past the pixel it writes.
+    pub const RESAMPLE_REACH: f32 = 2.0;
+
     /// How far outside a rectangle this filter reads, in device pixels, as
     /// `(left, top, right, bottom)`.
     ///
@@ -69,8 +75,12 @@ impl Filter {
     /// [`read_extent`](crate::read_extent) exists.
     pub fn kernel_support(&self) -> (f32, f32, f32, f32) {
         match self {
+            // A blur of zero is the identity, and executing it is skipped.
+            Self::Blur(deviation) if deviation.is_nan() || *deviation <= 0.0 => {
+                (0.0, 0.0, 0.0, 0.0)
+            }
             Self::Blur(deviation) => {
-                let reach = Self::BLUR_EXTENT * deviation.max(0.0);
+                let reach = Self::BLUR_EXTENT * deviation + Self::RESAMPLE_REACH;
                 (reach, reach, reach, reach)
             }
             Self::DropShadow {
@@ -79,7 +89,8 @@ impl Filter {
                 blur,
                 ..
             } => {
-                let reach = Self::BLUR_EXTENT * blur.max(0.0);
+                // The copy is always blurred, so it always resamples.
+                let reach = Self::BLUR_EXTENT * blur.max(0.0) + Self::RESAMPLE_REACH;
                 (
                     (reach - offset_x).max(0.0),
                     (reach - offset_y).max(0.0),

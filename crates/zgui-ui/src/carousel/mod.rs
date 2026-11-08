@@ -4,7 +4,7 @@ mod context;
 mod parts;
 mod style;
 
-pub use crate::carousel::context::{CarouselContext, CarouselSlot};
+pub use crate::carousel::context::{CarouselContext, CarouselSlot, Reach, reach};
 pub use crate::carousel::parts::{
     CarouselContent, CarouselContentProps, CarouselItem, CarouselItemProps, CarouselNext,
     CarouselNextProps, CarouselPrevious, CarouselPreviousProps,

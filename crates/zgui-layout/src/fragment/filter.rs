@@ -7,23 +7,40 @@
 
 use smallvec::SmallVec;
 use zgui_css::ComputedStyle;
+use zgui_css::values::custom;
 use zgui_css::values::effect::FilterValue;
 use zgui_scene::Filter;
+
+use crate::fragment::custom_properties::CustomProperties;
 
 /// A filter chain, which is short in every document that has one at all.
 pub type FilterChain = SmallVec<[Filter; 2]>;
 
 /// The `filter` chain applied to a box's own content.
 pub fn own(style: &ComputedStyle, scale: f32) -> FilterChain {
+    own_with(style, CustomProperties::ALL, scale)
+}
+
+/// [`own`], for a style that declares `declared`.
+pub fn own_with(style: &ComputedStyle, declared: CustomProperties, scale: f32) -> FilterChain {
     let mut chain = chain(&style.get_effects().filter.0, scale);
-    chain.extend(effect(style, zgui_scene::property::FILTER, scale));
+    if declared.filter() {
+        chain.extend(effect(style, &custom::FILTER, scale));
+    }
     chain
 }
 
 /// The `backdrop-filter` chain a box samples what is behind it through.
 pub fn backdrop(style: &ComputedStyle, scale: f32) -> FilterChain {
+    backdrop_with(style, CustomProperties::ALL, scale)
+}
+
+/// [`backdrop`], for a style that declares `declared`.
+pub fn backdrop_with(style: &ComputedStyle, declared: CustomProperties, scale: f32) -> FilterChain {
     let mut chain = chain(&style.get_effects().backdrop_filter.0, scale);
-    chain.extend(effect(style, zgui_scene::property::BACKDROP_FILTER, scale));
+    if declared.backdrop_filter() {
+        chain.extend(effect(style, &custom::BACKDROP_FILTER, scale));
+    }
     chain
 }
 
@@ -32,8 +49,8 @@ pub fn backdrop(style: &ComputedStyle, scale: f32) -> FilterChain {
 /// The parameters are deliberately absent: this conversion exists to answer how far a fragment
 /// reads, which is the effect's own declaration and nothing else. What the effect is *drawn* with
 /// is resolved where it is emitted, against a scene this stage does not have.
-fn effect(style: &ComputedStyle, property: &str, scale: f32) -> Option<Filter> {
-    let name = zgui_css::values::custom::text(style, property)?.trim();
+fn effect(style: &ComputedStyle, property: &custom::Property, scale: f32) -> Option<Filter> {
+    let name = property.text(style)?.trim();
     if name.is_empty() || name == "none" {
         return None;
     }
@@ -52,14 +69,29 @@ fn effect(style: &ComputedStyle, property: &str, scale: f32) -> Option<Filter> {
 ///
 /// This is the question the read-extent registry is a list of the answers to: a chain of per-pixel
 /// filters, or no chain at all, reads exactly what it writes and never needs to be found again.
-pub fn reads_outside(style: &ComputedStyle, scale: f32) -> bool {
-    own(style, scale).iter().any(|it| !it.is_per_pixel())
-        || backdrop(style, scale).iter().any(|it| !it.is_per_pixel())
-        || !style.get_effects().backdrop_filter.0.is_empty()
+///
+/// `declared` is the set of framework properties `style` declares, or [`CustomProperties::ALL`].
+pub fn reads_outside(style: &ComputedStyle, declared: CustomProperties, scale: f32) -> bool {
+    own_with(style, declared, scale)
+        .iter()
+        .any(|it| !it.is_per_pixel())
+        || backdrop_with(style, declared, scale)
+            .iter()
+            .any(|it| !it.is_per_pixel())
         // A backdrop reads what is beneath it whatever its chain does, and an application's is no
         // different: the copy it samples is a region of the composite, not of anything it wrote.
-        || zgui_css::values::custom::text(style, zgui_scene::property::BACKDROP_FILTER)
-            .is_some_and(|name| !name.trim().is_empty())
+        || filters_backdrop(style, declared)
+}
+
+/// Whether the box declares a `backdrop-filter`, its own or an application's.
+///
+/// `declared` is the set of framework properties `style` declares, or [`CustomProperties::ALL`].
+pub fn filters_backdrop(style: &ComputedStyle, declared: CustomProperties) -> bool {
+    !style.get_effects().backdrop_filter.0.is_empty()
+        || (declared.backdrop_filter()
+            && custom::BACKDROP_FILTER
+                .text(style)
+                .is_some_and(|name| !name.trim().is_empty()))
 }
 
 /// One computed list, converted entry by entry.
@@ -76,6 +108,8 @@ fn chain(values: &[FilterValue], scale: f32) -> FilterChain {
 /// One computed filter function.
 fn convert(value: &FilterValue, scale: f32) -> Option<Filter> {
     Some(match value {
+        // A blur of zero is the identity, so it gives no step to execute.
+        FilterValue::Blur(radius) if radius.0.px() <= 0.0 => return None,
         FilterValue::Blur(radius) => Filter::Blur(deviation(radius.0.px() * scale)),
         FilterValue::Brightness(amount) => Filter::Brightness(amount.0),
         FilterValue::Contrast(amount) => Filter::Contrast(amount.0),
@@ -107,9 +141,11 @@ fn deviation(radius: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use zgui_css::values::effect::FilterValue;
+    use zgui_css::values::length::NonNegativeLength;
     use zgui_scene::Filter;
 
-    use super::deviation;
+    use super::{chain, convert, deviation};
 
     #[test]
     fn a_blur_radius_is_twice_its_standard_deviation() {
@@ -118,5 +154,14 @@ mod tests {
         assert_eq!(deviation(-1.0), 0.0);
         assert!(Filter::Blur(deviation(0.0)).is_per_pixel());
         assert!(!Filter::Blur(deviation(8.0)).is_per_pixel());
+    }
+
+    #[test]
+    fn a_blur_of_zero_converts_to_no_filter() {
+        let blur = |px| FilterValue::Blur(NonNegativeLength::new(px));
+        assert_eq!(convert(&blur(0.0), 2.0), None);
+        assert_eq!(convert(&blur(4.0), 2.0), Some(Filter::Blur(4.0)));
+        let chain = chain(&[blur(0.0), FilterValue::Invert(1.0.into())], 1.0);
+        assert_eq!(chain.as_slice(), [Filter::Invert(1.0)]);
     }
 }

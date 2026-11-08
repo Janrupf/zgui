@@ -57,7 +57,10 @@ impl Chain {
                     _ => steps.push(Step::Matrix(matrix)),
                 },
                 None => steps.push(match filter {
-                    Filter::Blur(deviation) => Step::Blur(deviation.max(0.0)),
+                    // A blur of zero is the identity. Executing it would resample the content
+                    // through a half-resolution target and read past the region it writes.
+                    Filter::Blur(deviation) if deviation.is_nan() || *deviation <= 0.0 => continue,
+                    Filter::Blur(deviation) => Step::Blur(*deviation),
                     Filter::DropShadow {
                         offset_x,
                         offset_y,
@@ -166,6 +169,19 @@ mod tests {
             Chain::of(&[Filter::Saturate(1.0), Filter::Opacity(1.0)]).is_empty(),
             "an identity map is dropped rather than paid for"
         );
+    }
+
+    #[test]
+    fn a_blur_of_zero_is_not_a_step() {
+        assert!(Chain::of(&[Filter::Blur(0.0)]).is_empty());
+        // Without the blur between them, the two runs fold into one map.
+        let chain = Chain::of(&[
+            Filter::Saturate(0.0),
+            Filter::Blur(0.0),
+            Filter::Brightness(2.0),
+        ]);
+        assert_eq!(chain.steps().len(), 1);
+        assert!(matches!(chain.steps()[0], Step::Matrix(_)));
     }
 
     #[test]

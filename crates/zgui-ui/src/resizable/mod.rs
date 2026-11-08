@@ -6,7 +6,7 @@ mod panel;
 mod style;
 
 pub use crate::resizable::handle::{ResizableHandle, ResizableHandleProps};
-pub use crate::resizable::layout::{PanelBound, drag, normalise};
+pub use crate::resizable::layout::{PanelBound, clamp, drag, normalise};
 pub use crate::resizable::panel::{ResizablePanel, ResizablePanelProps};
 pub use crate::resizable::style::ResizableStyle;
 
@@ -102,6 +102,34 @@ impl ResizableContext {
             .update(|entries| entries.push(Entry::Handle { id }));
         self.forget_on_cleanup(id);
         id
+    }
+
+    /// Puts new bounds on the panel called `id`, and brings every share back inside them.
+    ///
+    /// What a bound stated in pixels goes through whenever the group's own box changes. The shares
+    /// keep their total, so the panels still fill the group.
+    pub fn set_bound(self, id: u64, bound: PanelBound) {
+        let changed = self.entries.try_update(|entries| {
+            entries.iter_mut().any(|entry| match entry {
+                Entry::Panel {
+                    id: found,
+                    bound: held,
+                    ..
+                } if *found == id && *held != bound => {
+                    *held = bound;
+                    true
+                }
+                _ => false,
+            })
+        });
+        if changed != Some(true) {
+            return;
+        }
+        let (sizes, bounds) = self.panels();
+        let fixed = layout::clamp(&sizes, &bounds);
+        if fixed != sizes {
+            self.write(&fixed);
+        }
     }
 
     /// What share of the group the panel called `id` takes, as a percentage.
@@ -201,21 +229,6 @@ impl ResizableContext {
         })
     }
 
-    /// Every panel's declared share and bounds, in order.
-    fn declarations(self) -> (Vec<f64>, Vec<PanelBound>) {
-        self.entries.with_untracked(|entries| {
-            entries
-                .iter()
-                .filter_map(|entry| match entry {
-                    Entry::Panel {
-                        bound, declared, ..
-                    } => Some((*declared, *bound)),
-                    Entry::Handle { .. } => None,
-                })
-                .unzip()
-        })
-    }
-
     /// Writes a new set of shares back, in panel order, and tells whoever asked to be told.
     fn write(self, sizes: &[f64]) {
         self.entries.update(|entries| {
@@ -239,18 +252,7 @@ impl ResizableContext {
     /// the second compounds: the first panel of two is the whole group on its own, and sharing out
     /// from that would leave it two thirds when the second one arrived.
     fn rebalance(self) {
-        let (sizes, bounds) = self.declarations();
-        let balanced = layout::normalise(&sizes, &bounds);
-        self.entries.update(|entries| {
-            let mut next = balanced.iter();
-            for entry in entries.iter_mut() {
-                if let Entry::Panel { size, .. } = entry
-                    && let Some(value) = next.next()
-                {
-                    *size = *value;
-                }
-            }
-        });
+        self.entries.update(|entries| share_out(entries));
     }
 
     /// A name nothing else in this group has.
@@ -261,14 +263,45 @@ impl ResizableContext {
     }
 
     /// Takes `id` out of the group when the calling scope goes away.
+    ///
+    /// A panel that goes gives its share back: the panels that stay are shared out again from what
+    /// they were declared as, so a panel that stands alone again fills the group.
     fn forget_on_cleanup(self, id: u64) {
         on_cleanup_local(move || {
             self.entries.try_update(|entries| {
+                let panel = entries
+                    .iter()
+                    .any(|entry| matches!(entry, Entry::Panel { id: found, .. } if *found == id));
                 entries.retain(|entry| match entry {
                     Entry::Panel { id: found, .. } | Entry::Handle { id: found } => *found != id,
                 });
+                if panel {
+                    share_out(entries);
+                }
             });
         });
+    }
+}
+
+/// Shares the group out among the panels of `entries` from what each was declared as.
+fn share_out(entries: &mut [Entry]) {
+    let (sizes, bounds): (Vec<f64>, Vec<PanelBound>) = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::Panel {
+                bound, declared, ..
+            } => Some((*declared, *bound)),
+            Entry::Handle { .. } => None,
+        })
+        .unzip();
+    let balanced = layout::normalise(&sizes, &bounds);
+    let mut next = balanced.iter();
+    for entry in entries.iter_mut() {
+        if let Entry::Panel { size, .. } = entry
+            && let Some(value) = next.next()
+        {
+            *size = *value;
+        }
     }
 }
 

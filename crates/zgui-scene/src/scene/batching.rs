@@ -25,64 +25,10 @@ impl Scene {
             PrimitiveKind::MonoSprite => &self.remap.mono_sprites,
             PrimitiveKind::SubpixelSprite => &self.remap.subpixel_sprites,
             PrimitiveKind::ColorSprite => &self.remap.color_sprites,
+            PrimitiveKind::Marks => &self.remap.marks,
             PrimitiveKind::External => &self.remap.externals,
             PrimitiveKind::Backdrop => &self.remap.backdrops,
             PrimitiveKind::Vector | PrimitiveKind::GroupStart | PrimitiveKind::GroupEnd => &[],
-        }
-    }
-
-    /// Where the primitive at draw-order `position` of `kind` puts ink, in device pixels.
-    ///
-    /// `None` for a primitive drawn under a coordinate system of its own, and for a position past
-    /// the end. A primitive's ink is stated in the space it is drawn in, so only one drawn in the
-    /// viewport's own space has ink that is already device pixels; answering for the others would
-    /// mean resolving a matrix per primitive per frame, which costs more than the question is
-    /// worth to the one caller that asks it.
-    ///
-    /// What asks is a renderer deciding which instances of a batch can reach a region it is
-    /// redrawing. `None` therefore has to mean "assume it can", never "it cannot".
-    pub fn device_ink(
-        &self,
-        kind: PrimitiveKind,
-        position: usize,
-    ) -> Option<Rect<DevicePx, Device>> {
-        let index = self.slot(kind, position)?;
-        let viewport = SpatialId::VIEWPORT.index();
-        match kind {
-            PrimitiveKind::Quad => {
-                let quad = self.primitives.quads.get(index)?;
-                (quad.transform == viewport).then(|| quad.ink())
-            }
-            PrimitiveKind::Shadow => {
-                let shadow = self.primitives.shadows.get(index)?;
-                (shadow.transform == viewport).then(|| shadow.ink())
-            }
-            PrimitiveKind::Decoration => {
-                let decoration = self.primitives.decorations.get(index)?;
-                (decoration.transform == viewport).then(|| decoration.ink())
-            }
-            PrimitiveKind::MonoSprite => {
-                let sprite = self.primitives.mono_sprites.get(index)?;
-                (sprite.transform == viewport).then(|| sprite.ink())
-            }
-            PrimitiveKind::SubpixelSprite => {
-                let sprite = self.primitives.subpixel_sprites.get(index)?;
-                (sprite.transform == viewport).then(|| sprite.ink())
-            }
-            PrimitiveKind::ColorSprite => {
-                let sprite = self.primitives.color_sprites.get(index)?;
-                (sprite.transform == viewport).then(|| sprite.ink())
-            }
-            PrimitiveKind::Shaded => {
-                let quad = self.primitives.shaded.get(index)?;
-                (quad.transform == viewport).then(|| quad.ink())
-            }
-            // Neither is drawn as one instance of a batch, so neither is ever asked.
-            PrimitiveKind::External
-            | PrimitiveKind::Backdrop
-            | PrimitiveKind::Vector
-            | PrimitiveKind::GroupStart
-            | PrimitiveKind::GroupEnd => None,
         }
     }
 
@@ -106,6 +52,7 @@ impl Scene {
             PrimitiveKind::MonoSprite => self.primitives.mono_sprites[index].ink(),
             PrimitiveKind::SubpixelSprite => self.primitives.subpixel_sprites[index].ink(),
             PrimitiveKind::ColorSprite => self.primitives.color_sprites[index].ink(),
+            PrimitiveKind::Marks => self.primitives.marks[index].ink(),
             PrimitiveKind::External => self.primitives.externals[index].ink(),
             PrimitiveKind::Backdrop => self.primitives.backdrops[index].bounds,
             PrimitiveKind::GroupStart | PrimitiveKind::GroupEnd => {
@@ -130,12 +77,13 @@ impl Scene {
             PrimitiveKind::MonoSprite => self.primitives.mono_sprites.get(index)?.transform,
             PrimitiveKind::SubpixelSprite => self.primitives.subpixel_sprites.get(index)?.transform,
             PrimitiveKind::ColorSprite => self.primitives.color_sprites.get(index)?.transform,
+            PrimitiveKind::Marks => self.primitives.marks.get(index)?.transform,
             PrimitiveKind::External => self.primitives.externals.get(index)?.transform.index(),
             PrimitiveKind::Vector => return self.primitives.vectors.get(index)?.transform,
             PrimitiveKind::GroupStart | PrimitiveKind::GroupEnd => {
                 return self.primitives.groups.get(index)?.transform;
             }
-            PrimitiveKind::Backdrop => return None,
+            PrimitiveKind::Backdrop => return self.primitives.backdrops.get(index)?.transform,
         };
         self.spatial.at(slot)
     }
@@ -170,6 +118,7 @@ impl Scene {
                 .color_sprites
                 .get(index)
                 .map(|held| held.order),
+            PrimitiveKind::Marks => self.primitives.marks.get(index).map(|held| held.order),
             PrimitiveKind::External => self.primitives.externals.get(index).map(|held| held.order),
             PrimitiveKind::Backdrop => self.primitives.backdrops.get(index).map(|held| held.order),
             PrimitiveKind::GroupStart | PrimitiveKind::GroupEnd => {
@@ -219,6 +168,10 @@ impl Scene {
                     .color_sprites
                     .get(slot)
                     .map(|held| held.order)
+            }
+            PrimitiveKind::Marks => {
+                let slot = self.slot(kind, position)?;
+                self.primitives.marks.get(slot).map(|held| held.order)
             }
             PrimitiveKind::External => {
                 let slot = self.slot(kind, position)?;
@@ -273,6 +226,12 @@ impl Scene {
             PrimitiveKind::Shadow => {
                 let end = self.run_end(kind, start, limit, None);
                 (Batch::Shadows(start..end), end)
+            }
+            // Each mark binds its own payload range, which the renderer looks up by position, so
+            // a run of them is one batch however many payloads it names.
+            PrimitiveKind::Marks => {
+                let end = self.run_end(kind, start, limit, None);
+                (Batch::Marks(start..end), end)
             }
             PrimitiveKind::Decoration => {
                 let end = self.run_end(kind, start, limit, None);

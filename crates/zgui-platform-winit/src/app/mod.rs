@@ -31,9 +31,9 @@
 //!    the type the install hands back is what makes handing it over the only thing that can be
 //!    done with it.
 
-mod drag;
-mod events;
-mod window;
+pub mod drag;
+pub mod events;
+pub mod window;
 
 use std::collections::HashMap;
 
@@ -239,8 +239,22 @@ impl<A: AppHandler> ApplicationHandler<UserEvent> for WinitApp<A> {
         let reason = match event {
             UserEvent::Wake(reason) => Some(reason),
             UserEvent::A11y(event) => a11y_wake(&self.shared, event),
+            UserEvent::Redraw(window) => {
+                self.window_event(
+                    event_loop,
+                    window,
+                    winit::event::WindowEvent::RedrawRequested,
+                );
+                None
+            }
         };
         let Some(reason) = reason else { return };
+        // The desktop lays the title bar out once more as a change of full screen ends.
+        if let WakeReason::SurfaceStateChanged(id) = &reason
+            && let Some(surface) = self.shared.by_surface(*id)
+        {
+            surface.place_title_buttons();
+        }
         let cx = WinitCx::new(&self.shared, event_loop);
         self.handler.wake(&cx, reason);
     }
@@ -261,9 +275,16 @@ impl<A: AppHandler> ApplicationHandler<UserEvent> for WinitApp<A> {
         a11y::observe(Surface::id(surface.as_ref()), surface.window(), &event);
 
         let destroyed = matches!(event, winit::event::WindowEvent::Destroyed);
+        let relayout = relays_out_title_bar(&event);
         let timestamp = self.shared.clock().timestamp();
         let state = self.windows.entry(window_id).or_default();
-        let translated = events::translate(&surface, state, timestamp, event);
+        let translated = events::translate(
+            state,
+            surface.scale(),
+            || Surface::size(surface.as_ref()),
+            timestamp,
+            event,
+        );
 
         if let Some(translated) = translated {
             if let SurfaceEvent::ColorSchemeChanged(scheme) = translated {
@@ -272,6 +293,10 @@ impl<A: AppHandler> ApplicationHandler<UserEvent> for WinitApp<A> {
             let cx = WinitCx::new(&self.shared, event_loop);
             self.handler
                 .surface_event(&cx, Surface::id(surface.as_ref()), translated);
+        }
+
+        if relayout {
+            surface.place_title_buttons();
         }
 
         if destroyed {
@@ -350,6 +375,15 @@ impl<A: AppHandler> ApplicationHandler<UserEvent> for WinitApp<A> {
         let cx = WinitCx::new(&self.shared, event_loop);
         self.handler.shutting_down(&cx);
     }
+}
+
+/// Whether the desktop lays a window's title bar out again after `event`.
+const fn relays_out_title_bar(event: &winit::event::WindowEvent) -> bool {
+    use winit::event::WindowEvent as E;
+    matches!(
+        event,
+        E::Resized(_) | E::ScaleFactorChanged { .. } | E::Focused(_) | E::ThemeChanged(_)
+    )
 }
 
 /// A window event's name, short enough to sit in a trace line.

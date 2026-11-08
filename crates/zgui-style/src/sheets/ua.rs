@@ -47,7 +47,11 @@ box, field, control, editor  { display: block; }
    of its own — the implementation decides everything — so the sheet gives it only a layout. */
 custom                       { display: block; }
 row                          { display: flex; flex-direction: row; }
-column, stack                { display: flex; flex-direction: column; }
+column                       { display: flex; flex-direction: column; }
+/* Every child in the one cell, so the children overlap in source order. Bare text directly in a
+   stack becomes an anonymous grid item; it is auto-placed in a new row below the cell. */
+stack                        { display: grid; position: relative; }
+stack > *                    { grid-area: 1 / 1; }
 text, label                  { display: inline; }
 image, canvas, vector, surface { display: inline-block; }
 /* HTML's canvas default, because an unstyled canvas that is invisible reads as broken; an

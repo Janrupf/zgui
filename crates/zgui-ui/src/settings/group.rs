@@ -6,7 +6,7 @@ use zgui::{component, view};
 use crate::settings::context::SettingsGroupContext;
 use crate::settings::style;
 
-/// One run of related settings inside a [`SettingsPane`](crate::SettingsPane).
+/// One run of related settings inside a [`SettingsPane`](crate::settings::SettingsPane).
 ///
 /// ```
 /// # use zgui::prelude::*;
@@ -24,7 +24,7 @@ use crate::settings::style;
 /// # }
 /// ```
 ///
-/// A group with a [`SettingsGroupLabel`](crate::SettingsGroupLabel) is named by it, so a reader
+/// A group with a [`SettingsGroupLabel`](crate::settings::SettingsGroupLabel) is named by it, so a reader
 /// meets "Log streams, group" rather than a heading followed by an anonymous box.
 #[component]
 pub fn SettingsGroup(

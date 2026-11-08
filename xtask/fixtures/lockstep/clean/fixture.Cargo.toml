@@ -1,0 +1,9 @@
+# Fixture workspace for the lockstep check of `cargo xtask release`.
+[workspace]
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+
+[workspace.dependencies]
+cephal = { version = "0.1.0", default-features = false }

@@ -1,7 +1,8 @@
 //! The documents the pixels are measured on, and the runs that produce them.
 //!
-//! Three documents, because the questions divide into three: an icon alone on a flat panel, the
-//! same panel with no drawing on it at all, and an icon with an opaque box drawn after it.
+//! Four documents, because the questions divide into four: an icon alone on a flat panel, the same
+//! panel with no drawing on it at all, an icon with an opaque box drawn after it, and a turned icon
+//! that takes the general rasteriser.
 //!
 //! The panel covers the whole window on purpose. It makes "everything outside the drawing" one flat
 //! colour, which is what lets a scissored repaint be compared to a full one pixel for pixel instead
@@ -64,7 +65,8 @@ const SHEET: &str = ":root { background-color: rgb(240, 200, 40); color: rgb(0, 
      .frame { display: flex; flex-direction: column; align-items: flex-start;
               width: 128px; height: 128px; padding: 16px;
               background-color: rgb(240, 200, 40) }
-     .lid { width: 96px; height: 48px; margin-top: -48px; background-color: rgb(0, 0, 0) }";
+     .lid { width: 96px; height: 48px; margin-top: -48px; background-color: rgb(0, 0, 0) }
+     .turned { transform: rotate(30deg) }";
 
 /// A panel with one icon on it.
 #[component]
@@ -93,6 +95,16 @@ fn Layered() -> impl IntoView {
     }
 }
 
+/// The icon turned off the axes, which no coverage mask is made for.
+#[component]
+fn Turned() -> impl IntoView {
+    view! {
+        box(class = "frame") {
+            Icon(icon = INFO, size = IconSize::Xl, class = "turned")
+        }
+    }
+}
+
 /// Drives the application over buffers until it settles, and stops.
 fn buffers(handler: Box<dyn AppHandler>) -> Result<(), PlatformError> {
     let mut harness = zgui_platform_headless::Harness::new(handler);
@@ -101,7 +113,7 @@ fn buffers(handler: Box<dyn AppHandler>) -> Result<(), PlatformError> {
     Ok(())
 }
 
-/// Every frame of the three runs.
+/// Every frame of the four runs.
 pub struct Runs {
     /// The panel with an icon on it.
     pub marked: Vec<Recorded>,
@@ -109,6 +121,8 @@ pub struct Runs {
     pub bare: Vec<Recorded>,
     /// The icon with a box drawn after it.
     pub layered: Vec<Recorded>,
+    /// The turned icon.
+    pub turned: Vec<Recorded>,
 }
 
 impl Runs {
@@ -120,7 +134,7 @@ impl Runs {
     }
 }
 
-/// The three runs, performed once however many assertions read them.
+/// The four runs, performed once however many assertions read them.
 ///
 /// `None` when this machine has no graphics device, which every caller says out loud when it skips.
 pub fn runs() -> Option<&'static Runs> {
@@ -134,6 +148,7 @@ pub fn runs() -> Option<&'static Runs> {
             marked: run("marked", || view! { Marked() }),
             bare: run("bare", || view! { Bare() }),
             layered: run("layered", || view! { Layered() }),
+            turned: run("turned", || view! { Turned() }),
         })
     })
     .as_ref()

@@ -24,11 +24,12 @@ pub fn detach(store: &mut LayoutStore, key: BoxKey) -> u32 {
     }
     let removed = remove_subtree(store, key);
     mark_dirty(store, parent);
+    crate::boxtree::percent::refresh(store, parent);
     removed
 }
 
 /// Removes a box and its descendants, leaving every other list alone.
-fn remove_subtree(store: &mut LayoutStore, key: BoxKey) -> u32 {
+pub(super) fn remove_subtree(store: &mut LayoutStore, key: BoxKey) -> u32 {
     let mut removed = 0;
     let mut stack = vec![key];
     while let Some(current) = stack.pop() {
@@ -72,8 +73,29 @@ pub fn replace(store: &mut LayoutStore, old: BoxKey, new: BoxKey) -> bool {
         node.parent = Some(parent);
         node.parent_fc = parent_fc;
     }
+    // The new box takes the old one's place in tree order: as an out-of-flow box, and as the
+    // sibling an out-of-flow box was written after.
+    if let Some(declared) = store.declared(old) {
+        store.set_declared(new, Some(declared));
+    }
+    let count = store.node(parent).paint_children.len();
+    for index in 0..count {
+        let sibling = store.node(parent).paint_children[index];
+        if let Some(declared) = store.declared(sibling)
+            && declared.after == Some(old)
+        {
+            store.set_declared(
+                sibling,
+                Some(crate::boxtree::absolute::Declared {
+                    after: Some(new),
+                    ..declared
+                }),
+            );
+        }
+    }
     remove_subtree(store, old);
     mark_dirty(store, parent);
+    crate::boxtree::percent::refresh(store, parent);
     true
 }
 

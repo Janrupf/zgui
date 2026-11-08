@@ -515,6 +515,44 @@ fn typing_into_a_field_puts_the_letters_in_the_field_and_tells_whoever_asked() {
 }
 
 #[test]
+fn a_field_rebuilt_over_another_binding_shows_what_that_one_holds() {
+    // One field standing over something that changes under it — a search strip over a list of a
+    // chosen kind — is built again with a different signal each time, and keeps its element. The
+    // text it shows has to come from the signal it holds now. Typing first is what makes the
+    // question real: the element then holds text the rebuild carries no record of, so only the
+    // signal can empty it.
+    let harness = Harness::open();
+    let first = RwSignal::new_local(String::new());
+    let second = RwSignal::new_local(String::new());
+    let leading = RwSignal::new_local(true);
+    harness.mount(move || {
+        view! {
+            {move || {
+                let value = if leading.get() { first } else { second };
+                view! { Input(value = value, label = "Search") }
+            }}
+        }
+    });
+    let field = harness.find("zui-field");
+    harness.type_char(field, 'w');
+    harness.type_char(field, 'e');
+    assert_eq!(first.get_untracked(), "we");
+    assert_eq!(text_of(&harness, field), "we");
+
+    leading.set(false);
+    harness.window.frame();
+    assert_eq!(text_of(&harness, harness.find("zui-field")), "");
+
+    second.set("pod".to_owned());
+    harness.window.frame();
+    assert_eq!(
+        text_of(&harness, harness.find("zui-field")),
+        "pod",
+        "and the field follows the signal it was rebuilt over"
+    );
+}
+
+#[test]
 fn a_field_carries_its_placeholder_where_one_rule_can_draw_every_instance() {
     // Not an element: a field's element holds the text nodes the editing model writes and nothing
     // else, which is what makes `:empty` mean "there is no text here". A box holding the
@@ -571,6 +609,91 @@ fn a_field_leaves_tab_and_escape_for_whatever_is_around_it() {
         seen.borrow().is_empty(),
         "one of those keys changed the text"
     );
+}
+
+#[test]
+fn a_secure_field_shows_bullets_and_its_owner_holds_the_value() {
+    let harness = Harness::open();
+    let value = RwSignal::new_local(String::new());
+    let revealed = RwSignal::new_local(false);
+    harness.mount(move || {
+        view! {
+            Input(
+                value = value,
+                secure = Signal::derive_local(move || !revealed.get()),
+                label = "Password"
+            )
+        }
+    });
+    let field = harness.only_child();
+    assert_eq!(
+        harness.semantics(field).role,
+        zgui::vocab::Role::PasswordInput
+    );
+    assert_eq!(harness.attribute(field, "secure").as_deref(), Some(""));
+
+    harness.type_char(field, 'h');
+    harness.type_char(field, 'i');
+    assert_eq!(value.get_untracked(), "hi");
+    assert_eq!(text_of(&harness, field), "\u{2022}\u{2022}");
+
+    revealed.set(true);
+    harness.window.frame();
+    assert_eq!(text_of(&harness, field), "hi");
+    assert_eq!(harness.semantics(field).role, zgui::vocab::Role::TextInput);
+    assert_eq!(harness.attribute(field, "secure"), None);
+
+    revealed.set(false);
+    harness.window.frame();
+    assert_eq!(text_of(&harness, field), "\u{2022}\u{2022}");
+}
+
+#[test]
+fn a_secure_field_never_writes_its_starting_value_as_text() {
+    let harness = Harness::open();
+    harness.mount(move || {
+        view! {
+            Input(
+                default_value = "hunter2",
+                secure = Signal::stored_local(true),
+                label = "Password"
+            )
+        }
+    });
+    let field = harness.only_child();
+    assert_eq!(text_of(&harness, field), "\u{2022}".repeat(7));
+    // The value travels to the editing model as a value, and no text node ever holds it.
+    for op in harness.window.dom.transcript().ops() {
+        if let zgui_testkit_view::Op::SetText { text, .. } = &op {
+            assert!(
+                !text.contains("hunter"),
+                "a text node held the value: {text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_field_with_no_secure_prop_carries_no_secure_attribute() {
+    let harness = Harness::open();
+    harness.mount(|| view! { Input(default_value = "plain", label = "Name") });
+    let field = harness.only_child();
+    assert_eq!(harness.attribute(field, "secure"), None);
+    assert_eq!(text_of(&harness, field), "plain");
+    assert_eq!(harness.semantics(field).role, zgui::vocab::Role::TextInput);
+}
+
+#[test]
+fn a_secure_group_field_shows_bullets() {
+    let harness = Harness::open();
+    let value = RwSignal::new_local(String::new());
+    harness.mount(move || {
+        view! { InputGroup { InputGroupInput(value = value, secure = true) } }
+    });
+    let field = harness.find("zui-field");
+    harness.type_char(field, 'x');
+    assert_eq!(value.get_untracked(), "x");
+    assert_eq!(text_of(&harness, field), "\u{2022}");
 }
 
 #[test]

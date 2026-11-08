@@ -8,6 +8,8 @@
     reason = "one support module serves several test binaries, and none of them uses all of it"
 )]
 
+pub(crate) mod conformance;
+
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use zgui_bits::DamageSet;
@@ -161,13 +163,13 @@ impl zgui_render::VectorRaster for Counting {
         plan
     }
 
-    fn clear_targets(&mut self, plan: &zgui_render::VectorPlan) {
+    fn clear_targets(&mut self, plan: &zgui_render::VectorPlan, round: usize) {
         self.work
             .lock()
             .unwrap_or_else(|held| held.into_inner())
             .clears += 1;
         let started = std::time::Instant::now();
-        self.inner.clear_targets(plan);
+        self.inner.clear_targets(plan, round);
         let elapsed = started.elapsed().as_nanos();
         self.work
             .lock()

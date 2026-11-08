@@ -3,6 +3,13 @@ name = "zgui-platform-winit"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "winit platform backend for zgui on Windows, macOS and Linux"
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+include.workspace = true
 
 # L2 — backends. Every dependency is inherited: `foo.workspace = true`.
 #
@@ -66,6 +73,14 @@ harness = false
 # compile at all: it reaches for `std::os::unix` on Windows and for a pipe flag Apple does not have.
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 smithay-clipboard.workspace = true
+
+# The application menu, the reopen request and the title-bar buttons, which only AppKit has.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2.workspace = true
+muda.workspace = true
+objc2.workspace = true
+objc2-app-kit.workspace = true
+objc2-foundation.workspace = true
 
 [lints]
 workspace = true

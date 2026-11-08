@@ -11,7 +11,7 @@ use zgui_ui_primitives::use_roving_item_when;
 use crate::settings::context::SettingsContext;
 use crate::settings::style;
 
-/// One entry of a [`SettingsPages`](crate::SettingsPages).
+/// One entry of a [`SettingsPages`](crate::settings::SettingsPages).
 ///
 /// ```
 /// # use zgui::prelude::*;

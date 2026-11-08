@@ -34,6 +34,8 @@ pub struct Gallery {
     swatches: Vec<Point<CssPx, Css>>,
     /// The frame count when the last measurement began.
     baseline: u64,
+    /// How many glyphs the first paint of the document placed.
+    document_glyphs: u64,
     /// Held for the life of the fixture: the counters are one block for the whole process.
     _turn: MutexGuard<'static, ()>,
 }
@@ -50,6 +52,7 @@ impl Gallery {
     /// every case measuring an interaction with nothing.
     pub fn open() -> Self {
         let turn = exclusive();
+        zgui_profile::counter::reset();
         let fonts = Fonts::system();
         let metrics = fonts.clone();
         let shaping = fonts.clone();
@@ -71,6 +74,7 @@ impl Gallery {
         let mut harness = Harness::new(runtime);
         harness.deliver_to_first(SurfaceEvent::Resized(surface()));
         harness.settle(64);
+        let document_glyphs = zgui_profile::counter::get(zgui_profile::Counter::GlyphsPlaced);
         let swatches = swatch_centres(&harness.app().windows()[0]);
         assert_eq!(
             swatches.len(),
@@ -81,8 +85,14 @@ impl Gallery {
             harness,
             swatches,
             baseline: 0,
+            document_glyphs,
             _turn: turn,
         }
+    }
+
+    /// How many glyphs the first paint of the document placed: every glyph on the page, once.
+    pub fn document_glyphs(&self) -> u64 {
+        self.document_glyphs
     }
 
     /// Runs the loop until nothing is owed, and takes that as the baseline for what follows.

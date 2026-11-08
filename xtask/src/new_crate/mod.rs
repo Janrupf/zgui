@@ -33,11 +33,8 @@ pub(crate) fn run(root: &Path, name: &str, layer: Layer) -> Result<()> {
     println!("created crates/{name} ({layer})");
     println!("  crates/{name}/Cargo.toml");
     println!("  crates/{name}/src/lib.rs");
-    println!(
-        "the workspace globs crates/*, so nothing else needs editing; \
-         add `{name}` to the phase that introduces it in docs/planning/PHASES.md or \
-         `cargo xtask ledger topo` will say so"
-    );
+    println!("the workspace globs crates/*; add a description, a README.md and the LICENSE and");
+    println!("NOTICE links (`ln -s ../../LICENSE ../../NOTICE crates/{name}/`) before publishing");
     Ok(())
 }
 
@@ -78,5 +75,6 @@ mod tests {
         assert!(root.contains("#![forbid(unsafe_code)]"));
         let manifest = template::manifest("zgui-paint", Layer::L4);
         assert!(manifest.contains("[lints]\nworkspace = true"));
+        assert!(manifest.contains("include.workspace = true"));
     }
 }

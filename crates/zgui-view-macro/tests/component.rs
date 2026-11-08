@@ -46,6 +46,64 @@ fn a_default_and_an_optional_prop_are_taken_when_they_are_written() {
     assert_eq!(harness.text(), "aaa!");
 }
 
+/// A component with an optional prop that converts, saying what it was given.
+#[component]
+fn Guarded(
+    /// Whether it is guarded.
+    #[prop(into, optional)]
+    guarded: Option<Signal<bool, zgui_reactive::LocalStorage>>,
+) -> impl IntoView {
+    let said = match guarded {
+        Some(guarded) if guarded.get_untracked() => "on",
+        Some(_) => "off",
+        None => "none",
+    };
+    view! { {said} }
+}
+
+/// A component that passes its own optional prop on.
+#[component]
+fn Wrapper(
+    /// Passed on as it is.
+    #[prop(optional)]
+    guarded: Option<Signal<bool, zgui_reactive::LocalStorage>>,
+) -> impl IntoView {
+    view! { Guarded(guarded = guarded) }
+}
+
+#[test]
+fn an_optional_prop_that_converts_takes_a_value_a_signal_or_an_option() {
+    let said = |view: &dyn Fn() -> AnyView| {
+        let harness = Harness::new();
+        let _state = harness.mount(harness.window.with(view));
+        harness.text()
+    };
+    let signal = || Signal::stored_local(true);
+    let absent = || None::<Signal<bool, zgui_reactive::LocalStorage>>;
+    assert_eq!(
+        said(&|| AnyView::new(view! { Guarded(guarded = true) })),
+        "on"
+    );
+    assert_eq!(
+        said(&|| AnyView::new(view! { Guarded(guarded = signal()) })),
+        "on"
+    );
+    assert_eq!(
+        said(&|| AnyView::new(view! { Guarded(guarded = Some(false)) })),
+        "off"
+    );
+    assert_eq!(
+        said(&|| AnyView::new(view! { Guarded(guarded = absent()) })),
+        "none"
+    );
+    assert_eq!(said(&|| AnyView::new(view! { Guarded() })), "none");
+    assert_eq!(
+        said(&|| AnyView::new(view! { Wrapper(guarded = signal()) })),
+        "on"
+    );
+    assert_eq!(said(&|| AnyView::new(view! { Wrapper() })), "none");
+}
+
 #[test]
 fn a_component_identifies_itself_by_module_path_and_name() {
     assert!(

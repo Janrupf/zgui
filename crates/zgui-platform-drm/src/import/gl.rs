@@ -1,7 +1,7 @@
 //! The same buffers, on a machine that has no Vulkan.
 //!
 //! [`Imported`](super::Imported) creates its images through Vulkan and exports them. Neither half
-//! of that exists on an OpenGL adapter, so this goes the other way round: [`gbm`](super::gbm)
+//! of that exists on an OpenGL adapter, so this goes the other way round: [`gbm`]
 //! allocates a buffer the display already owns, and EGL imports the descriptor as the texture a
 //! frame is composed into. Nothing is read back and nothing is copied by the processor, which is
 //! the whole point of both paths.
@@ -30,7 +30,7 @@
 //! picture. **The refinement is to negotiate** — `eglQueryDmaBufModifiersEXT` says which layouts
 //! the renderer will import, the plane's `IN_FORMATS` says which the display can scan out, and the
 //! intersection goes to `gbm_bo_create_with_modifiers`. That is what
-//! [`modifier`](super::modifier) does for the Vulkan path, and it is the shape this one wants.
+//! `modifier` does for the Vulkan path, and it is the shape this one wants.
 //!
 //! # Nothing here is guaranteed by a capability
 //!

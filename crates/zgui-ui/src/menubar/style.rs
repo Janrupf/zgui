@@ -60,7 +60,8 @@ style! { pub MenubarStyle =>
     }"
 
     // The menu that drops out of a title. Wider than one opened from a button, because what hangs
-    // off a menubar is a whole heading's worth of commands rather than a row's.
+    // off a menubar is a whole heading's worth of commands rather than a row's. It is never taller
+    // than the room left in the window, and scrolls past that.
     ".zui-menubar__content {
         display: flex;
         flex-direction: column;
@@ -71,7 +72,9 @@ style! { pub MenubarStyle =>
         background-color: var(--zui-color-popover);
         color: var(--zui-color-popover-foreground);
         box-shadow: var(--zui-shadow-md);
-        overflow: hidden;
+        max-height: var(--zui-popper-available-height, none);
+        overflow-x: hidden;
+        overflow-y: auto;
     }"
     // It always drops out of the bar, so it always comes in from above: eight pixels up, at
     // nineteen twentieths and transparent, settling over the same seventh of a second every other
@@ -117,7 +120,18 @@ style! { pub MenubarStyle =>
         color: var(--zui-color-accent-foreground);
     }"
     ".zui-menubar__item:disabled { opacity: 0.5; pointer-events: none; }"
-    ".zui-menubar__item-label { flex: 1 1 auto; }"
+    ".zui-menubar__item-label {
+        display: flex;
+        flex: 1 1 auto;
+        flex-direction: row;
+        align-items: center;
+        gap: var(--zui-space-sm);
+        min-width: 0;
+    }"
+    // Icons are muted at rest and take the row's colour under the highlight, as in a menu.
+    ".zui-menubar__item-label .zui-icon { color: var(--zui-color-muted-foreground); }"
+    ".zui-menubar__item:hover .zui-menubar__item-label .zui-icon,
+     .zui-menubar__item:focus .zui-menubar__item-label .zui-icon { color: inherit; }"
     // A tick or a bullet is placed in the gutter the row's own left padding opens for it, so every
     // label on the menu starts in the same column whether its row carries a mark or not.
     ".zui-menubar__item--check {

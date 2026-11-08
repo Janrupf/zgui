@@ -1,0 +1,5 @@
+[package]
+name = "zgui-platform-drm"
+version.workspace = true
+edition = "2024"
+publish = false

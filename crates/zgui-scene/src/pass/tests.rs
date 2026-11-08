@@ -5,8 +5,10 @@ use zgui_geom::{Point, Rect, Size};
 
 use crate::clip::ClipLink;
 use crate::id::ClipId;
+use crate::pass::ScenePassPlan;
 use crate::pass::fixture::{
-    across_a_group, avatars, badged_cards, dashboard, falling_order, rect, stacked_area, viewport,
+    across_a_group, avatars, badged_cards, dashboard, falling_order, label_field, rect,
+    stacked_area, viewport,
 };
 use crate::pass::overlap::Overlap;
 use crate::pass::warning::PassWarning;
@@ -427,4 +429,205 @@ fn a_pass_that_would_trap_a_primitive_under_its_composite_is_split_into_one_pass
             "every composite still sits above every item of its own pass"
         );
     }
+}
+
+/// A pass that grows past thousands of intervening primitives plans in time linear in each of them.
+///
+/// The bound is generous for an unoptimised build and far below what testing every intervening
+/// primitive again for every admitted item costs.
+#[test]
+fn a_long_pass_past_many_backgrounds_plans_quickly() {
+    let mut scene = label_field(8000);
+    let started = std::time::Instant::now();
+    let planned = passes(&mut scene, &DamageSet::full(), Overlap::PerItemInk);
+    let elapsed = started.elapsed();
+    assert_eq!(planned, 1);
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "planning took {elapsed:?}"
+    );
+}
+
+/// A mark is an occluder like a quad: drawn after a vector item and over its ink, it ends the
+/// item's pass.
+#[test]
+fn marks_split_a_vector_pass_like_any_primitive() {
+    use std::sync::Arc;
+
+    let mut scene = Scene::new();
+    scene.begin_frame(viewport());
+    let path = |x: f64| {
+        Arc::new(kurbo::Shape::to_path(
+            &kurbo::Rect::new(x, 0.0, x + 40.0, 40.0),
+            0.1,
+        ))
+    };
+    let fill = crate::PaintRef::solid(
+        scene
+            .paints
+            .solid(zgui_color::Color::srgb(0.5, 0.5, 0.5, 1.0)),
+    );
+    scene.push_vector(crate::VectorItem::filled(
+        crate::VectorId(1),
+        path(0.0),
+        fill,
+    ));
+    let payload = crate::MarkPayload {
+        discs: vec![[20.0, 20.0, 10.0, 0.0]],
+        ..crate::MarkPayload::default()
+    };
+    let mark = crate::MarkItem::new(rect(10.0, 10.0, 20.0, 20.0), fill, payload.counts());
+    scene.push_marks(mark, Arc::new(payload));
+    scene.push_vector(crate::VectorItem::filled(
+        crate::VectorId(2),
+        path(10.0),
+        fill,
+    ));
+    assert_eq!(
+        passes(&mut scene, &DamageSet::full(), Overlap::default()),
+        2
+    );
+}
+
+/// A damage set of one rectangle.
+fn damaged(x: i32, y: i32, width: i32, height: i32) -> DamageSet {
+    let mut damage = DamageSet::new();
+    damage.absorb(Rect::new(Point::new(x, y), Size::new(width, height)));
+    damage
+}
+
+/// A scene of one wide drawing, and of a second one in the same pass when `two`.
+fn wide(two: bool) -> Scene {
+    let mut scene = Scene::new();
+    scene.begin_frame(viewport());
+    crate::pass::fixture::vector(&mut scene, 0, rect(0.0, 0.0, 800.0, 400.0), ClipId::ROOT);
+    if two {
+        crate::pass::fixture::vector(&mut scene, 1, rect(150.0, 60.0, 300.0, 10.0), ClipId::ROOT);
+    }
+    scene
+}
+
+#[test]
+fn a_pass_region_is_cut_to_the_damage() {
+    let mut scene = wide(false);
+    scene.finish(&damaged(100, 50, 100, 30));
+    let plan = scene.pass_plan();
+    assert_eq!(plan.len(), 1);
+    let pass = &plan.passes[0];
+    assert_eq!(
+        pass.region,
+        Rect::new(Point::new(96, 48), Size::new(112, 32)),
+        "the region is the damage on the tile grid, not the drawing's 800 by 400"
+    );
+    assert!(pass.clamped);
+}
+
+#[test]
+fn a_cut_pass_cuts_its_item_inks() {
+    let mut scene = wide(true);
+    scene.finish(&damaged(100, 50, 100, 30));
+    let plan = scene.pass_plan();
+    assert_eq!(plan.len(), 1);
+    let pass = &plan.passes[0];
+    let inks: Vec<_> = plan.items_of(pass).iter().map(|item| item.ink).collect();
+    assert_eq!(
+        inks,
+        vec![
+            Rect::new(Point::new(0, 0), Size::new(112, 32)),
+            Rect::new(Point::new(54, 12), Size::new(58, 10)),
+        ],
+        "each ink is the part of the item inside the region, relative to it"
+    );
+}
+
+#[test]
+fn a_pass_inside_a_group_keeps_its_whole_region() {
+    let mut scene = across_a_group();
+    scene.finish(&damaged(220, 40, 8, 8));
+    let plan = scene.pass_plan();
+    assert_eq!(plan.len(), 1, "only the drawing in the group is damaged");
+    let pass = &plan.passes[0];
+    assert_eq!(
+        pass.region,
+        Rect::new(Point::new(208, 32), Size::new(48, 32)),
+        "a group target is drawn whole, so its pass is not cut"
+    );
+    assert!(!pass.clamped);
+}
+
+#[test]
+fn a_scene_with_a_backdrop_keeps_whole_regions() {
+    let mut scene = wide(false);
+    scene.push_backdrop(crate::group::BackdropFilter::new(
+        rect(1200.0, 600.0, 100.0, 100.0),
+        smallvec::smallvec![crate::group::Filter::Blur(4.0)],
+    ));
+    scene.finish(&damaged(100, 50, 100, 30));
+    let pass = &scene.pass_plan().passes[0];
+    assert_eq!(
+        pass.region,
+        Rect::new(Point::new(0, 0), Size::new(800, 400))
+    );
+    assert!(!pass.clamped);
+}
+
+#[test]
+fn a_pass_past_the_edge_of_the_surface_overhangs_and_is_not_cut() {
+    let edge = viewport().width as f32;
+    let mut scene = Scene::new();
+    scene.begin_frame(viewport());
+    crate::pass::fixture::vector(
+        &mut scene,
+        0,
+        rect(edge - 40.0, 8.0, 80.0, 16.0),
+        ClipId::ROOT,
+    );
+    crate::pass::fixture::vector(&mut scene, 1, rect(16.0, 64.0, 32.0, 16.0), ClipId::ROOT);
+    scene.finish(&DamageSet::full());
+    let plan = scene.pass_plan();
+    assert_eq!(plan.len(), 1);
+    let pass = &plan.passes[0];
+    assert!(pass.overhangs, "the first item goes past the right edge");
+    assert!(!pass.clamped);
+    assert!(
+        !plan.is_cut(),
+        "the edge of the surface does not cut a pass"
+    );
+
+    let mut scene = Scene::new();
+    scene.begin_frame(viewport());
+    crate::pass::fixture::vector(&mut scene, 0, rect(16.0, 64.0, 32.0, 16.0), ClipId::ROOT);
+    scene.finish(&DamageSet::full());
+    assert!(!scene.pass_plan().passes[0].overhangs);
+}
+
+#[test]
+fn full_damage_cuts_nothing() {
+    let mut scene = wide(true);
+    scene.finish(&DamageSet::full());
+    let plan = scene.pass_plan();
+    let pass = &plan.passes[0];
+    assert_eq!(
+        pass.region,
+        Rect::new(Point::new(0, 0), Size::new(800, 400))
+    );
+    assert!(!pass.clamped);
+    assert_eq!(
+        plan.items_of(pass)[1].ink,
+        Rect::new(Point::new(150, 60), Size::new(300, 10))
+    );
+}
+
+#[test]
+fn an_uncut_plan_is_the_plan_full_damage_makes() {
+    let mut cut = wide(true);
+    cut.finish(&damaged(100, 50, 100, 30));
+    assert!(cut.pass_plan().is_cut());
+    let mut uncut = ScenePassPlan::default();
+    cut.plan_uncut_passes(&mut uncut);
+
+    let mut whole = wide(true);
+    whole.finish(&DamageSet::full());
+    assert!(!uncut.is_cut());
+    assert_eq!(&uncut, whole.pass_plan());
 }

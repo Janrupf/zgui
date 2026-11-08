@@ -37,8 +37,8 @@ pub struct Encoded {
 ///
 /// The scene is not reset, because a scratch layer holds every pass assigned to it and those passes
 /// are rasterised together — one scene, one rasterisation, whatever the layer's share of the frame
-/// turned out to be. Device coordinates are what makes that sound: two passes on one layer do not
-/// overlap on the surface, so they do not overlap in the scene either.
+/// turned out to be. Bins are what makes that sound: two passes on one layer have bins that do not
+/// meet, whatever they cover on the surface.
 pub fn pass(
     scene: &mut Scene,
     cache: &mut Encodings,
@@ -50,6 +50,22 @@ pub fn pass(
         f64::from(pass.raster_region.origin.x - pass.region.origin.x),
         f64::from(pass.raster_region.origin.y - pass.region.origin.y),
     ));
+    // A cut pass, or one at the edge of the surface, holds items that reach past its region, and
+    // the layer goes on past the region into the pass packed beside it. One clip keeps every item
+    // of the pass inside its own region.
+    if pass.clamped {
+        let region = pass.raster_region;
+        scene.push_clip_layer(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            &kurbo::Rect::new(
+                f64::from(region.left()),
+                f64::from(region.top()),
+                f64::from(region.right()),
+                f64::from(region.bottom()),
+            ),
+        );
+    }
 
     for planned in frame.plan.items_of(pass) {
         let Some(item) = frame.items.get(planned.item) else {
@@ -83,9 +99,9 @@ pub fn pass(
             scene.push_clip_layer(Fill::NonZero, shift * *placement, shape);
             encoded.clip_layers += 1;
         }
-        // The item's own shape clips are in the item's own space, so they go *inside* the item's
-        // transform: a clipped drawing that is rotated has its clip rotated with it.
-        let placement = shift * transform;
+        // The item's own shape clips are in the item's path space, so they go *inside* the item's
+        // placement and transform: a clipped drawing that is rotated has its clip rotated with it.
+        let placement = shift * transform * item.placement;
         for clip in &item.clips {
             scene.push_clip_layer(clip.rule, placement, clip.path.as_ref());
             encoded.clip_layers += 1;
@@ -100,6 +116,9 @@ pub fn pass(
         for _ in &shapes {
             scene.pop_layer();
         }
+    }
+    if pass.clamped {
+        scene.pop_layer();
     }
     encoded
 }
@@ -138,16 +157,16 @@ fn encode_item(
     if fill.is_none() && stroke.is_none() {
         return false;
     }
-    // Encoded once at the item's own coordinates and re-placed every frame with a copy, rather than
-    // re-flattened: curves are flattened on the device, so what is cached here is the encoding and
-    // not a polyline.
+    // Encoded once in path space and re-placed every frame with a copy, rather than re-flattened:
+    // curves are flattened on the device, so what is cached here is the encoding and not a
+    // polyline.
     let encoding = cache.get(item, paints, |into| {
         if let Some(painted) = &fill {
             into.fill(
                 item.fill_rule,
                 Affine::IDENTITY,
                 &painted.brush,
-                painted.transform,
+                brush_transform(item.brush, painted.transform),
                 item.path.as_ref(),
             );
         }
@@ -156,13 +175,19 @@ fn encode_item(
                 style,
                 Affine::IDENTITY,
                 &painted.brush,
-                painted.transform,
+                brush_transform(item.brush, painted.transform),
                 item.path.as_ref(),
             );
         }
     });
     scene.append(encoding, Some(placement));
     true
+}
+
+/// What maps a brush into path space: the item's brush after the paint's own transform.
+fn brush_transform(brush: Affine, paint: Option<Affine>) -> Option<Affine> {
+    let paint = paint.unwrap_or(Affine::IDENTITY);
+    (brush != Affine::IDENTITY || paint != Affine::IDENTITY).then_some(brush * paint)
 }
 
 /// The item's own transform, or the identity when it is not one this can apply.

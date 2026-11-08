@@ -8,7 +8,7 @@ use zgui_ui_primitives::{Align, Placement, Side};
 
 use crate::combobox::SHEET;
 use crate::combobox::style::ComboboxStyle;
-use crate::listbox::Listbox;
+use crate::listbox::{Listbox, ListboxCatalogueOfProps};
 use crate::overlay::{AnchoredSurfaceProps, OverlayState};
 
 /// The options of a [`Combobox`](crate::Combobox), under its field.
@@ -45,13 +45,17 @@ pub fn ComboboxContent(
     children: ChildrenFn,
 ) -> impl IntoView {
     install_stylesheet(SHEET, ComboboxStyle::CSS);
-    let state = Listbox::current().map_or_else(
+    let listbox = Listbox::current();
+    let state = listbox.map_or_else(
         || OverlayState::uncontrolled(false, None),
         |listbox| listbox.surface(),
     );
     let own = Attrs::new().class_toggle(ClassName::new("zui-combobox__list"), true);
+    // Held rather than moved: the options are built in two places — the open list, and the hidden
+    // catalogue that teaches the closed field what its value reads as.
+    let children = StoredValue::new_local(children);
 
-    view! {
+    let list = view! {
         AnchoredSurface(
             state = state,
             placement = placement,
@@ -64,8 +68,29 @@ pub fn ComboboxContent(
             {..attrs},
             class = class
         ) {
-            {children.view()}
+            {children.get_value().view()}
+            ComboboxQueryEnd()
         }
+    };
+    // Built exactly while the list is not, so a value chosen before the list ever opened still
+    // reads as its option's text. See [`SelectContent`](crate::SelectContent) for why.
+    let described = view! {
+        if move || listbox.is_some() && !state.is_open() {
+            ListboxCatalogueOf {{children.get_value().view()}}
+        } else {}
+    };
+
+    (list.into_view(), described.into_view())
+}
+
+/// Ends the query when the list it narrows has gone, so the next opening shows every option.
+///
+/// Built with the list's content, so its cleanup runs after the exit animation, when nobody can
+/// see the options come back.
+#[component]
+fn ComboboxQueryEnd() -> impl IntoView {
+    if let Some(listbox) = Listbox::current() {
+        on_cleanup_local(move || listbox.reset_query());
     }
 }
 

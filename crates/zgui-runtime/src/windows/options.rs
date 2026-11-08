@@ -2,7 +2,8 @@
 
 use zgui_geom::{CssPx, Point, Size};
 use zgui_platform::{
-    ColorScheme, Decorations, FullscreenMode, SurfaceAttributes, WindowIcon, WindowLevel,
+    ColorScheme, Decorations, FullscreenMode, SurfaceAttributes, TitleButtons, WindowIcon,
+    WindowLevel,
 };
 use zgui_vocab::SharedString;
 
@@ -75,6 +76,14 @@ impl WindowOptions {
         self
     }
 
+    /// Where the desktop's window buttons sit over a window with [`Decorations::NoTitleBar`].
+    ///
+    /// Only macOS draws its buttons over the content. Elsewhere this does nothing.
+    pub fn with_title_buttons(mut self, buttons: TitleButtons) -> Self {
+        self.attributes.title_buttons = Some(buttons);
+        self
+    }
+
     /// Whether the window may be partly transparent.
     ///
     /// What a window with rounded corners of its own needs, so the desktop shows through them.
@@ -121,9 +130,11 @@ impl WindowOptions {
         self
     }
 
-    /// This window's own stylesheet, cascaded after the application's.
+    /// Adds a stylesheet of this window's own, cascaded after the application's.
+    ///
+    /// Each call adds one sheet. The sheets cascade in call order.
     pub fn with_stylesheet(mut self, css: impl Into<String>) -> Self {
-        self.runtime.window_stylesheet = Some(css.into());
+        self.runtime.window_stylesheets.push(css.into());
         self
     }
 

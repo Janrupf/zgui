@@ -35,6 +35,7 @@ use zgui_dom::Document;
 use zgui_geom::{Device, Edges, Rect, Size};
 use zgui_layout::fragment::diff::pixels;
 use zgui_layout::{BoxKey, FragKey, LayoutStore};
+use zgui_scene::Placements;
 
 use crate::damage::ink::{Reads, read_extent_of};
 
@@ -116,21 +117,23 @@ pub const FULL_DAMAGE_SHARE: f64 = 0.5;
 
 /// Grows `damage` to cover everything read by a composite whose read region it already touches.
 ///
-/// Runs to a fixpoint, because a grown rectangle can reach a second group's source region; the
-/// number of passes is bounded by the number of registered fragments, since each pass can absorb at
-/// most one source no earlier pass reached. On exhaustion the whole surface is damaged, which is
-/// correct and, at that point, cheaper than continuing.
+/// Runs to a fixpoint, because a grown rectangle can reach a second group's source region. Each
+/// pass that grows absorbs at least one source no earlier pass reached, so the registered fragments
+/// bound the passes that grow, and one more pass finds the fixpoint. On exhaustion the whole surface
+/// is damaged, which is correct and, at that point, cheaper than continuing.
 ///
 /// After this the damage set is frozen: the emit walk consults it and never adds to it.
 ///
 /// `scale` is the frame's own device scale, and it is the same one the emit walk is given: the two
 /// readers of a read extent have to convert the filter chain identically or the region the
 /// expansion adds and the region the cull tests are different rectangles.
+/// `placements` puts each read extent on the device, where the damage is measured.
 pub fn expand(
     store: &LayoutStore,
     damage: &mut DamageSet,
     surface: Size<i32, Device>,
     scale: f32,
+    placements: &Placements,
     memory: &mut BackdropMemory,
 ) -> Expansion {
     let registry = store.read_extents();
@@ -148,7 +151,15 @@ pub fn expand(
     let sole = sole_backdrop(store, registry, scale);
     let keeping = memory.admit(surface, sole.map(|(box_, _, source)| (box_, source)));
 
-    if !settle(store, registry, damage, scale, keeping, &mut report) {
+    if !settle(
+        store,
+        registry,
+        damage,
+        scale,
+        placements,
+        keeping,
+        &mut report,
+    ) {
         return give_up(damage, registry.len(), report);
     }
     let Some((box_, bounds, source)) = keeping.and(sole) else {
@@ -183,7 +194,15 @@ pub fn expand(
     // chasing the two around costs more than it saves — so the copy is renewed instead, which is
     // what every frame did before there was one to keep.
     let settled = report.absorbed;
-    if !settle(store, registry, damage, scale, keeping, &mut report) {
+    if !settle(
+        store,
+        registry,
+        damage,
+        scale,
+        placements,
+        keeping,
+        &mut report,
+    ) {
         return give_up(damage, registry.len(), report);
     }
     match report.absorbed > settled {
@@ -192,7 +211,15 @@ pub fn expand(
             if !contains(damage, source) {
                 damage.absorb(source);
             }
-            let _ = settle(store, registry, damage, scale, None, &mut report);
+            let _ = settle(
+                store,
+                registry,
+                damage,
+                scale,
+                placements,
+                None,
+                &mut report,
+            );
         }
         false => report.keeping = Some(box_),
     }
@@ -208,10 +235,12 @@ fn settle(
     registry: &[FragKey],
     damage: &mut DamageSet,
     scale: f32,
+    placements: &Placements,
     keeping: Option<BoxKey>,
     report: &mut Expansion,
 ) -> bool {
-    for pass in 1..=registry.len() {
+    // The passes that can grow, and the pass that finds nothing left to absorb.
+    for pass in 1..=registry.len() + 1 {
         report.passes = report.passes.max(pass);
         let mut grew = false;
         for frag in registry {
@@ -222,11 +251,15 @@ fn settle(
             let Some(extent) = read_extent_of(store, *frag, scale) else {
                 continue;
             };
-            let source = pixels(extent.source);
+            let Some(fragment) = store.fragment(*frag) else {
+                continue;
+            };
+            let source = pixels(fragment.on_device(extent.source, placements));
             if !damage.intersects(source) || contains(damage, source) {
                 continue;
             }
-            damage.absorb(source);
+            // Whole, because the test above asks whether one rectangle covers the source.
+            damage.absorb_whole(source);
             report.absorbed += 1;
             grew = true;
         }
@@ -259,12 +292,12 @@ fn give_up(damage: &mut DamageSet, registered: usize, mut report: Expansion) -> 
 /// panel, and then no panel ever keeps anything. Their rectangles need not agree either, so the
 /// answer is the union: a rule that has to cover whichever fragment the emitter picks covers all
 /// of them.
-fn sole_backdrop(
-    store: &LayoutStore,
-    registry: &[FragKey],
-    scale: f32,
-) -> Option<(BoxKey, Rect<i32, Device>, Rect<i32, Device>)> {
-    let mut found: Option<(BoxKey, Rect<i32, Device>, Rect<i32, Device>)> = None;
+/// The one backdrop a frame may keep a copy for: the box it belongs to, what it writes, and what
+/// it reads.
+type SoleBackdrop = (BoxKey, Rect<i32, Device>, Rect<i32, Device>);
+
+fn sole_backdrop(store: &LayoutStore, registry: &[FragKey], scale: f32) -> Option<SoleBackdrop> {
+    let mut found: Option<SoleBackdrop> = None;
     for frag in registry {
         let Some(extent) = read_extent_of(store, *frag, scale) else {
             continue;
@@ -338,12 +371,19 @@ fn contains(damage: &DamageSet, rect: zgui_geom::Rect<i32, Device>) -> bool {
 ///
 /// It takes the roots rather than borrowing them, which is what makes it the consumer: a second
 /// reader would find the list already emptied and absorb nothing, silently.
-pub fn vacated(document: &mut Document, store: &LayoutStore, damage: &mut DamageSet) -> usize {
+///
+/// `placements` puts the removed pieces' ink on the device, where the damage is measured.
+pub fn vacated(
+    document: &mut Document,
+    store: &LayoutStore,
+    damage: &mut DamageSet,
+    placements: &Placements,
+) -> usize {
     let removed = document.take_removed();
     let mut absorbed = 0;
     for index in removed {
         let node = document.store().key_of(index);
-        let ink = zgui_layout::fragment::index::ink_of(store, node);
+        let ink = zgui_layout::fragment::index::device_ink_of(store, node, placements);
         if ink.is_empty() {
             continue;
         }

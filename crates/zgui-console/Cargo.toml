@@ -1,0 +1,42 @@
+[package]
+name = "zgui-console"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Runs a zgui application on a bare Linux console, through the kernel's display interface"
+repository.workspace = true
+homepage.workspace = true
+# Experimental: the console stack under it stays in this repository and is not published.
+publish = false
+
+# L8 — product. Every dependency is inherited: `foo.workspace = true`.
+#
+# The console entry point, kept out of the umbrella crate so that `zgui` does not depend on the
+# console stack. An application that runs on a console names this crate beside `zgui`.
+[target.'cfg(target_os = "linux")'.dependencies]
+zgui = { path = "../zgui", version = "0.1.0" }
+zgui-atlas = { path = "../zgui-atlas", version = "0.1.0" }
+zgui-bits = { path = "../zgui-bits", version = "0.1.0" }
+# The rectangles a drawn frame reports, which the display turns into the damage it flips.
+zgui-geom = { path = "../zgui-geom", version = "0.1.0" }
+zgui-platform = { path = "../zgui-platform", version = "0.1.0" }
+zgui-platform-drm = { path = "../zgui-platform-drm", version = "0.1.0" }
+zgui-render = { path = "../zgui-render", version = "0.1.0" }
+zgui-render-vector-vello = { path = "../zgui-render-vector-vello", version = "0.1.0" }
+zgui-render-wgpu = { path = "../zgui-render-wgpu", version = "0.1.0" }
+# The latency trace. A console has no standard error a person can read — it is the screen the frame
+# loop overwrites — so the stages are written to the file `ZGUI_LATENCY` names.
+zgui-profile = { path = "../zgui-profile", version = "0.1.0" }
+zgui-runtime = { path = "../zgui-runtime", version = "0.1.0" }
+zgui-scene = { path = "../zgui-scene", version = "0.1.0" }
+zgui-view = { path = "../zgui-view", version = "0.1.0" }
+# What the console renderer says when a frame did not reach a display — a readback that answered
+# nothing, a buffer the display would not give up, a driver that refused the flip — and what it
+# says when it settles on copying every frame through the processor.
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+zgui-platform-headless = { path = "../zgui-platform-headless", version = "0.1.0" }
+
+[lints]
+workspace = true

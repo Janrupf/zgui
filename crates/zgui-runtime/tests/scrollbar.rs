@@ -74,7 +74,7 @@ fn bars(
             let FragmentKind::Scrollbar { axis, part } = fragment.kind else {
                 continue;
             };
-            let box_ = fragment.border_box;
+            let box_ = fragment.on_device(fragment.border_box, &window.placements());
             found.push((
                 axis,
                 part,
@@ -106,6 +106,23 @@ fn bar(
     first.2
 }
 
+/// Where a quad is drawn on the device, through its own coordinate system.
+fn on_device(scene: &zgui_scene::Scene, quad: &zgui_scene::Quad) -> [f32; 4] {
+    let local = quad.ink();
+    let placed = scene
+        .spatial
+        .resolve_at(quad.transform)
+        .map_or(local, |matrix| {
+            zgui_geom::transformed_bounds(&matrix, local)
+        });
+    [
+        placed.origin.x.0,
+        placed.origin.y.0,
+        placed.size.width.0,
+        placed.size.height.0,
+    ]
+}
+
 /// Whether the scene holds a quad covering exactly `rect`.
 ///
 /// The display list rather than the fragment tree, because a fragment that nothing emits for is the
@@ -114,11 +131,32 @@ fn painted(
     harness: &zgui_platform_headless::Harness<zgui_runtime::Runtime>,
     rect: [f32; 4],
 ) -> bool {
-    window(harness).scene().primitives.quads.iter().any(|quad| {
-        quad.bounds
+    let scene = window(harness).scene();
+    scene.primitives.quads.iter().any(|quad| {
+        on_device(scene, quad)
             .iter()
             .zip(rect.iter())
             .all(|(drawn, wanted)| (drawn - wanted).abs() < 0.01)
+    })
+}
+
+/// Whether the scene holds a quad that lies wholly inside `rect` and covers part of it.
+///
+/// The thumb is painted slimmer than the rectangle layout reserved for it, so this is how a test
+/// that is not about its thickness finds it.
+fn painted_within(
+    harness: &zgui_platform_headless::Harness<zgui_runtime::Runtime>,
+    rect: [f32; 4],
+) -> bool {
+    let scene = window(harness).scene();
+    scene.primitives.quads.iter().any(|quad| {
+        let [x, y, width, height] = on_device(scene, quad);
+        width > 0.0
+            && height > 0.0
+            && x >= rect[0] - 0.01
+            && y >= rect[1] - 0.01
+            && x + width <= rect[0] + rect[2] + 0.01
+            && y + height <= rect[1] + rect[3] + 0.01
     })
 }
 
@@ -214,7 +252,7 @@ fn pointer(
 }
 
 #[test]
-fn a_scrolling_page_draws_a_track_and_a_thumb_into_the_gutter_it_reserved() {
+fn a_scrolling_page_places_a_track_and_draws_a_thumb_in_the_gutter_it_reserved() {
     let mut harness = page(CSS, false);
     harness.settle(8);
 
@@ -230,11 +268,15 @@ fn a_scrolling_page_draws_a_track_and_a_thumb_into_the_gutter_it_reserved() {
     let thumb = bar(&harness, ScrollbarPart::Thumb);
     assert_eq!(thumb, [400.0 - GUTTER, 0.0, GUTTER, 150.0]);
 
+    // The default paint draws no groove and a slim capsule centred in the thumb's rectangle.
     assert!(
-        painted(&harness, track),
-        "the track reached the display list"
+        !painted(&harness, track),
+        "the default track is transparent and pushes nothing"
     );
-    assert!(painted(&harness, thumb), "and so did the thumb");
+    assert!(
+        painted(&harness, [400.0 - GUTTER / 2.0 - 3.0, 0.0, 6.0, 150.0]),
+        "the thumb reached the display list, six pixels wide down the middle of the gutter"
+    );
 }
 
 #[test]
@@ -250,9 +292,8 @@ fn a_reserved_gutter_with_nothing_to_scroll_has_a_track_and_no_thumb() {
     );
     assert_eq!(found[0].1, ScrollbarPart::Track);
     assert!(
-        painted(&harness, found[0].2),
-        "the strip is filled even though nothing can move, because it is space the content will \
-         never cover"
+        !painted(&harness, found[0].2),
+        "the default track is transparent and pushes nothing, whether or not anything can move"
     );
 }
 
@@ -266,33 +307,21 @@ fn a_fixed_scrim_and_the_gutter_together_cover_the_whole_window() {
     harness.settle(8);
 
     let track = bar(&harness, ScrollbarPart::Track);
-    let scrim = {
-        let window = window(&harness);
-        let layout = window.layout().borrow();
-        let mut widest: Option<[f32; 4]> = None;
-        for key in layout.keys() {
-            let Some(node) = layout.get(key) else {
-                continue;
-            };
-            if node.style.get_box().position != zgui_css::values::size::PositionValue::Fixed {
-                continue;
-            }
-            let Some(frag) = layout.fragments_of_box(key).first().copied() else {
-                continue;
-            };
-            let Some(fragment) = layout.fragment(frag) else {
-                continue;
-            };
-            let box_ = fragment.border_box;
-            widest = Some([
-                box_.origin.x.0,
-                box_.origin.y.0,
-                box_.size.width.0,
-                box_.size.height.0,
-            ]);
-        }
-        widest.expect("the fixed scrim was laid out")
-    };
+    // Found by its fill in the display list. The overlay root is also a fixed box, and it paints
+    // nothing.
+    let scene = window(&harness).scene();
+    let scrim = scene
+        .primitives
+        .quads
+        .iter()
+        .find(|quad| {
+            let fill = quad.fill.id().and_then(|id| scene.paints.get(id));
+            matches!(fill, Some(zgui_scene::Paint::Solid(color))
+                if color.components()[0] < 0.01
+                    && (color.components()[2] - 128.0 / 255.0).abs() < 0.01)
+        })
+        .map(|quad| on_device(scene, quad))
+        .expect("the fixed scrim was painted");
 
     assert_eq!(
         scrim,
@@ -305,7 +334,10 @@ fn a_fixed_scrim_and_the_gutter_together_cover_the_whole_window() {
         "and the track begins exactly where it ends, with no strip between them"
     );
     assert_eq!(track[0] + track[2], 400.0, "reaching the window's edge");
-    assert!(painted(&harness, track));
+    assert!(
+        painted_within(&harness, track),
+        "the thumb is drawn in the strip beside the scrim"
+    );
 }
 
 #[test]
@@ -449,6 +481,25 @@ fn a_thumb_is_dragged_in_its_own_space_however_its_scroller_is_transformed() {
 }
 
 #[test]
+fn a_transformed_scrollers_thumb_is_painted_where_the_transform_puts_it() {
+    // The thumb's rectangle is in the scroller's own space, so its quad has to be drawn through
+    // that space. Drawn through the viewport, the quad stays where the scroller was laid out.
+    let mut harness = warped("translate(100px, 20px) scale(2)");
+    harness.settle(8);
+    let thumb = PANEL * (PANEL / CONTENT);
+    let on_screen = [
+        100.0 + 2.0 * (PANEL - GUTTER),
+        20.0,
+        2.0 * GUTTER,
+        2.0 * thumb,
+    ];
+    assert!(
+        painted_within(&harness, on_screen),
+        "no quad is drawn inside the thumb's place on the screen, {on_screen:?}"
+    );
+}
+
+#[test]
 fn the_bar_follows_a_resize() {
     let mut harness = page(CSS, false);
     harness.settle(8);
@@ -464,7 +515,10 @@ fn the_bar_follows_a_resize() {
         [500.0 - GUTTER, 0.0, GUTTER, 400.0],
         "the track moved with the window's right edge and grew with its height"
     );
-    assert!(painted(&harness, track));
+    assert!(
+        painted_within(&harness, track),
+        "the thumb is drawn in the moved track"
+    );
 }
 
 #[test]
@@ -486,7 +540,8 @@ fn at_a_fractional_scale_the_track_begins_exactly_where_the_content_ends() {
         let layout = window.layout().borrow();
         let root = layout.root().expect("a root box");
         let frag = layout.fragments_of_box(root)[0];
-        layout.fragment(frag).expect("a fragment").content_box
+        let fragment = layout.fragment(frag).expect("a fragment");
+        fragment.on_device(fragment.content_box(), &window.placements())
     };
     assert_eq!(
         track[0],
@@ -494,5 +549,117 @@ fn at_a_fractional_scale_the_track_begins_exactly_where_the_content_ends() {
         "the track begins on the content box's own right edge"
     );
     assert_eq!(track[0] + track[2], 501.0, "and reaches the surface's edge");
-    assert!(painted(&harness, track));
+    assert!(
+        painted_within(&harness, track),
+        "the thumb is drawn in the track"
+    );
+}
+
+/// The scrolling page with twenty pixels of padding on its left and right.
+const PADDED_CSS: &str = "
+root { display: block; width: 100%; height: 100%; padding: 0 20px; overflow-x: hidden;
+       overflow-y: scroll }
+.filler { display: block; width: 100%; height: 600px; background-color: #202020 }
+";
+
+#[test]
+fn a_padded_scroller_draws_its_bar_against_its_edge_and_its_padding_hits_no_bar() {
+    let mut harness = page(PADDED_CSS, false);
+    harness.settle(8);
+
+    // The bar is outside the padding, against the edge of the window.
+    let track = bar(&harness, ScrollbarPart::Track);
+    assert_eq!(track, [400.0 - GUTTER, 0.0, GUTTER, 300.0]);
+    let thumb = bar(&harness, ScrollbarPart::Thumb);
+    assert_eq!(thumb, [400.0 - GUTTER, 0.0, GUTTER, 150.0]);
+
+    // Where the bar used to be: between the content and the right padding. A press and a move
+    // there are on the page and drag nothing.
+    let old_strip = 400.0 - 20.0 - GUTTER / 2.0;
+    pointer(&mut harness, PointerAction::Moved, (old_strip, 40.0));
+    pointer(&mut harness, PointerAction::Pressed, (old_strip, 40.0));
+    pointer(&mut harness, PointerAction::Moved, (old_strip, 70.0));
+    pointer(&mut harness, PointerAction::Released, (old_strip, 70.0));
+    assert_eq!(offset(&harness), 0.0, "the padding is not a bar");
+
+    // The thumb where it is now drags as before: thirty of thumb is sixty of content.
+    pointer(&mut harness, PointerAction::Moved, (392.0, 40.0));
+    pointer(&mut harness, PointerAction::Pressed, (392.0, 40.0));
+    assert_eq!(offset(&harness), 0.0);
+    pointer(&mut harness, PointerAction::Moved, (392.0, 70.0));
+    assert!(
+        (offset(&harness) - 60.0).abs() < 0.51,
+        "the offset is {}",
+        offset(&harness)
+    );
+    pointer(&mut harness, PointerAction::Released, (392.0, 70.0));
+
+    // And a press on the track below the thumb pages by the visible height.
+    pointer(&mut harness, PointerAction::Moved, (392.0, 290.0));
+    pointer(&mut harness, PointerAction::Pressed, (392.0, 290.0));
+    assert_eq!(offset(&harness), 300.0);
+}
+
+/// The colour of the quad painted at exactly `rect`, as premultiplied sRGB.
+fn painted_color(
+    harness: &zgui_platform_headless::Harness<zgui_runtime::Runtime>,
+    rect: [f32; 4],
+) -> Option<[f32; 4]> {
+    let scene = window(harness).scene();
+    scene
+        .primitives
+        .quads
+        .iter()
+        .find(|quad| {
+            on_device(scene, quad)
+                .iter()
+                .zip(rect.iter())
+                .all(|(drawn, wanted)| (drawn - wanted).abs() < 0.01)
+        })
+        .and_then(|quad| quad.fill.id().and_then(|id| scene.paints.get(id)))
+        .and_then(|paint| match paint {
+            zgui_scene::Paint::Solid(color) => Some(color.to_premultiplied_srgb()),
+            _ => None,
+        })
+}
+
+/// Where the default thumb is painted on the scrolling page.
+const THUMB: [f32; 4] = [400.0 - GUTTER / 2.0 - 3.0, 0.0, 6.0, 150.0];
+
+/// The scrolling page in a dark scheme, on a platform that presents light.
+const DARK_CSS: &str = "
+root { display: block; width: 100%; height: 100%; overflow-x: hidden; overflow-y: scroll;
+       color-scheme: dark }
+.filler { display: block; width: 100%; height: 600px; background-color: #202020 }
+";
+
+/// The scrolling page with a themed thumb.
+const LIME_CSS: &str = "
+:root { --zgui-scrollbar-thumb: rgb(0, 255, 0) }
+root { display: block; width: 100%; height: 100%; overflow-x: hidden; overflow-y: scroll }
+.filler { display: block; width: 100%; height: 600px; background-color: #202020 }
+";
+
+#[test]
+fn a_scroller_in_a_dark_scheme_paints_the_dark_thumb_on_a_light_platform() {
+    let mut harness = page(CSS, false);
+    harness.settle(8);
+    let light = painted_color(&harness, THUMB).expect("the thumb was painted");
+    assert_eq!(light, [0.0, 0.0, 0.0, 0.35], "the platform's light paint");
+
+    let mut harness = page(DARK_CSS, false);
+    harness.settle(8);
+    let dark = painted_color(&harness, THUMB).expect("the thumb was painted");
+    assert_eq!(
+        dark,
+        [0.5, 0.5, 0.5, 0.5],
+        "translucent white, premultiplied"
+    );
+}
+
+#[test]
+fn a_custom_property_sets_the_thumb_colour() {
+    let mut harness = page(LIME_CSS, false);
+    harness.settle(8);
+    assert_eq!(painted_color(&harness, THUMB), Some([0.0, 1.0, 0.0, 1.0]));
 }

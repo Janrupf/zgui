@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 
 use zgui::prelude::*;
 use zgui::view::scroll::{ScrollBehavior, ScrollTarget};
+use zgui_console::RunDrm;
 
 /// How many lines the list holds.
 const LINES: usize = 200;

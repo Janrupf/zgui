@@ -26,6 +26,7 @@ fn registry() -> Registry {
         zgui_paint::lower::clip::REGISTERED,
         zgui_paint::lower::filter::REGISTERED,
         zgui_paint::lower::outline::REGISTERED,
+        zgui_paint::lower::scrollbar::REGISTERED,
         zgui_paint::lower::shadow::REGISTERED,
         zgui_paint::lower::transform::REGISTERED,
         zgui_paint::emit::text::REGISTERED,

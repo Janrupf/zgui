@@ -13,13 +13,23 @@
 //! whatever the code says: a row of 1280 pixels needs 5120 bytes, and gen3 Intel rounds a tiled
 //! surface's pitch up to a power of two, which is 8192.
 
+#[cfg(target_os = "linux")]
 use std::os::fd::AsFd;
 
+#[cfg(target_os = "linux")]
 use zgui_gbm::{Device, Layout, Library};
 
 /// `XR24`, the format a scanout buffer is allocated under.
+#[cfg(target_os = "linux")]
 const FOURCC: u32 = u32::from_le_bytes(*b"XR24");
 
+/// Says so and leaves, on a host where the crate it would ask is empty.
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("libgbm is a Linux interface, so there is nothing here to ask");
+}
+
+#[cfg(target_os = "linux")]
 fn main() {
     let node = std::env::args()
         .nth(1)

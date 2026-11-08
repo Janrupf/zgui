@@ -6,12 +6,16 @@
 //! the only way to learn them is to ask one.
 //!
 //! A machine with no such driver says so on standard error and asserts nothing — the shape `cargo
-//! xtask ledger ignored` prescribes for a test that cannot be switched off. The pure half of this
-//! milestone, the intersection and the narrowing, is unit-tested inside the modules that own it
+//! xtask ledger ignored` prescribes for a test that cannot be switched off. The pure half of the
+//! import, the intersection and the narrowing, is unit-tested inside the modules that own it
 //! and runs everywhere.
 //!
 //! Nothing here needs DRM master, and nothing here puts a picture on a screen. The display is read
 //! for one thing only: which layouts its primary plane can scan out.
+
+// Proving a wgpu handle `Send` walks a type chain deeper than the default limit of 128, which newer
+// compilers report as a future error.
+#![recursion_limit = "256"]
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
@@ -101,7 +105,7 @@ struct Screen {
 /// The obvious stand-in, the linear layout, is the wrong one. Every display engine scans it out
 /// and only some drivers render into it: NVIDIA 595.84 lists `B8G8R8A8_UNORM` in the linear layout
 /// without `COLOR_ATTACHMENT`, so a linear stand-in would report "no shared layout" on the very
-/// machine this milestone was measured on.
+/// machine this import was measured on.
 fn screen(test: &str, gpu: &Gpu) -> Screen {
     let driver = |reason: &str| Screen {
         layouts: driver_offer(gpu),

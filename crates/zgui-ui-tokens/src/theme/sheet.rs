@@ -31,6 +31,8 @@ pub const THEME_SHEET: &str = "zgui-ui-theme";
 /// | [`ColorScheme::Dark`] | one rule, the dark tokens |
 /// | [`ColorScheme::System`] | the light tokens, then the dark ones inside `@media (prefers-color-scheme: dark)` |
 ///
+/// Each rule also sets `color-scheme` to the scheme of its tokens.
+///
 /// ```
 /// use zgui_ui_tokens::{ColorScheme, Theme, theme_sheet};
 ///
@@ -46,19 +48,20 @@ pub const THEME_SHEET: &str = "zgui-ui-theme";
 pub fn theme_sheet(selector: &str, light: &Theme, dark: &Theme, scheme: ColorScheme) -> String {
     let mut css = String::new();
 
+    // Each rule also says which scheme its tokens are for, so that what the engine draws itself,
+    // such as a scrollbar, matches the theme rather than the desktop.
     if scheme.wants_light() {
         let mut declarations = Declarations::new();
+        declarations.push("color-scheme", "light");
         light.declare(&mut declarations);
         css.push_str(&declarations.into_rule(selector));
     }
 
     if scheme.wants_dark() {
         let mut declarations = Declarations::new();
+        declarations.push("color-scheme", "dark");
         dark.declare(&mut declarations);
         let rule = declarations.into_rule(selector);
-        if rule.is_empty() {
-            return css;
-        }
         if !css.is_empty() {
             css.push('\n');
         }
@@ -131,6 +134,23 @@ mod tests {
             css.matches('{').count(),
             css.matches('}').count(),
             "the sheet does not close what it opens"
+        );
+    }
+
+    #[test]
+    fn each_rule_says_which_scheme_its_tokens_are_for() {
+        assert!(sheet(ColorScheme::Light).contains("color-scheme: light"));
+        assert!(!sheet(ColorScheme::Light).contains("color-scheme: dark"));
+        assert!(sheet(ColorScheme::Dark).contains("color-scheme: dark"));
+        let system = sheet(ColorScheme::System);
+        let query = system
+            .find("@media (prefers-color-scheme: dark)")
+            .expect("the query is written");
+        let light = system.find("color-scheme: light").expect("light");
+        let dark = system.find("color-scheme: dark").expect("dark");
+        assert!(
+            light < query && query < dark,
+            "the dark scheme is inside the query"
         );
     }
 

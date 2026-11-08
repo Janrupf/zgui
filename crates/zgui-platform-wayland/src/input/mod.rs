@@ -1,7 +1,7 @@
 //! Input, as it arrives from the compositor.
 //!
 //! Every module here answers one question: what a key means ([`keyboard`]), where a pointer is and
-//! what it did ([`pointer`]), what a finger did ([`touch`]), what is being dragged over a window
+//! what it did ([`pointer`](mod@pointer)), what a finger did ([`touch`]), what is being dragged over a window
 //! ([`dnd`]), which devices a person has ([`seat`]), and which serial a request may quote
 //! ([`serial`]).
 

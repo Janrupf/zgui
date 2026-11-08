@@ -29,7 +29,7 @@ where
     V: FnMut(&mut BuildCx<'_>) -> Box<dyn Anchor> + 'static,
 {
     let mut options = zgui_runtime::WindowContent::default();
-    options.window_stylesheet = Some(SHEET.to_owned());
+    options.window_stylesheets.push(SHEET.to_owned());
     let token = harness.app().window_commands().open(WindowSpec::new(
         SurfaceAttributes::new("second"),
         options,
@@ -302,7 +302,7 @@ fn a_close_the_user_asked_for_can_be_refused() {
     let mut harness = app(SHEET, empty);
     harness.settle(4);
     let mut options = zgui_runtime::WindowContent::default();
-    options.window_stylesheet = Some(SHEET.to_owned());
+    options.window_stylesheets.push(SHEET.to_owned());
     harness.app().window_commands().open(
         WindowSpec::new(SurfaceAttributes::new("second"), options, Box::new(empty))
             .with_close_callbacks(Rc::clone(&close)),
@@ -337,7 +337,7 @@ fn the_platform_taking_a_window_is_not_a_close_to_refuse() {
     let mut harness = app(SHEET, empty);
     harness.settle(4);
     let mut options = zgui_runtime::WindowContent::default();
-    options.window_stylesheet = Some(SHEET.to_owned());
+    options.window_stylesheets.push(SHEET.to_owned());
     harness.app().window_commands().open(
         WindowSpec::new(SurfaceAttributes::new("second"), options, Box::new(empty))
             .with_close_callbacks(close),
@@ -359,7 +359,7 @@ fn an_application_can_close_a_window_that_refuses_the_user() {
     let mut harness = app(SHEET, empty);
     harness.settle(4);
     let mut options = zgui_runtime::WindowContent::default();
-    options.window_stylesheet = Some(SHEET.to_owned());
+    options.window_stylesheets.push(SHEET.to_owned());
     let token = harness.app().window_commands().open(
         WindowSpec::new(SurfaceAttributes::new("second"), options, Box::new(empty))
             .with_close_callbacks(close),

@@ -5,11 +5,31 @@ use zgui::render::FrameOutcome;
 use zgui::scene::Scene;
 use zgui_render_wgpu::{Pixels, WgpuRenderer};
 
+/// Which primitive array a drawing arrived in.
+///
+/// The display list picks a route per shape. A shape it recognises arrives as quads or as one mark
+/// item, a small one as a single-channel sprite, and only what is left as a vector item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// A vector item, for the general rasteriser.
+    Vector,
+    /// A colour sprite, from the CPU layer route.
+    Colour,
+    /// A mark item: discs, boxes, polylines or path glyphs.
+    Mark,
+    /// A single-channel sprite: a shape rasterised as a coverage mask, or a glyph.
+    Mask,
+    /// A quad: a shape the analytic route recognised, or a box's background and border.
+    Quad,
+}
+
 /// One drawing the display list held, and where it claimed its ink would land.
 #[derive(Clone, Copy, Debug)]
 pub struct Drawing {
-    /// Its place in the painting order.
+    /// Its index in the array of its kind.
     pub order: usize,
+    /// The array it is in.
+    pub kind: Kind,
     /// What it paints, in device pixels, as the display list measured it.
     pub ink: Rect<DevicePx, Device>,
     /// The clip chain it draws through.
@@ -54,12 +74,18 @@ pub struct Glyph {
 pub struct Frame {
     /// The composed target, read back off the device.
     pub pixels: Pixels,
-    /// Every vector item the display list held, in painting order.
+    /// Every primitive only a drawing produces: each vector item, then each colour sprite, then
+    /// each mark item.
     pub drawings: Vec<Drawing>,
+    /// Every primitive a drawing can arrive as: the drawings, then each quad and each
+    /// single-channel sprite. See [`Frame::shapes_in`].
+    pub shapes: Vec<Drawing>,
     /// Every filled rectangle it held, in painting order.
     pub quads: Vec<Filled>,
     /// Every glyph it held, in painting order.
     pub glyphs: Vec<Glyph>,
+    /// The persistent target frames are composed into, which is what a surface shows.
+    pub composed: Pixels,
     /// How many rasterisation passes the frame planned.
     pub passes: usize,
     /// How many vector items the damage cull dropped.
@@ -74,18 +100,73 @@ impl Frame {
     /// Reads back what `renderer` just drew, beside what `scene` said would be in it.
     pub fn record(renderer: &mut WgpuRenderer, scene: &Scene, outcome: &FrameOutcome) -> Self {
         let plan = scene.pass_plan();
-        let drawings = scene
+        let mut drawings: Vec<Drawing> = scene
             .primitives
             .vectors
             .iter()
             .enumerate()
             .map(|(order, item)| Drawing {
                 order,
+                kind: Kind::Vector,
                 ink: item.ink,
                 clip: item.clip.0,
                 painted: (item.fill.is_some(), item.stroke.is_some()),
             })
             .collect();
+        // A drawing on the CPU layer route arrives as one colour sprite.
+        drawings.extend(scene.primitives.color_sprites.iter().enumerate().map(
+            |(order, sprite)| Drawing {
+                order,
+                kind: Kind::Colour,
+                ink: placed(scene, sprite.bounds, sprite.transform),
+                clip: sprite.clip,
+                painted: (true, false),
+            },
+        ));
+        // A shape the marks route recognised arrives as one mark item.
+        drawings.extend(
+            scene
+                .primitives
+                .marks
+                .iter()
+                .enumerate()
+                .map(|(order, mark)| Drawing {
+                    order,
+                    kind: Kind::Mark,
+                    ink: placed(scene, mark.bounds, mark.transform),
+                    clip: mark.clip,
+                    painted: (true, false),
+                }),
+        );
+        let mut shapes = drawings.clone();
+        shapes.extend(
+            scene
+                .primitives
+                .quads
+                .iter()
+                .enumerate()
+                .map(|(order, quad)| Drawing {
+                    order,
+                    kind: Kind::Quad,
+                    ink: placed(scene, quad.bounds, quad.transform),
+                    clip: quad.clip,
+                    painted: (!quad.fill.is_none(), !quad.stroke.is_none()),
+                }),
+        );
+        shapes.extend(
+            scene
+                .primitives
+                .mono_sprites
+                .iter()
+                .enumerate()
+                .map(|(order, sprite)| Drawing {
+                    order,
+                    kind: Kind::Mask,
+                    ink: placed(scene, sprite.bounds, sprite.transform),
+                    clip: sprite.clip,
+                    painted: (true, false),
+                }),
+        );
         let quads = scene
             .primitives
             .quads
@@ -123,7 +204,9 @@ impl Frame {
             pixels: renderer
                 .read_presented()
                 .expect("these fixtures draw to a texture, which can be read back"),
+            composed: renderer.read_composed(),
             drawings,
+            shapes,
             quads,
             glyphs,
             pass_regions: plan
@@ -136,6 +219,46 @@ impl Frame {
             rasterised: outcome.stats().map_or(0, |stats| stats.vector_passes),
         }
     }
+
+    /// Every shape whose middle is inside `rect`, without the quads that fill one of `boxes`.
+    ///
+    /// `boxes` are the element boxes of the document. A background or a border is a quad the size
+    /// of its element's box, and a shape the analytic route drew is the size of the shape. A glyph
+    /// that arrives as a single-channel sprite is still in the result, so a caller asks inside a
+    /// rectangle with no text, or removes the text itself.
+    pub fn shapes_in(
+        &self,
+        rect: Rect<DevicePx, Device>,
+        boxes: &[Rect<DevicePx, Device>],
+    ) -> Vec<Drawing> {
+        self.shapes
+            .iter()
+            .copied()
+            .filter(|shape| middle_inside(rect, shape.ink))
+            .filter(|shape| {
+                shape.kind != Kind::Quad || !boxes.iter().any(|held| same(*held, shape.ink))
+            })
+            .collect()
+    }
+}
+
+/// Whether the middle of `inner` is inside `outer`.
+fn middle_inside(outer: Rect<DevicePx, Device>, inner: Rect<DevicePx, Device>) -> bool {
+    let x = inner.origin.x.0 + inner.size.width.0 / 2.0;
+    let y = inner.origin.y.0 + inner.size.height.0 / 2.0;
+    x >= outer.origin.x.0
+        && x <= outer.origin.x.0 + outer.size.width.0
+        && y >= outer.origin.y.0
+        && y <= outer.origin.y.0 + outer.size.height.0
+}
+
+/// Whether two rectangles are the same to half a pixel on every edge.
+fn same(left: Rect<DevicePx, Device>, right: Rect<DevicePx, Device>) -> bool {
+    const SLACK: f32 = 0.5;
+    (left.origin.x.0 - right.origin.x.0).abs() <= SLACK
+        && (left.origin.y.0 - right.origin.y.0).abs() <= SLACK
+        && (left.size.width.0 - right.size.width.0).abs() <= SLACK
+        && (left.size.height.0 - right.size.height.0).abs() <= SLACK
 }
 
 /// Where `bounds` lands once the transform it draws under has been applied.

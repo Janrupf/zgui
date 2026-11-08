@@ -206,3 +206,95 @@ fn a_square_box_is_the_same_box_whatever_shape_it_names() {
         );
     }
 }
+
+/// A rounded box at a fraction of a pixel covers the edge pixel by that fraction along its
+/// straight sides, as a square box does.
+#[test]
+fn a_rounded_edge_at_a_fraction_of_a_pixel_covers_that_fraction() {
+    let Some(mut renderer) = plain_renderer() else {
+        return;
+    };
+    for radius in [0.0, 8.0] {
+        let mut scene = scene();
+        let fill = scene.paints.add(zgui_scene::Paint::Solid(opaque(0, 0, 0)));
+        scene
+            .push_quad(Quad::filled(rect(10.25, 10.0, 40.0, 40.0), fill).with_radii(radii(radius)));
+        scene.finish(&DamageSet::full());
+        let pixels = present(&mut renderer, &scene);
+        // The left edge is a quarter of a pixel into column 10, so three quarters of it are inside.
+        let alpha = pixels.rgba(10, 30)[3];
+        assert!(
+            alpha.abs_diff(191) <= 2,
+            "radius {radius}: the edge pixel holds {alpha} of 255"
+        );
+    }
+}
+
+/// A ring's inner edge is antialiased where it runs beside the straight band of its border.
+#[test]
+fn a_ring_antialiases_its_inner_edge_beside_the_straight_band() {
+    let Some(mut renderer) = plain_renderer() else {
+        return;
+    };
+    let mut scene = scene();
+    let stroke = zgui_scene::PaintRef::solid(scene.paints.solid(opaque(0, 0, 0)));
+    // Centred on (30.5, 30.6), outer radius 19, border 2: the inner edge crosses column 30 at
+    // 13.6, so the border covers six tenths of pixel (30, 13).
+    let mut ring = Quad::filled(rect(11.5, 11.6, 38.0, 38.0), zgui_scene::PaintRef::NONE)
+        .with_radii(radii(19.0));
+    ring.border = [2.0; 4];
+    ring.stroke = stroke;
+    scene.push_quad(ring);
+    scene.finish(&DamageSet::full());
+    let pixels = present(&mut renderer, &scene);
+    let alpha = pixels.rgba(30, 13)[3];
+    assert!(
+        alpha.abs_diff(153) <= 3,
+        "the pixel across the inner edge holds {alpha} of 255"
+    );
+}
+
+/// A border with one colour per side draws each side in its own colour, and the sides meet on the
+/// diagonal from the outer corner to the inner one.
+#[test]
+fn each_border_side_is_drawn_in_its_own_colour() {
+    let Some(mut renderer) = plain_renderer() else {
+        return;
+    };
+    let mut scene = scene();
+    let grey = opaque(128, 128, 128);
+    let red = opaque(255, 0, 0);
+    let stroke = scene
+        .paints
+        .add(zgui_scene::Paint::Sides([grey, grey, grey, red]));
+    // Left 8, other sides 4: the join at the top left runs from (10, 10) to (18, 14).
+    scene.push_quad(
+        Quad::filled(rect(10.0, 10.0, 60.0, 40.0), zgui_scene::PaintRef::NONE).with_border(
+            [4.0, 4.0, 4.0, 8.0],
+            stroke,
+            zgui_scene::prim::quad::BorderStyle::Solid,
+        ),
+    );
+    scene.finish(&DamageSet::full());
+    let pixels = present(&mut renderer, &scene);
+
+    let rgb = |x, y| {
+        let [r, g, b, _] = pixels.rgba(x, y);
+        [r, g, b]
+    };
+    assert_eq!(rgb(12, 30), [255, 0, 0], "the left side is red");
+    assert_eq!(rgb(40, 11), [128, 128, 128], "the top side is grey");
+    assert_eq!(rgb(68, 30), [128, 128, 128], "the right side is grey");
+    assert_eq!(rgb(40, 48), [128, 128, 128], "the bottom side is grey");
+    // Inside the corner square, on either side of the diagonal.
+    assert_eq!(
+        rgb(11, 13),
+        [255, 0, 0],
+        "below the diagonal belongs to the left side"
+    );
+    assert_eq!(
+        rgb(16, 11),
+        [128, 128, 128],
+        "above it belongs to the top side"
+    );
+}

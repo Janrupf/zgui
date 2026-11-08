@@ -25,8 +25,9 @@ style! { pub SidebarBandStyle =>
     }"
 
     // Inset from both edges and in the panel's own border colour, so it reads as part of the panel
-    // rather than as the panel ending.
-    ".zui-sidebar__separator {
+    // rather than as the panel ending. The doubled class and the attribute out-rank the width and
+    // colour of the separator sheet.
+    ".zui-sidebar__separator.zui-sidebar__separator[data-orientation] {
         width: auto;
         margin: 0 8px;
         background-color: var(--zui-color-sidebar-border);

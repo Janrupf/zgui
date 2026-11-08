@@ -6,11 +6,15 @@
 //! run below.
 
 use smallvec::SmallVec;
+use zgui_color::Color;
 use zgui_geom::{Corners, Device, DevicePx, Edges, Point, Rect, Size, Vec2};
-use zgui_scene::{ClipId, PaintRef, Quad, Scene, Shadow, SpatialId};
+use zgui_scene::{
+    ClipId, Paint, PaintOwner, PaintRef, PaintRole, PropertyOwner, Quad, Scene, Shadow, SpatialId,
+};
 
 use crate::emit::paint::gradient_paint;
 use crate::lower::PaintStyle;
+use crate::lower::anim::{OwnedPaints, border_paint};
 use crate::lower::border::inner_radii;
 
 /// Where a box's decorations are drawn.
@@ -28,6 +32,23 @@ pub struct BoxPlacement {
     pub transform: SpatialId,
     /// How many device pixels one CSS pixel is, for resolving a gradient's stop positions.
     pub scale: f32,
+    /// The box that owns the slots its animated colours are drawn through, and which colours.
+    ///
+    /// `None` for a box with no animated colour, which draws through interned paints.
+    pub owned: Option<(PropertyOwner, OwnedPaints)>,
+}
+
+impl BoxPlacement {
+    /// The owned slots this placement draws `role` through, if it does.
+    fn owner_of(&self, role: PaintRole) -> Option<PaintOwner> {
+        let (owner, paints) = self.owned?;
+        let drawn = match role {
+            PaintRole::Background => paints.background(),
+            PaintRole::BorderSides => paints.border(),
+            PaintRole::Outline => paints.outline(),
+        };
+        drawn.then_some(PaintOwner::new(owner, role))
+    }
 }
 
 /// Emits the shadows a box casts outwards, behind everything else it draws.
@@ -41,7 +62,21 @@ pub fn inset_shadows(scene: &mut Scene, style: &PaintStyle, placement: BoxPlacem
 }
 
 /// Emits one direction's shadows, last written first so the first written ends up on top.
+///
+/// A drop shadow is cast by the border box. An inset shadow is clipped to the padding box, so it
+/// never covers the border, and its hole is concentric with the padding box's corners.
 fn shadows(scene: &mut Scene, style: &PaintStyle, placement: BoxPlacement, inset: bool) -> usize {
+    let (element, element_radii) = if inset {
+        (
+            placement.border_box.inset(placement.border),
+            inner_radii(placement.radii, placement.border),
+        )
+    } else {
+        (placement.border_box, placement.radii)
+    };
+    if inset && element.is_empty() {
+        return 0;
+    }
     let mut pushed = 0;
     for spec in style.shadows.iter().rev() {
         if spec.inset != inset || spec.is_invisible() {
@@ -49,7 +84,7 @@ fn shadows(scene: &mut Scene, style: &PaintStyle, placement: BoxPlacement, inset
         }
         let mut shadow = if inset {
             Shadow::inset_shadow(
-                placement.border_box,
+                element,
                 (spec.offset_x, spec.offset_y),
                 spec.spread,
                 spec.deviation,
@@ -57,7 +92,7 @@ fn shadows(scene: &mut Scene, style: &PaintStyle, placement: BoxPlacement, inset
             )
         } else {
             Shadow::drop_shadow(
-                placement.border_box,
+                element,
                 (spec.offset_x, spec.offset_y),
                 spec.spread,
                 spec.deviation,
@@ -68,8 +103,8 @@ fn shadows(scene: &mut Scene, style: &PaintStyle, placement: BoxPlacement, inset
         // open, so the corners of the two move in opposite directions: an inset shadow's shape is
         // concentric inside the box, and growing its radii would round the hole the wrong way.
         let spread = if inset { -spec.spread } else { spec.spread };
-        shadow.radii = flatten(grow(placement.radii, spread));
-        shadow.element_radii = flatten(placement.radii);
+        shadow.radii = flatten(grow(element_radii, spread));
+        shadow.element_radii = flatten(element_radii);
         // A shadow is the box's own shape blurred, so it is cut the same way: a squircle casting a
         // rounded-rectangle shadow shows the shadow's corners outside its own.
         shadow.shape = style.corner_shape.get();
@@ -93,9 +128,14 @@ pub fn background_and_border(
     if let Some(pushed) = shaded(scene, style, placement, shaders, pointer) {
         return pushed;
     }
-    let (fills, _) = fills_of(scene, style, placement);
+    let (fills, draws_border) = fills_of(scene, style, placement);
     let borders = border_widths(placement.border);
-    let strokes = border_strokes(scene, style);
+    let stroke = match placement.owner_of(PaintRole::BorderSides) {
+        Some(name) if draws_border => scene
+            .paints
+            .owned(name, border_paint(style.border.colors, placement.border)),
+        _ => border_stroke(scene, style, borders, true),
+    };
     let last = fills.len().saturating_sub(1);
     let mut pushed = 0;
     for (index, fill) in fills.into_iter().enumerate() {
@@ -105,7 +145,7 @@ pub fn background_and_border(
                 placement,
                 style,
                 fill,
-                (index == last).then_some((borders, strokes, style)),
+                (index == last).then_some((borders, stroke, style)),
             )
             .is_some(),
         );
@@ -126,7 +166,15 @@ fn fills_of(
     placement: BoxPlacement,
 ) -> (SmallVec<[PaintRef; 2]>, bool) {
     let mut fills: SmallVec<[PaintRef; 2]> = SmallVec::new();
-    if style.background.color.alpha() != 0.0 {
+    // An owned colour is drawn at any alpha, so the slot is there when an animation brings the
+    // colour in from transparent.
+    if let Some(name) = placement.owner_of(PaintRole::Background) {
+        fills.push(
+            scene
+                .paints
+                .owned(name, Paint::Solid(style.background.color)),
+        );
+    } else if style.background.color.alpha() != 0.0 {
         fills.push(
             scene
                 .paints
@@ -148,7 +196,8 @@ fn fills_of(
             fills.push(fill);
         }
     }
-    let draws_border = !style.border.invisible
+    let draws_border = (!style.border.invisible
+        || placement.owner_of(PaintRole::BorderSides).is_some())
         && border_widths(placement.border)
             .iter()
             .any(|width| *width > 0.0);
@@ -201,7 +250,8 @@ fn shaded(
         (SmallVec::from_slice(&[PaintRef::NONE]), false)
     };
     let borders = border_widths(placement.border);
-    let stroke = draws_border.then(|| border_stroke(scene, style));
+    // The shaded pipeline strokes in one colour.
+    let stroke = draws_border.then(|| border_stroke(scene, style, borders, false));
     let last = fills.len().saturating_sub(1);
     let mut pushed = 0;
     for (index, fill) in fills.into_iter().enumerate() {
@@ -232,15 +282,15 @@ fn push(
     placement: BoxPlacement,
     style: &PaintStyle,
     fill: PaintRef,
-    border: Option<([f32; 4], [PaintRef; 4], &PaintStyle)>,
+    border: Option<([f32; 4], PaintRef, &PaintStyle)>,
 ) -> Option<zgui_scene::DrawOrder> {
     let mut quad = Quad::filled(placement.border_box, fill)
         .clipped(placement.clip)
         .transformed(placement.transform)
         .with_radii(placement.radii)
         .with_corner_shape(style.corner_shape);
-    if let Some((widths, strokes, style)) = border {
-        quad = quad.with_border_sides(widths, strokes, style.border.style.to_scene());
+    if let Some((widths, stroke, style)) = border {
+        quad = quad.with_border(widths, stroke, style.border.style.to_scene());
     }
     // Only a paint that is read at a point has an origin to be read from, and saying so is what
     // keeps every flat-filled box in the document carrying a zero it does not use.
@@ -268,7 +318,10 @@ pub fn outline(scene: &mut Scene, style: &PaintStyle, placement: BoxPlacement) -
     if rect.is_empty() {
         return 0;
     }
-    let stroke = scene.paints.add(zgui_scene::Paint::Solid(outline.color));
+    let stroke = match placement.owner_of(PaintRole::Outline) {
+        Some(name) => scene.paints.owned(name, Paint::Solid(outline.color)),
+        None => scene.paints.add(Paint::Solid(outline.color)),
+    };
     let quad = Quad::filled(rect, PaintRef::NONE)
         .clipped(placement.clip)
         .transformed(placement.transform)
@@ -285,39 +338,32 @@ fn border_widths(border: Edges<DevicePx>) -> [f32; 4] {
     [border.top.0, border.right.0, border.bottom.0, border.left.0]
 }
 
-/// The paint each of a box's border sides is stroked with, in top, right, bottom, left order.
+/// The paint a box's border is stroked with, given the widths in top, right, bottom, left order.
 ///
-/// A side that draws nothing is [`PaintRef::NONE`] rather than a transparent colour, so the shader
-/// can leave that side of the border undrawn instead of blending nothing over the background. That
-/// is what a spinner is made of: a ring of one colour with its top side taken away, which is
-/// invisible as a turning thing if the four sides are collapsed into one paint.
-///
-/// The sides are interned separately and the common case — four sides of one colour — resolves to
-/// four references to the same paint, so it costs one entry in the table and no extra work.
-fn border_strokes(scene: &mut Scene, style: &PaintStyle) -> [PaintRef; 4] {
-    style.border.colors.map(|color| {
-        if color.alpha() == 0.0 {
-            return PaintRef::NONE;
-        }
-        scene.paints.add(zgui_scene::Paint::Solid(color))
-    })
-}
-
-/// One border colour for a box whose shape a shader decides.
-///
-/// A [`ShadedQuad`](zgui_scene::ShadedQuad) carries a single stroke rather than four, because an
-/// effect that reshapes a box is not a spinner: the first side that paints something is the box's
-/// border, and the per-side ring the ordinary path draws is not what a coverage effect wants.
-fn border_stroke(scene: &mut Scene, style: &PaintStyle) -> PaintRef {
-    let Some(color) = style
-        .border
-        .colors
-        .iter()
-        .copied()
-        .find(|color| color.alpha() != 0.0)
-    else {
-        return PaintRef::NONE;
+/// The sides that have a width decide. One colour on all of them is a solid stroke. Different
+/// colours are a [`Paint::Sides`](zgui_scene::Paint::Sides) stroke when `sides` allows it, and the
+/// first visible colour when it does not.
+fn border_stroke(scene: &mut Scene, style: &PaintStyle, widths: [f32; 4], sides: bool) -> PaintRef {
+    let colors = style.border.colors;
+    let shown = || {
+        (0..4)
+            .filter(|&side| widths[side] > 0.0)
+            .map(|side| colors[side])
     };
+    let color = match shown().next() {
+        Some(first) if shown().all(|color| color == first) => first,
+        Some(_) if sides => return scene.paints.add(zgui_scene::Paint::Sides(colors)),
+        Some(first) => shown().find(|color| color.alpha() != 0.0).unwrap_or(first),
+        // No side has a width, so the stroke draws nothing whatever its colour.
+        None => colors
+            .iter()
+            .copied()
+            .find(|color| color.alpha() != 0.0)
+            .unwrap_or(Color::TRANSPARENT),
+    };
+    if color.alpha() == 0.0 {
+        return PaintRef::NONE;
+    }
     scene.paints.add(zgui_scene::Paint::Solid(color))
 }
 
@@ -369,7 +415,7 @@ pub fn padding_radii(
 mod tests {
     use zgui_geom::{Corners, Device, DevicePx, Point, Rect, Size, Vec2};
 
-    use super::{BoxPlacement, background_and_border, grow, inset_shadows, outer_shadows};
+    use super::{BoxPlacement, grow, inset_shadows, outer_shadows};
     use crate::lower::PaintStyle;
     use crate::lower::shadow::ShadowSpec;
 
@@ -385,6 +431,7 @@ mod tests {
             clip: zgui_scene::ClipId::ROOT,
             transform: zgui_scene::SpatialId::VIEWPORT,
             scale: 1.0,
+            owned: None,
         }
     }
 
@@ -425,6 +472,46 @@ mod tests {
         assert_eq!(only_shadow_radius(&with_shadow(6.0, true), true), 4.0);
     }
 
+    /// The only inset shadow a 48-pixel box with a two-pixel border and six-pixel corners emits.
+    fn bordered_inset(offset: (f32, f32), spread: f32) -> zgui_scene::Shadow {
+        let mut style = with_shadow(spread, true);
+        style.shadows[0].offset_x = offset.0;
+        style.shadows[0].offset_y = offset.1;
+        let placement = BoxPlacement {
+            border_box: Rect::new(
+                Point::new(DevicePx(10.0), DevicePx(10.0)),
+                Size::new(DevicePx(48.0), DevicePx(48.0)),
+            ),
+            border: zgui_geom::Edges::uniform(DevicePx(2.0)),
+            radii: Corners::uniform(Vec2::new(DevicePx(6.0), DevicePx(6.0))),
+            ..placement()
+        };
+        let mut scene = zgui_scene::Scene::new();
+        scene.begin_frame(Size::<i32, Device>::new(256, 256));
+        assert_eq!(inset_shadows(&mut scene, &style, placement), 1);
+        scene.primitives.shadows[0]
+    }
+
+    #[test]
+    fn an_inset_spread_shrinks_the_hole_inside_the_padding_box() {
+        let shadow = bordered_inset((0.0, 0.0), 2.0);
+        assert_eq!(shadow.inset, 1);
+        // The padding box: the border box less the two-pixel border.
+        assert_eq!(shadow.bounds, [12.0, 12.0, 44.0, 44.0]);
+        assert_eq!(shadow.element_bounds, [12.0, 12.0, 44.0, 44.0]);
+        assert_eq!(shadow.element_radii, [4.0; 8]);
+        // The hole: the padding box less the spread, with concentric corners.
+        assert_eq!(shadow.shape_bounds, [14.0, 14.0, 40.0, 40.0]);
+        assert_eq!(shadow.radii, [2.0; 8]);
+    }
+
+    #[test]
+    fn an_inset_offset_moves_the_hole_and_keeps_the_painted_box() {
+        let shadow = bordered_inset((0.0, 2.0), 0.0);
+        assert_eq!(shadow.bounds, [12.0, 12.0, 44.0, 44.0]);
+        assert_eq!(shadow.shape_bounds, [12.0, 14.0, 44.0, 44.0]);
+    }
+
     #[test]
     fn a_square_corner_stays_square_however_far_it_grows() {
         let radii = Corners {
@@ -443,95 +530,5 @@ mod tests {
         let radii = Corners::uniform(Vec2::new(DevicePx(2.0), DevicePx(2.0)));
         let shrunk = grow(radii, -10.0);
         assert_eq!(shrunk.top_left, Vec2::new(DevicePx(0.0), DevicePx(0.0)));
-    }
-
-    /// A ring of one colour with its top side taken away is drawn with the top side taken away.
-    ///
-    /// What a spinner is: `border: 2px solid` with `border-top-color: transparent`, turned by an
-    /// animation. Collapsed into one paint it is a closed ring, and a closed ring is the same
-    /// picture at every angle — so the spinner turns and nothing on the screen moves. The gap is
-    /// the whole of what makes the rotation visible, and it lives in these four references.
-    #[test]
-    fn a_side_left_transparent_is_the_one_side_that_paints_nothing() {
-        let mut style = crate::lower::lower(&zgui_css::StyleDraft::initial().build(), 1.0);
-        style.border.colors = [
-            zgui_color::Color::TRANSPARENT,
-            zgui_color::Color::BLACK,
-            zgui_color::Color::BLACK,
-            zgui_color::Color::BLACK,
-        ];
-        style.border.invisible = false;
-        let mut placed = placement();
-        placed.border = zgui_geom::Edges {
-            top: DevicePx(2.0),
-            right: DevicePx(2.0),
-            bottom: DevicePx(2.0),
-            left: DevicePx(2.0),
-        };
-
-        let mut scene = zgui_scene::Scene::new();
-        scene.begin_frame(Size::<i32, Device>::new(256, 256));
-        assert_eq!(
-            background_and_border(
-                &mut scene,
-                &style,
-                placed,
-                &crate::content::shader::NoShaders,
-                None,
-            ),
-            1,
-        );
-
-        let strokes = scene.primitives.quads[0].strokes;
-        assert_eq!(
-            strokes[0],
-            zgui_scene::PaintRef::NONE,
-            "the transparent top side was given a paint, so the ring has no gap and a spinner \
-             built from it cannot be seen to turn"
-        );
-        for side in &strokes[1..] {
-            assert_ne!(
-                *side,
-                zgui_scene::PaintRef::NONE,
-                "a solid side paints nothing"
-            );
-        }
-    }
-
-    /// Four sides of one colour cost one entry in the paint table.
-    ///
-    /// The common case by far, and the reason each side is interned rather than carried as a
-    /// colour: a border that is one colour must not pay four times for saying so.
-    #[test]
-    fn four_sides_of_one_colour_share_one_paint() {
-        let mut style = crate::lower::lower(&zgui_css::StyleDraft::initial().build(), 1.0);
-        style.border.colors = [zgui_color::Color::BLACK; 4];
-        style.border.invisible = false;
-        let mut placed = placement();
-        placed.border = zgui_geom::Edges {
-            top: DevicePx(1.0),
-            right: DevicePx(1.0),
-            bottom: DevicePx(1.0),
-            left: DevicePx(1.0),
-        };
-
-        let mut scene = zgui_scene::Scene::new();
-        scene.begin_frame(Size::<i32, Device>::new(256, 256));
-        assert_eq!(
-            background_and_border(
-                &mut scene,
-                &style,
-                placed,
-                &crate::content::shader::NoShaders,
-                None,
-            ),
-            1,
-        );
-
-        let strokes = scene.primitives.quads[0].strokes;
-        assert!(
-            strokes.iter().all(|side| *side == strokes[0]),
-            "one colour resolved to four different paints"
-        );
     }
 }

@@ -37,11 +37,12 @@ impl DocumentDom {
     /// A node that is already gone is left gone. A teardown can reach the same element twice —
     /// once from its own view and once from an ancestor whose whole subtree went — and the second
     /// arrival has nothing left to remove; unwinding over it would poison the document mid-batch.
+    /// A poisoned document keeps the node.
     pub(crate) fn unlink(&self, node: NodeId) {
         let Some(node) = self.live_index_of(node) else {
             return;
         };
-        self.edit(|edit| edit.remove(node));
+        self.edit_unless_poisoned(|edit| edit.remove(node));
     }
 
     /// What `node` currently sits under, or nothing when it sits under the document itself.
@@ -53,6 +54,15 @@ impl DocumentDom {
             return None;
         }
         Some(id::to_view(document.store().key_of(parent)))
+    }
+
+    /// Whether the live text node `node` holds exactly `data`. An absent text reads as empty.
+    pub(crate) fn holds_text(&self, node: NodeId, data: &str) -> bool {
+        let Some(index) = self.live_index_of(node) else {
+            return false;
+        };
+        let document = self.document();
+        zgui_dom::text::node::text_of(document.store(), index).unwrap_or_default() == data
     }
 
     /// Replaces the text `node` holds.

@@ -50,7 +50,7 @@ use crate::waker::PingWaker;
 ///
 /// # Nothing reaches the application from inside a dispatch
 ///
-/// A protocol event never calls the application. It records what happened in [`WaylandState::out`]
+/// A protocol event never calls the application. It records what happened in `WaylandState::out`
 /// and returns, and the turn delivers the batch afterwards with nothing borrowed. That is what
 /// makes the borrowed context safe to hand out at all: the application can create a surface, close
 /// one, or ask for the clipboard from inside a callback, and none of it can re-enter a dispatch

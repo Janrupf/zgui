@@ -5,18 +5,30 @@
 //! | `place` | where a fragment ends up, and in what order it is painted |
 //! | `folds` | what an unwind folds up the tree |
 //! | `hits` | what answers at a point |
+//! | `inline_effects` | a line that paints the nested inline boxes on it |
 //! | `bounds` | where an element is, across every piece it was painted as |
+//! | `extra` | the values a fragment keeps outside its record |
 //! | `probe` | finding the box and the fragment a fixture element produced |
+//! | `spaces` | which coordinate system a fragment names |
+//! | `snapped` | which device pixel a translated box is drawn at |
 
 mod support;
 
 #[path = "fragments/bounds.rs"]
 mod bounds;
+#[path = "fragments/extra.rs"]
+mod extra;
 #[path = "fragments/folds.rs"]
 mod folds;
 #[path = "fragments/hits.rs"]
 mod hits;
+#[path = "fragments/inline_effects.rs"]
+mod inline_effects;
 #[path = "fragments/place.rs"]
 mod place;
 #[path = "fragments/probe.rs"]
 mod probe;
+#[path = "fragments/snapped.rs"]
+mod snapped;
+#[path = "fragments/spaces.rs"]
+mod spaces;

@@ -27,6 +27,7 @@ pub fn registered() -> Vec<Registration> {
         crate::lower::clip::REGISTERED,
         crate::lower::filter::REGISTERED,
         crate::lower::outline::REGISTERED,
+        crate::lower::scrollbar::REGISTERED,
         crate::lower::shadow::REGISTERED,
         crate::lower::transform::REGISTERED,
         crate::emit::text::REGISTERED,

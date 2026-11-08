@@ -133,7 +133,7 @@ pub struct DevTools {
     /// How long each of the last few frames took, in microseconds, oldest first.
     ///
     /// One number per frame rather than one per stage: the strip beside it says where a frame's
-    /// time went, and this says which frames were the expensive ones — a spike is invisible in a
+    /// time went, and this says which frames were the expensive ones — one slow frame is invisible in a
     /// breakdown of the frame that happens to be showing.
     pub(crate) history: RwSignal<Vec<f64>, LocalStorage>,
     /// How wide the docked panel is, in CSS pixels.

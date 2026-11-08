@@ -177,6 +177,20 @@ impl Stage {
         self.harness.settle(64);
     }
 
+    /// Tells the window it now shows `scale` device pixels per CSS pixel, as a compositor does.
+    #[allow(dead_code, reason = "not every fixture changes the scale")]
+    pub fn rescale(&mut self, scale: f64) {
+        self.harness
+            .deliver_to_first(SurfaceEvent::ScaleFactorChanged {
+                scale_factor: scale,
+                size: Size::new(
+                    DevicePx((f64::from(WIDTH) * scale) as f32),
+                    DevicePx((f64::from(HEIGHT) * scale) as f32),
+                ),
+            });
+        self.harness.settle(64);
+    }
+
     /// Makes the window draw a complete picture, and waits for it.
     ///
     /// A window repaints the rectangles it damaged and nothing else, so the display list of an
@@ -188,11 +202,39 @@ impl Stage {
     /// A surface that comes back from being hidden owes a full redraw, because nothing observed
     /// what the compositor did to it while it was away. That is the event asked for here: it is one
     /// a real desktop sends, it costs one frame, and what it produces is the whole window.
+    ///
+    /// The window paces that redraw as it paces a configure: when the last full redraw ran at the
+    /// same moment, the redraw waits for its deadline. The clock moves on one output frame at a
+    /// time until the redraw ran.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the window draws nothing after a few output frames.
     pub fn repaint(&mut self) {
+        let before = self.frames_drawn();
         self.harness.deliver_to_first(SurfaceEvent::Occluded(true));
         self.harness.settle(64);
         self.harness.deliver_to_first(SurfaceEvent::Occluded(false));
         self.harness.settle(64);
+        for _ in 0..4 {
+            if self.frames_drawn() > before {
+                return;
+            }
+            self.harness.advance(TICK);
+            self.harness.settle(64);
+        }
+        assert!(
+            self.frames_drawn() > before,
+            "the window did not redraw after it was shown again"
+        );
+    }
+
+    /// How many frames the device drew.
+    fn frames_drawn(&self) -> usize {
+        self.log
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .len()
     }
 
     /// Moves the pointer to `at`, in device pixels, and lets the frames that asks for run.
@@ -263,6 +305,26 @@ impl Stage {
                 position: self.pointer,
                 delta: zgui::vocab::ScrollDelta::Lines { x: 0.0, y: lines },
                 phase: zgui::vocab::ScrollPhase::Discrete,
+            },
+            modifiers: Modifiers::NONE,
+            timestamp: Timestamp::ORIGIN,
+        });
+        self.harness.advance(TICK);
+        self.harness.pump();
+    }
+
+    /// Delivers one touchpad movement of `pixels` CSS pixels down and runs exactly one frame.
+    ///
+    /// A pixel delta is applied in the frame it arrives in, so each call is one frame of scroll.
+    #[allow(dead_code, reason = "not every fixture scrolls by pixels")]
+    pub fn touchpad_step(&mut self, pixels: f32) {
+        self.harness.deliver_to_first(SurfaceEvent::Wheel {
+            event: zgui::vocab::WheelEvent {
+                id: zgui::vocab::PointerId::MOUSE,
+                kind: zgui::vocab::PointerKind::Mouse,
+                position: self.pointer,
+                delta: zgui::vocab::ScrollDelta::Pixels(Size::new(CssPx(0.0), CssPx(pixels))),
+                phase: zgui::vocab::ScrollPhase::Moved,
             },
             modifiers: Modifiers::NONE,
             timestamp: Timestamp::ORIGIN,
@@ -415,6 +477,28 @@ impl Stage {
         })
     }
 
+    /// Every shape the most recent frame's display list held inside `rect`, in painting order.
+    ///
+    /// The shapes of a drawing, whatever route the display list gave it: a vector item, a mark
+    /// item, a coverage sprite or a quad. The quads that are an element's background or border are
+    /// left out. See [`Frame::shapes_in`](crate::device::frame::Frame::shapes_in).
+    ///
+    /// # Panics
+    ///
+    /// Panics when nothing has been drawn yet.
+    pub fn shapes_in(
+        &self,
+        rect: zgui::geom::Rect<DevicePx, Device>,
+    ) -> Vec<crate::device::frame::Drawing> {
+        let boxes: Vec<_> = self
+            .census()
+            .nodes
+            .iter()
+            .filter_map(|node| node.rect)
+            .collect();
+        self.drawn(|frame| frame.shapes_in(rect, &boxes))
+    }
+
     /// Every glyph the most recent frame's display list held inside `rect`, in painting order.
     ///
     /// # Panics
@@ -453,6 +537,15 @@ impl Stage {
             return;
         }
         self.drawn(|frame| crate::device::shot::whole(&frame.pixels, name))
+            .expect("the picture was written");
+    }
+
+    /// Writes the composed target out as a picture, when a run asked for one.
+    pub fn capture_composed(&self, name: &str) {
+        if crate::device::shot::directory().is_none() {
+            return;
+        }
+        self.drawn(|frame| crate::device::shot::whole(&frame.composed, name))
             .expect("the picture was written");
     }
 
@@ -503,6 +596,33 @@ impl Stage {
             for y in top..bottom {
                 for x in left..right {
                     let [red, green, blue, _] = frame.pixels.rgba(x, y);
+                    colours.push((red, green, blue));
+                }
+            }
+            colours
+        })
+    }
+
+    /// The colours inside `rect` on the composed target after the most recent frame that drew.
+    ///
+    /// The composed target is persistent, so a frame that repainted one control still shows
+    /// every other control as the frame before it left it — which is what a surface shows.
+    pub fn composed_colours_in(
+        &self,
+        rect: zgui::geom::Rect<DevicePx, Device>,
+    ) -> Vec<(u8, u8, u8)> {
+        self.drawn(|frame| {
+            let size = frame.composed.size();
+            let left = (rect.origin.x.0.floor() as i32).clamp(0, size.width.saturating_sub(1));
+            let top = (rect.origin.y.0.floor() as i32).clamp(0, size.height.saturating_sub(1));
+            let right =
+                ((rect.origin.x.0 + rect.size.width.0).ceil() as i32).clamp(left, size.width);
+            let bottom =
+                ((rect.origin.y.0 + rect.size.height.0).ceil() as i32).clamp(top, size.height);
+            let mut colours = Vec::new();
+            for y in top..bottom {
+                for x in left..right {
+                    let [red, green, blue, _] = frame.composed.rgba(x, y);
                     colours.push((red, green, blue));
                 }
             }

@@ -57,6 +57,8 @@ pub struct StyleEngine {
     deps: StyleDependencies,
     /// Each element's text keys, as of its last restyle.
     texts: TextKeyStore,
+    /// The elements whose computed style read a viewport unit, as of their last restyle.
+    unit_readers: crate::device::viewport::UnitReaders,
     /// The root-relative quantities units resolve against.
     root_metrics: stylist::RootMetrics,
     /// The text colours that changed in the last restyle.
@@ -67,12 +69,23 @@ pub struct StyleEngine {
     /// between two cascade results — and reads it, and because it has to survive the frame that
     /// created it.
     animations: Animations,
-    /// Whether some element is waiting for the animation-only traversal.
+    /// The elements marked for the animation-only traversal since the last restyle.
     ///
     /// The traversal that services those elements is a second, separate descent that no other
     /// input asks for, so a frame that would otherwise have nothing to do still has to run it —
     /// and a frame that has nothing waiting must not, because the descent is not free.
-    animation_restyle_owed: bool,
+    animation_marks: Vec<zgui_dom::NodeKey>,
+    /// Marked elements that were out of the document when a restyle ran.
+    ///
+    /// Each keeps its hint until a restyle finds it in the document again.
+    animation_waiting: Vec<zgui_dom::NodeKey>,
+    /// The elements whose animations the last restyle gave new keyframe values.
+    refreshed_animations: Vec<zgui_dom::NodeIndex>,
+    /// What each rule chain reads and declares, kept from one restyle to the next.
+    refs: crate::driver::traversal::RefsCache,
+    /// The computed styles earlier cascades produced, by rule chain, kept from one restyle to the
+    /// next.
+    shared: crate::driver::share::SharedStyles,
     /// The user-agent sheet, held so that it stays installed.
     _user_agent: SheetHandle,
 }
@@ -114,10 +127,15 @@ impl StyleEngine {
             sheets,
             deps: StyleDependencies::unusable(),
             texts: TextKeyStore::new(),
+            unit_readers: crate::device::viewport::UnitReaders::default(),
             root_metrics: stylist::RootMetrics::default(),
             text_paint_updates: Vec::new(),
             animations: Animations::new(),
-            animation_restyle_owed: false,
+            animation_marks: Vec::new(),
+            animation_waiting: Vec::new(),
+            refreshed_animations: Vec::new(),
+            refs: crate::driver::traversal::RefsCache::default(),
+            shared: crate::driver::share::SharedStyles::default(),
             _user_agent: user_agent,
         }
     }
@@ -125,6 +143,12 @@ impl StyleEngine {
     /// The animations and transitions this document is running.
     pub fn animations(&self) -> &Animations {
         &self.animations
+    }
+
+    /// The animations this document is running, to change how they are applied.
+    #[cfg(test)]
+    pub(crate) fn animations_mut(&mut self) -> &mut Animations {
+        &mut self.animations
     }
 
     /// The surface the current device was built for.
@@ -141,12 +165,24 @@ impl StyleEngine {
             &mut self.stylist,
             &self.lock,
             document,
+            &mut self.unit_readers,
             &self.metrics,
             self.viewport,
             next,
         );
         self.viewport = next;
         epoch
+    }
+
+    /// Marks the author rules as changed, so the next restyle matches the whole document again.
+    ///
+    /// A sheet that arrives while the document is being built reaches the rule set after the
+    /// elements it styles are already in the tree. This tells the rule set to re-collect, which
+    /// is what carries the new rules to elements that are already there.
+    pub fn force_author_rules_dirty(&mut self) {
+        use style::stylesheets::OriginSet;
+        self.stylist
+            .force_stylesheet_origins_dirty(OriginSet::ORIGIN_AUTHOR);
     }
 
     /// Whether the installed sheets have changed since the last restyle.
@@ -187,7 +223,7 @@ impl StyleEngine {
 
     /// Whether a restyle would do anything this frame.
     pub fn needs_restyle(&mut self, document: &Document) -> bool {
-        self.animation_restyle_owed
+        !self.animation_marks.is_empty()
             || driver::document_owes_restyle(document)
             || self.sheets_have_changed()
     }
@@ -200,6 +236,14 @@ impl StyleEngine {
     /// again.
     pub fn text_paint_updates(&self) -> &[TextPaintUpdate] {
         &self.text_paint_updates
+    }
+
+    /// The elements whose animations the last restyle gave new keyframe values.
+    ///
+    /// A custom property that a `@keyframes` rule reads moved under a running or filling
+    /// animation. The next animation tick reads the new values, so the frame loop must run one.
+    pub fn refreshed_animations(&self) -> &[zgui_dom::NodeIndex] {
+        &self.refreshed_animations
     }
 
     /// Installs a sheet at the end of `origin`'s sheets.

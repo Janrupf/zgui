@@ -67,6 +67,7 @@
 //! the transform, the alpha folded in from the groups above — is applied to an effect too, so an
 //! effect cannot draw outside the box it was given.
 
+#![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
 // The root a `shader!` expansion names its crates through, so an application that declares an

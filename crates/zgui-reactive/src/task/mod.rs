@@ -70,7 +70,9 @@ pub use ui::{Ui, ui};
 pub(crate) use ui::drain as drain_ui_queue;
 
 use crate::executor::assert_ui_thread;
-use crate::task::cancel::{Cancel, Cancellable};
+use crate::task::cancel::Cancel;
+
+pub(crate) use crate::task::cancel::Cancellable;
 
 /// A running task, and the way to stop it before it finishes.
 ///
@@ -162,8 +164,8 @@ pub fn spawn_detached(future: impl Future<Output = ()> + 'static) {
 
 /// Hands a wrapped task to this thread's pool.
 fn push(task: Rc<Cancel>, at: &'static Location<'static>) {
-    crate::executor::pool::note_spawn_location(at);
-    any_spawner::Executor::spawn_local(Box::pin(Cancellable::new(task)));
+    let body = crate::executor::pool::Body::Task(Cancellable::new(Rc::clone(&task)));
+    task.set_key(crate::executor::pool::spawn(body, Some(at)));
 }
 
 #[cfg(test)]
@@ -219,6 +221,69 @@ mod tests {
             dropped.get(),
             "and released what it captured inside `unmount`, not a frame later"
         );
+    }
+
+    #[test]
+    fn an_unmount_frees_the_pool_slots_of_its_tasks_and_asks_for_no_frame() {
+        let waker = runtime();
+        let node = Mounted::new();
+        let polls = StdRc::new(Cell::new(0));
+
+        node.with(|| {
+            for _ in 0..100 {
+                let polls = StdRc::clone(&polls);
+                spawn_local(std::future::poll_fn(move |_| {
+                    polls.set(polls.get() + 1);
+                    std::task::Poll::<()>::Pending
+                }));
+            }
+        });
+        flush();
+        assert_eq!(polls.get(), 100);
+        assert_eq!(crate::executor::pool::live(), 100);
+        waker.take();
+
+        node.unmount();
+        assert_eq!(
+            crate::executor::pool::live(),
+            0,
+            "the unmount freed every slot inside `unmount`"
+        );
+        assert_eq!(waker.take(), 0, "and woke nothing");
+
+        let outcome = flush();
+        assert_eq!(polls.get(), 100, "the next flush polled none of them");
+        assert!(!outcome.needs_another_frame);
+    }
+
+    #[test]
+    fn a_task_that_cancels_itself_finishes_its_poll_and_leaves_the_pool() {
+        let _waker = runtime();
+        let owner = Owner::new();
+        let handle = StdRc::new(Cell::new(None::<Task>));
+        let dropped = StdRc::new(Cell::new(false));
+
+        let task = owner.with(|| {
+            let handle = StdRc::clone(&handle);
+            let witness = Witness(StdRc::clone(&dropped));
+            spawn_local(async move {
+                let _held = witness;
+                if let Some(task) = handle.take() {
+                    task.cancel();
+                }
+                std::future::pending::<()>().await;
+            })
+        });
+        handle.set(Some(task.clone()));
+
+        flush();
+        assert!(task.is_finished());
+        assert!(
+            dropped.get(),
+            "the captures went with the poll that cancelled"
+        );
+        assert_eq!(crate::executor::pool::live(), 0, "and the slot with them");
+        owner.cleanup();
     }
 
     #[test]
@@ -288,11 +353,18 @@ mod tests {
         let waker = runtime();
         let node = Mounted::new();
         let done = StdRc::new(Cell::new(false));
+        // Holds the worker until the wakes before it have been cleared, so its own wake cannot be
+        // cleared with them.
+        let (go, gate) = std::sync::mpsc::channel::<()>();
 
         node.with(|| {
             let done = StdRc::clone(&done);
             spawn_local(async move {
-                let value = background(async { 6 * 7 }).await;
+                let value = background(async move {
+                    gate.recv().ok();
+                    6 * 7
+                })
+                .await;
                 done.set(value == 42);
             });
         });
@@ -300,12 +372,13 @@ mod tests {
         // The first flush starts the background work and parks on the oneshot.
         flush();
         waker.take();
+        go.send(()).expect("the worker is waiting");
 
-        // Wait for the worker without spinning the reactive runtime.
-        let mut frames = 0;
-        while waker.count() == 0 && frames < 1_000 {
-            std::thread::yield_now();
-            frames += 1;
+        // Wait for the worker without spinning the reactive runtime. The deadline only stops a
+        // broken wake from hanging the suite; a loaded machine can take far longer than one yield.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while waker.count() == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert_eq!(waker.take(), 1, "the finished worker asked for one frame");
 

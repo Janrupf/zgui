@@ -77,11 +77,16 @@ pub struct DocumentDom {
     /// makes its box a replaced box before any content exists for it. The list is the backend's
     /// because the vocabulary is: the document neither knows nor cares what an `image` is.
     replaced_tags: RefCell<Vec<ElementName>>,
-    /// Who is told when an attribute of a replaced element changes.
+    /// The element names whose attribute changes reach the attribute hook.
+    ///
+    /// Every replaced name, and the names added with
+    /// [`watch_attributes_of`](DocumentDom::watch_attributes_of).
+    watched_tags: RefCell<Vec<ElementName>>,
+    /// Who is told when an attribute of a watched element changes.
     ///
     /// The document stores the attribute either way; this is how the owner of the *content* — an
     /// image loader, an embedded renderer's host — hears that `src` moved without polling every
-    /// node every frame. It fires only for elements whose name is in `replaced_tags`, after the
+    /// node every frame. It fires only for elements whose name is in `watched_tags`, after the
     /// write has landed, outside the edit batch.
     attribute_hook: RefCell<Option<AttributeHook>>,
 }
@@ -122,6 +127,10 @@ impl DocumentDom {
                 ElementName::new("image"),
                 ElementName::new("surface"),
             ]),
+            watched_tags: RefCell::new(vec![
+                ElementName::new("image"),
+                ElementName::new("surface"),
+            ]),
             attribute_hook: RefCell::new(None),
         }
     }
@@ -135,9 +144,22 @@ impl DocumentDom {
         if !tags.contains(&name) {
             tags.push(name);
         }
+        drop(tags);
+        self.watch_attributes_of(name);
     }
 
-    /// Installs the listener for attribute changes on replaced elements.
+    /// Adds `name` to the element names whose attribute changes reach the attribute hook.
+    ///
+    /// Replaced names are watched from the start. This adds a name whose content stays in the
+    /// document, such as an editable element with an attribute that changes how it shows its text.
+    pub fn watch_attributes_of(&self, name: ElementName) {
+        let mut tags = self.watched_tags.borrow_mut();
+        if !tags.contains(&name) {
+            tags.push(name);
+        }
+    }
+
+    /// Installs the listener for attribute changes on watched elements.
     ///
     /// One slot, because one consumer owns the question: the runtime multiplexes from there. See
     /// [`AttributeHook`] for what the hook may and may not do.
@@ -150,7 +172,7 @@ impl DocumentDom {
         self.replaced_tags.borrow().contains(name)
     }
 
-    /// Fires the attribute hook for `index`, if one is installed and the element is replaced.
+    /// Fires the attribute hook for `index`, if one is installed and the element is watched.
     ///
     /// Called after the edit batch that wrote the attribute has closed, so the hook reads the
     /// document as it will be styled and laid out.
@@ -161,7 +183,8 @@ impl DocumentDom {
         let key = {
             let document = self.document.borrow();
             let record = document.store().core(index);
-            if !self.is_replaced_tag(&record.local_name().to_interned()) {
+            let local = record.local_name().to_interned();
+            if !self.watched_tags.borrow().contains(&local) {
                 return;
             }
             document.store().key_of(index)
@@ -278,6 +301,22 @@ impl DocumentDom {
             .borrow()
             .edit(filter.as_ref(), body)
             .expect("the document has not been poisoned")
+    }
+
+    /// Runs `body` as a batch of changes on the document, unless the document is poisoned.
+    ///
+    /// For the changes a teardown makes: taking a node out and taking a listener off. A batch
+    /// that panicked has already been reported, and the scopes it leaves behind still dispose of
+    /// their views on the way out. Each of those removals finds a document that accepts nothing,
+    /// and a second panic from inside a cleanup aborts the process before the first report is
+    /// read. A teardown on a poisoned document therefore changes nothing and returns None.
+    pub(crate) fn edit_unless_poisoned<R>(
+        &self,
+        body: impl FnOnce(&mut zgui_dom::Edit<'_>) -> R,
+    ) -> Option<R> {
+        self.revision.set(self.revision.get().wrapping_add(1));
+        let filter = Rc::clone(&self.filter.borrow());
+        self.document.borrow().edit(filter.as_ref(), body).ok()
     }
 
     /// The handlers, for the methods that add and remove them.

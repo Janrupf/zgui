@@ -4,6 +4,9 @@ use zgui::prelude::*;
 use zgui::view::CustomPropertyName;
 use zgui::{component, view};
 
+use crate::chart::SHEET;
+use crate::chart::style::ChartStyle;
+
 use crate::chart::scale::tick_label;
 
 /// What the swatch beside a name is drawn as.
@@ -99,6 +102,7 @@ pub fn ChartTooltipContent(
     #[prop(attrs)]
     attrs: Attrs,
 ) -> impl IntoView {
+    install_stylesheet(SHEET, ChartStyle::CSS);
     let heading = (!hide_label)
         .then_some(label)
         .flatten()

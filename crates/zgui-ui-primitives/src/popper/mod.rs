@@ -4,13 +4,14 @@ mod placement;
 mod scale;
 mod solve;
 
+use zgui::geom::{DevicePx, Point};
 use zgui::prelude::*;
-use zgui::reactive::{LocalStorage, RenderEffect, RwSignal};
+use zgui::reactive::{LocalStorage, Memo, RenderEffect, RwSignal};
 use zgui::{component, view};
 
 pub use crate::popper::placement::{Align, Placement, Side};
 use crate::popper::scale::Density;
-pub use crate::popper::solve::{PopperOptions, Solution, WindowRect, solve};
+pub use crate::popper::solve::{PopperOptions, Solution, WindowRect, anchor_point, solve};
 
 /// Places its children against an anchor, and keeps them inside the window.
 ///
@@ -50,6 +51,28 @@ pub use crate::popper::solve::{PopperOptions, Solution, WindowRect, solve};
 /// ```text
 /// .popover[data-side="top"]    { animation: slide-up 180ms }
 /// .popover[data-side="bottom"] { animation: slide-down 180ms }
+/// ```
+///
+/// `--zui-popper-anchor-width` carries the anchor's own width in CSS pixels, so a surface that
+/// has to be as wide as the control it belongs to says so in the sheet:
+///
+/// ```text
+/// .select__list { width: var(--zui-popper-anchor-width); }
+/// ```
+///
+/// `--zui-popper-available-width` and `--zui-popper-available-height` carry the largest size the
+/// surface can have and stay inside the window, in whole CSS pixels. A surface that can scroll caps
+/// itself with them, and solving again from the capped size moves nothing:
+///
+/// ```text
+/// .menu { max-height: var(--zui-popper-available-height); overflow-y: auto; }
+/// ```
+///
+/// `--zui-popper-anchor-x` and `--zui-popper-anchor-y` carry the centre of the anchor, measured
+/// from the corner of the surface and held inside it. An arrow points at the anchor from these:
+///
+/// ```text
+/// .tooltip__arrow { left: var(--zui-popper-anchor-x, 50%); }
 /// ```
 ///
 /// # Two kinds of pixel
@@ -156,7 +179,8 @@ pub fn Popper(
     let viewport =
         Signal::derive_local(move || window_box.get().and_then(|observed| observed.get()));
 
-    let solution = Signal::derive_local(move || {
+    // A memo, so the seven readers below share one solve per change rather than one each.
+    let solution = Memo::new(move |_| {
         // A surface that is not showing has no placement, and asking for one would be asking for
         // the measurements it has deliberately stopped watching.
         if !active.get() {
@@ -213,6 +237,42 @@ pub fn Popper(
     // measurement is what decides where it goes. `visibility` keeps the box and its layout and
     // takes it out of the paint, which is exactly the state a surface being placed is in.
     let visibility = move || solution.get().is_none().then(|| "hidden".to_owned());
+    // The anchor's own width, in the CSS pixels a style sheet reads. A surface that has to be
+    // exactly as wide as the control it belongs to — a select's list, a combo box's list — takes
+    // its width from here and stays right through a resize.
+    let anchor_width = move || {
+        let density = Density::reported(positioner.scale());
+        anchor_box
+            .get()
+            .map(|rect| px(density.css(rect.size.width.0.round())))
+    };
+    // The centre of the anchor, measured from the corner of the surface as it is drawn.
+    let anchor_center = Signal::derive_local(move || {
+        let solved = solution.get()?;
+        let anchor = anchor_box.get()?;
+        let density = Density::reported(positioner.scale());
+        let corner = Point::new(
+            DevicePx(solved.origin.x.0.round()),
+            DevicePx(solved.origin.y.0.round()),
+        );
+        let point = anchor_point(anchor, corner, floating_size.get());
+        Some((
+            density.css(point.x.0.round()),
+            density.css(point.y.0.round()),
+        ))
+    });
+    // The room left in the window, rounded down to a whole CSS pixel so that a surface capped to it
+    // is never a fraction of a pixel too tall to fit.
+    let available = move |of: fn(&Solution) -> f32| {
+        let density = Density::reported(positioner.scale());
+        solution
+            .get()
+            .map(|solved| px(density.css(of(&solved)).floor()))
+    };
+    let available_width = move || available(|solved| solved.available.width.0);
+    let available_height = move || available(|solved| solved.available.height.0);
+    let anchor_x = move || anchor_center.get().map(|(x, _)| px(x));
+    let anchor_y = move || anchor_center.get().map(|(_, y)| px(y));
     let side = move || {
         solution
             .get()
@@ -232,6 +292,11 @@ pub fn Popper(
             style:left = left,
             style:top = top,
             style:visibility = visibility,
+            style:--zui-popper-anchor-width = anchor_width,
+            style:--zui-popper-available-width = available_width,
+            style:--zui-popper-available-height = available_height,
+            style:--zui-popper-anchor-x = anchor_x,
+            style:--zui-popper-anchor-y = anchor_y,
             attr:data-side = side,
             attr:data-align = align
         ) {

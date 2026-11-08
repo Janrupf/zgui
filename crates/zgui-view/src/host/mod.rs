@@ -102,6 +102,10 @@ pub trait ViewHost {
     ///
     /// The scroll happens in the frame this schedules, not before this call returns, so reading
     /// [`ViewHost::scroll_position`] immediately afterwards still reports the old offset.
+    ///
+    /// The scroll is carried out after that frame's layout pass. It therefore measures the layout
+    /// that holds whatever the same reactive flush added, such as a new last row. A
+    /// [`ViewHost::freeze_scrolling`] asked for in the same flush applies first.
     fn scroll_to(&self, node: NodeId, target: ScrollTarget, behavior: ScrollBehavior);
 
     /// Stops, or lets go of, this window's own scrolling.
@@ -188,6 +192,16 @@ pub trait ViewHost {
 
     /// Removes a registration. Removing one that was never made does nothing.
     fn remove_window_shortcut(&self, node: NodeId);
+
+    /// Whether this node is one a person types into.
+    ///
+    /// The kind of element alone. A disabled or read-only field answers true, because the
+    /// question an application-wide chord asks is where the keyboard is, and a key that carries
+    /// no modifier belongs to a text element wherever that element is in the document.
+    ///
+    /// Reach for [`focus_is_text_entry`](crate::focus_is_text_entry) to ask it of whatever holds
+    /// focus.
+    fn is_text_entry(&self, node: NodeId) -> bool;
 
     /// The selection in this editable node, in document offsets.
     fn selection(&self, node: NodeId) -> Option<Range<usize>>;

@@ -32,12 +32,22 @@ impl Window {
     /// Computes this frame's caret and selection, and damages whatever that moved.
     pub(crate) fn plan_caret(&mut self, now: Instant) {
         let (plan, drawn) = self.caret_plan(now);
-        for rect in self.carets.install(plan, drawn) {
+        // The marks the last frame drew come first in what is owed. They are pixels of the drawn
+        // frame and the rest are this frame's, which tells a scroll that moves composed pixels
+        // which of the two to move.
+        let drawn_before = self.carets.drawn().len();
+        let owed = self.carets.install(plan, drawn);
+        for (index, rect) in owed.into_iter().enumerate() {
             if rect.is_empty() {
                 continue;
             }
-            self.damage
-                .absorb(zgui_layout::fragment::diff::pixels(rect));
+            let rect = zgui_layout::fragment::diff::pixels(rect);
+            self.damage.absorb(rect);
+            if index < drawn_before {
+                self.damage_before_layout.absorb(rect);
+            } else {
+                self.damage_after_layout.absorb(rect);
+            }
         }
         // Where an input method should put its candidate window is a reading of the plan that was
         // just installed, so it is answered here rather than where the caret was asked to move.
@@ -54,12 +64,15 @@ impl Window {
             return (Plan::empty(), Vec::new());
         };
         let document = self.document.borrow();
-        if !crate::editing::Editors::is_editable(&document, node) {
+        if !crate::editing::Editors::is_selectable(&document, node) {
             return (Plan::empty(), Vec::new());
         }
+        // A read-only element draws its selection and no caret.
+        let editable = crate::editing::Editors::is_editable(&document, node);
         // The model's own selection, not the record beside it: the record is a byte range and has
         // forgotten which end the caret is at and which of the two places a boundary offset means.
-        let Some(selection) = self.editors.selection(node) else {
+        // In the offsets of the text the document holds, which are the bullets of a secure field.
+        let Some(selection) = self.editors.shown_selection(node) else {
             return (Plan::empty(), Vec::new());
         };
         let layout = self.layout.borrow();
@@ -79,7 +92,7 @@ impl Window {
             selection,
             color,
             self.scale,
-            self.carets.blink().is_visible(now),
+            editable && self.carets.blink().is_visible(now),
         );
         let drawn = self.absolute_rects(&layout, box_, &plan);
         (plan, drawn)
@@ -112,7 +125,7 @@ impl Window {
                 continue;
             };
             out.extend(
-                plan.rects_of(paragraph, line, fragment.border_box.origin)
+                plan.rects_of(fragment.box_, paragraph, line, fragment.border_box.origin)
                     .into_iter()
                     .map(|rect| {
                         zgui_layout::fragment::transform::placed::onto_device(
@@ -161,7 +174,7 @@ impl Window {
                 continue;
             };
             if let Some(rect) = plan
-                .rects_of(paragraph, line, fragment.border_box.origin)
+                .rects_of(fragment.box_, paragraph, line, fragment.border_box.origin)
                 .last()
             {
                 return Some(zgui_layout::fragment::transform::placed::onto_device(
@@ -186,7 +199,8 @@ impl Window {
     ) -> Option<(usize, zgui_edit::Affinity)> {
         let layout = self.layout.borrow();
         let located = Located::of(&layout, &self.text, node)?;
-        located.hit(point, &self.scene.spatial)
+        let (shown, affinity) = located.hit(point, &self.scene.spatial)?;
+        Some((self.editors.to_model(node, shown), affinity))
     }
 
     /// The paragraph an editable element's lines belong to, for a caller inspecting the plan.

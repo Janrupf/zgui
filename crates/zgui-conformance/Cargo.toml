@@ -3,6 +3,9 @@ name = "zgui-conformance"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "CSS property coverage report for zgui, backed by tests"
+repository.workspace = true
+homepage.workspace = true
 # Never published: this is the instrument the framework is measured with, not part of it.
 publish = false
 

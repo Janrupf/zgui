@@ -77,7 +77,7 @@ impl RovingContext {
             return false;
         };
         self.active.try_set(Some(next.id()));
-        next.focus();
+        next.focus_and_reveal();
         true
     }
 
@@ -87,7 +87,7 @@ impl RovingContext {
             return false;
         };
         self.active.try_set(Some(target.id()));
-        target.focus();
+        target.focus_and_reveal();
         true
     }
 

@@ -69,7 +69,7 @@ impl Classes {
     /// This list with `other`'s names appended, skipping any that are already present.
     ///
     /// `other` is anything a class list can be made from, and the conversion happens here. A
-    /// [`view!`](zgui_view_macro::view) expansion merges whatever a caller wrote — a literal from
+    /// `view!` expansion merges whatever a caller wrote — a literal from
     /// the component, a list from the caller — and only the caller's own types say which side needs
     /// converting. Converting in the expansion instead would make every caller who already held a
     /// list pay for a conversion the macro could not know was unnecessary.

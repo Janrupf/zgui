@@ -74,7 +74,8 @@ pub fn DialogTrigger(
 ///
 /// The reason it exists rather than a callback the caller writes: a dialog's "Cancel" sits in the
 /// footer, three components below the root that owns whether the dialog is open, and threading a
-/// setter down to it is a prop on every component in between.
+/// setter down to it is a prop on every component in between. A caller's `on:click` runs before
+/// it closes.
 ///
 /// ```
 /// # use zgui::prelude::*;
@@ -101,6 +102,9 @@ pub fn DialogClose(
     /// How big it is.
     #[prop(default = ButtonSize::Md)]
     size: ButtonSize,
+    /// Whether it can be pressed. A disabled control does not close the dialog.
+    #[prop(into, default = Signal::stored_local(false))]
+    disabled: Signal<bool, LocalStorage>,
     /// Classes merged after the button's own.
     #[prop(into, optional)]
     class: Classes,
@@ -115,12 +119,16 @@ pub fn DialogClose(
         Button(
             variant = variant,
             size = size,
+            disabled = disabled,
+            {..attrs},
             on:click = move |_| {
+                if disabled.get_untracked() {
+                    return;
+                }
                 if let Some(state) = state {
                     state.close();
                 }
             },
-            {..attrs},
             class = class
         ) {
             {children.into_view_once()}

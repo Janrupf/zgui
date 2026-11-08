@@ -136,6 +136,8 @@ pub mod prelude;
 
 pub use crate::app::{App, app};
 pub use crate::error::Error;
+/// How precisely the default renderer holds a plain group, see [`App::with_group_precision`].
+pub use zgui_render_wgpu::GroupPrecision;
 
 /// A view written as nested calls, a component written as a function, and the styling macros.
 pub use zgui_view_macro::{component, css, slot, style, variants, view};
@@ -156,6 +158,12 @@ pub use zgui_canvas as canvas;
 pub use zgui_custom as custom;
 /// The element vocabulary, as builders.
 pub use zgui_elements as elements;
+/// What an application has outside its windows: the application menu, the request to show it
+/// again, and its exit.
+pub mod desktop {
+    pub use zgui_platform::{AppMenu, MenuAction, MenuEntry, MenuId, MenuRole, Shortcut, Submenu};
+    pub use zgui_runtime::desktop::{AppHookGuard, on_exit, on_menu, on_reopen};
+}
 /// The pixel spaces and the geometry every stage agrees in.
 pub use zgui_geom as geom;
 /// The windowing contract every platform backend implements.

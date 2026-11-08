@@ -23,7 +23,7 @@ pub struct Canary {
     /// An accessibility role, from the pure-data accessibility vocabulary.
     pub role: accesskit::Role,
     /// An outer display type, from the layout engine.
-    pub display: taffy::Display,
+    pub display: cephal::style::Display,
     /// A paragraph alignment, from the text layout engine.
     pub alignment: parley::Alignment,
     /// A stylesheet cascade origin, from the style engine, whose library is named `style`.
@@ -45,7 +45,7 @@ impl Canary {
             scene: vello::Scene::new(),
             backends: wgpu::Backends::VULKAN,
             role: accesskit::Role::Button,
-            display: taffy::Display::Block,
+            display: cephal::style::Display::Block,
             alignment: parley::Alignment::Start,
             origin: style::stylesheets::Origin::UserAgent,
             window: winit::window::WindowAttributes::default(),
@@ -53,6 +53,13 @@ impl Canary {
         }
     }
 }
+
+/// The accessibility adapter of the windowing backend, from its glue crate. Named, never built:
+/// building one needs an event loop.
+pub type AccessAdapter = accesskit_winit::Adapter;
+
+/// A reactive store, from the store layer over the reactive graph.
+pub type Store<T> = reactive_stores::Store<T>;
 
 impl Default for Canary {
     fn default() -> Self {
@@ -67,6 +74,6 @@ mod tests {
     #[test]
     fn the_engine_stack_links() {
         let canary = Canary::new();
-        assert_eq!(canary.display, taffy::Display::Block);
+        assert_eq!(canary.display, cephal::style::Display::Block);
     }
 }

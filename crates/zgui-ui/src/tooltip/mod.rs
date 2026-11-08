@@ -2,12 +2,14 @@
 
 mod arrow;
 mod content;
+mod geom;
 mod provider;
 mod style;
 mod trigger;
 
 pub use crate::tooltip::arrow::{TooltipArrow, TooltipArrowProps};
 pub use crate::tooltip::content::{TooltipContent, TooltipContentProps};
+pub use crate::tooltip::geom::{ARROW_REACH, DEFAULT_OFFSET};
 pub use crate::tooltip::provider::{TooltipDelays, TooltipProvider, TooltipProviderProps};
 pub use crate::tooltip::style::TooltipStyle;
 pub use crate::tooltip::trigger::{TooltipTrigger, TooltipTriggerProps};
@@ -18,7 +20,7 @@ use zgui::prelude::*;
 use zgui::reactive::UnsyncCallback;
 use zgui::{component, view};
 
-use crate::overlay::{HoverIntent, OverlayState};
+use crate::overlay::{Handoff, HoverIntent, OverlayState};
 use zgui_ui_primitives::Binding;
 
 /// What the tooltip's rules are installed under.
@@ -106,6 +108,8 @@ pub fn Tooltip(
         .or_else(|| shared.map(TooltipDelays::close))
         .unwrap_or(DEFAULT_CLOSE_DELAY);
     let state = OverlayState::new(open, default_open, on_open_change).provide();
-    HoverIntent::new(state, delay, close_delay).provide();
+    HoverIntent::new(state, delay, close_delay)
+        .in_handoff(Handoff::current())
+        .provide();
     view! { {children.into_view_once()} }
 }

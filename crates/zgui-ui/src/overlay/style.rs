@@ -63,6 +63,7 @@ style! { pub OverlayStyle =>
         color: var(--zui-surface-ink, var(--zui-color-popover-foreground));
         box-shadow: var(--zui-surface-shadow, var(--zui-shadow-md));
         transform-origin: var(--zui-surface-origin-x, center) var(--zui-surface-origin-y, center);
+        transform: var(--zui-surface-place, none);
     }"
 
     // # How a surface enters and leaves
@@ -81,7 +82,9 @@ style! { pub OverlayStyle =>
     // reasons to carry a transform — the placement it owns, which for a dialog is the half of its
     // own size it pulls itself back by, and the entrance every surface shares — and a keyframe
     // that wrote `transform` outright would drop the first, hanging the dialog below and right of
-    // the centre by half its size for as long as the animation ran.
+    // the centre by half its size for as long as the animation ran. The resting rule above states
+    // the placement too, because an entrance of no length never starts and `animation: none` has no
+    // keyframes: in both, the resting transform is the one that applies.
     ".zui-surface {
         animation: zui-surface-enter var(--zui-surface-enter-duration, var(--zui-motion-duration-normal))
             var(--zui-surface-enter-ease, ease) both;
@@ -123,38 +126,38 @@ style! { pub OverlayStyle =>
     // the two in step without a line of Rust. It slides *towards* its trigger — a surface below the
     // trigger starts eight pixels high and settles down onto its place.
     //
-    // A descendant selector rather than a child one, because what is between the positioner and the
-    // surface depends on the surface: a popover confines focus and so has a scope element in the
-    // way, and a tooltip, which must not, has nothing. Nothing else can match, because a surface
-    // opened from inside this one is portalled onto its own band rather than nested here.
-    ".zui-overlay-positioner[data-side=\"bottom\"] .zui-surface { --zui-surface-enter-y: -8px; }"
-    ".zui-overlay-positioner[data-side=\"top\"] .zui-surface { --zui-surface-enter-y: 8px; }"
-    ".zui-overlay-positioner[data-side=\"left\"] .zui-surface { --zui-surface-enter-x: 8px; }"
-    ".zui-overlay-positioner[data-side=\"right\"] .zui-surface { --zui-surface-enter-x: -8px; }"
+    // The properties are declared on the positioner, and the surface inherits them. Thus any
+    // declaration on the surface itself wins, and a theme sets the offsets with `.zui-surface`
+    // alone. Nothing else inherits them, because a surface opened from inside this one is
+    // portalled onto its own band rather than nested here.
+    ".zui-overlay-positioner[data-side=\"bottom\"] { --zui-surface-enter-y: -8px; }"
+    ".zui-overlay-positioner[data-side=\"top\"] { --zui-surface-enter-y: 8px; }"
+    ".zui-overlay-positioner[data-side=\"left\"] { --zui-surface-enter-x: 8px; }"
+    ".zui-overlay-positioner[data-side=\"right\"] { --zui-surface-enter-x: -8px; }"
 
     // And what it grows *out of* is the corner nearest that trigger, so the zoom reads as the
     // surface unfolding from the control rather than swelling out of its own middle. The side
     // settles one axis and the alignment settles the other, which is why the alignment rules name
     // the side as well: for a surface below its trigger the alignment runs left to right, and for
     // one beside it the same word means top to bottom.
-    ".zui-overlay-positioner[data-side=\"bottom\"] .zui-surface { --zui-surface-origin-y: top; }"
-    ".zui-overlay-positioner[data-side=\"top\"] .zui-surface { --zui-surface-origin-y: bottom; }"
-    ".zui-overlay-positioner[data-side=\"left\"] .zui-surface { --zui-surface-origin-x: right; }"
-    ".zui-overlay-positioner[data-side=\"right\"] .zui-surface { --zui-surface-origin-x: left; }"
-    ".zui-overlay-positioner[data-side=\"top\"][data-align=\"start\"] .zui-surface,
-     .zui-overlay-positioner[data-side=\"bottom\"][data-align=\"start\"] .zui-surface {
+    ".zui-overlay-positioner[data-side=\"bottom\"] { --zui-surface-origin-y: top; }"
+    ".zui-overlay-positioner[data-side=\"top\"] { --zui-surface-origin-y: bottom; }"
+    ".zui-overlay-positioner[data-side=\"left\"] { --zui-surface-origin-x: right; }"
+    ".zui-overlay-positioner[data-side=\"right\"] { --zui-surface-origin-x: left; }"
+    ".zui-overlay-positioner[data-side=\"top\"][data-align=\"start\"],
+     .zui-overlay-positioner[data-side=\"bottom\"][data-align=\"start\"] {
         --zui-surface-origin-x: left;
     }"
-    ".zui-overlay-positioner[data-side=\"top\"][data-align=\"end\"] .zui-surface,
-     .zui-overlay-positioner[data-side=\"bottom\"][data-align=\"end\"] .zui-surface {
+    ".zui-overlay-positioner[data-side=\"top\"][data-align=\"end\"],
+     .zui-overlay-positioner[data-side=\"bottom\"][data-align=\"end\"] {
         --zui-surface-origin-x: right;
     }"
-    ".zui-overlay-positioner[data-side=\"left\"][data-align=\"start\"] .zui-surface,
-     .zui-overlay-positioner[data-side=\"right\"][data-align=\"start\"] .zui-surface {
+    ".zui-overlay-positioner[data-side=\"left\"][data-align=\"start\"],
+     .zui-overlay-positioner[data-side=\"right\"][data-align=\"start\"] {
         --zui-surface-origin-y: top;
     }"
-    ".zui-overlay-positioner[data-side=\"left\"][data-align=\"end\"] .zui-surface,
-     .zui-overlay-positioner[data-side=\"right\"][data-align=\"end\"] .zui-surface {
+    ".zui-overlay-positioner[data-side=\"left\"][data-align=\"end\"],
+     .zui-overlay-positioner[data-side=\"right\"][data-align=\"end\"] {
         --zui-surface-origin-y: bottom;
     }"
 

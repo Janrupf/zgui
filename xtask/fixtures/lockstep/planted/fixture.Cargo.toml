@@ -1,0 +1,10 @@
+# Fixture workspace for the lockstep check of `cargo xtask release`.
+[workspace]
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+
+# PLANTED VIOLATION: a path with no version, inherited by a published member.
+[workspace.dependencies]
+cephal = { path = "vendor/cephal", default-features = false }

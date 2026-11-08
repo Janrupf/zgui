@@ -137,6 +137,10 @@
 // list measures something no caller of this crate ever sees.
 #![allow(clippy::too_many_arguments)]
 
+// The style sheets read the token sheet's variables at run time and name no item of its crate.
+// The dependency keeps the two released together.
+use zgui_ui_tokens as _;
+
 pub mod accordion;
 pub mod alert;
 pub mod alert_dialog;
@@ -272,12 +276,12 @@ pub use crate::command::{
     CommandShortcutProps, CommandStyle,
 };
 pub use crate::context_menu::{
-    ContextMenu, ContextMenuContent, ContextMenuContentProps, ContextMenuProps, ContextMenuStyle,
-    ContextMenuTrigger, ContextMenuTriggerProps,
+    ContextMenu, ContextMenuContent, ContextMenuContentProps, ContextMenuPlace, ContextMenuProps,
+    ContextMenuStyle, ContextMenuTrigger, ContextMenuTriggerProps,
 };
 pub use crate::data_table::{
     CellOrder, CellText, Column, ColumnResizer, ColumnResizerProps, DataModel, DataTable,
-    DataTableProps, DataTableStyle, Page, RowId, RowMatch, SortState,
+    DataTableProps, DataTableStyle, GripEdge, Page, RowId, RowMatch, SortState,
 };
 pub use crate::date_picker::{DatePicker, DatePickerProps, DatePickerStyle};
 pub use crate::dialog::{

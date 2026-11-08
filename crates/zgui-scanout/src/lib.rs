@@ -21,10 +21,10 @@
 //!
 //! # Who waits
 //!
-//! [`Signalled`] is the answer, and the tiers are the point rather than an implementation detail. A
-//! copy that hands back a descriptor lets the **kernel** wait for it, so the commit that follows
-//! carries the wait and this program carries none. A copy that cannot is already finished by the
-//! time it answers, because the wait had to happen here. See [`Copier::copy`].
+//! [`Copier::begin`] starts a copy and waits for nothing, and [`Copier::finish`] is the wait —
+//! nothing may read the buffer written to until that has answered. A device that exported a fence
+//! descriptor could let the **kernel** carry the wait instead, by handing it to whatever the caller
+//! commits next. The hardware this was written against exports none, so the wait happens here.
 //!
 //! # Loading
 //!
@@ -39,12 +39,22 @@
 // starting on a machine that has neither.
 #![allow(unsafe_code)]
 
+// Every module here reaches EGL or libgbm over a file descriptor, and `std::os::fd` exists only on
+// a Unix host, so on any other platform this crate is empty and `cargo check --workspace` passes on
+// a machine this code could never run on. The same arrangement `zgui-drm` and `zgui-evdev` keep.
+#[cfg(target_os = "linux")]
 mod buffer;
+#[cfg(target_os = "linux")]
 mod copier;
+#[cfg(target_os = "linux")]
 mod error;
 
+#[cfg(target_os = "linux")]
 pub mod egl;
 
+#[cfg(target_os = "linux")]
 pub use crate::buffer::{Buffer, Rect};
+#[cfg(target_os = "linux")]
 pub use crate::copier::Copier;
+#[cfg(target_os = "linux")]
 pub use crate::error::Error;

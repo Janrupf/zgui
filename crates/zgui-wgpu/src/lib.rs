@@ -30,7 +30,11 @@
 //! producer share one device queue, so writes submitted before a present are ordered before the
 //! frame that samples them.
 
+#![deny(missing_docs)]
 #![forbid(unsafe_code)]
+// Proving a wgpu handle `Send` and `Sync` walks a type chain deeper than the default limit of 128,
+// which newer compilers report as a future error.
+#![recursion_limit = "256"]
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -705,11 +709,13 @@ impl WgpuSurfaces {
                 .first()
                 .and_then(|key| layout.fragments_of_box(*key).first().copied())
                 .and_then(|fragment| {
+                    // In device pixels, through the anchor, because the damage it owes is. This
+                    // keeps today's behaviour and ignores the element's own transform.
                     layout
                         .fragment(fragment)
-                        .map(|fragment| fragment.content_box)
+                        .map(|fragment| fragment.on_device(fragment.content_box(), cx.placements))
                 });
-            let ink = zgui_layout::fragment::index::ink_of(&layout, node);
+            let ink = zgui_layout::fragment::index::device_ink_of(&layout, node, cx.placements);
             (content_box, ink)
         };
         let size = content_box.map(|content_box| {

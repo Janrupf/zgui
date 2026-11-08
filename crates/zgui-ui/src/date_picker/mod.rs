@@ -119,8 +119,15 @@ pub fn DatePicker(
     let locale = Locale::current();
     let chosen = Controllable::new(value, default_value, on_change);
     let span = Controllable::new(range, default_range, on_range_change);
-    let state = OverlayState::new(open, false, on_open_change).provide();
-    let trigger = node_ref.unwrap_or_else(|| state.trigger());
+    let state = OverlayState::new(open, false, on_open_change);
+    // A caller's ref becomes the overlay's own handle, so the surface is anchored to the element
+    // the caller's ref binds.
+    let state = match node_ref {
+        Some(trigger) => state.anchored_to(trigger),
+        None => state,
+    }
+    .provide();
+    let trigger = state.trigger();
 
     // What is chosen, either way — one day or two — so that the trigger, the reader's value and the
     // emptiness the placeholder answers to are all one question asked once.

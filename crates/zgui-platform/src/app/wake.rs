@@ -2,6 +2,7 @@
 
 use accesskit::ActionRequest;
 
+use crate::app::event::AppEvent;
 use crate::clipboard::{ClipboardData, ClipboardError, ClipboardSerial};
 use crate::surface::SurfaceId;
 
@@ -53,6 +54,11 @@ pub enum WakeReason {
     DeviceLost,
     /// The desktop's light or dark preference changed.
     ColorSchemeChanged,
+    /// The desktop asked something of the application as a whole.
+    App(AppEvent),
+    /// The desktop finished changing the state of a surface, such as taking it out of full
+    /// screen, after the last resize the change made.
+    SurfaceStateChanged(SurfaceId),
 }
 
 impl WakeReason {
@@ -63,7 +69,9 @@ impl WakeReason {
     pub fn surfaces(&self) -> &[SurfaceId] {
         match self {
             Self::ReactiveWork { surfaces } => surfaces,
-            Self::A11yTreeRequested(surface) => core::slice::from_ref(surface),
+            Self::A11yTreeRequested(surface) | Self::SurfaceStateChanged(surface) => {
+                core::slice::from_ref(surface)
+            }
             _ => &[],
         }
     }

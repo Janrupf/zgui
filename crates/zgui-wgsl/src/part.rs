@@ -4,7 +4,7 @@
 //! crate gets the sources by depending on it rather than by knowing where it was unpacked.
 
 /// Every part, under the name a table names it by.
-pub const PART_NAMES: [&str; 22] = [
+pub const PART_NAMES: [&str; 28] = [
     "blit",
     "blur",
     "clear",
@@ -13,6 +13,12 @@ pub const PART_NAMES: [&str; 22] = [
     "decoration",
     "effect",
     "external",
+    "marks",
+    "marks_box",
+    "marks_composite",
+    "marks_disc",
+    "marks_glyph",
+    "marks_polyline",
     "paint",
     "quad",
     "sdf",
@@ -45,6 +51,12 @@ pub fn part(name: &str) -> &'static str {
         "decoration" => include_str!("wgsl/decoration.wgsl"),
         "effect" => include_str!("wgsl/effect.wgsl"),
         "external" => include_str!("wgsl/external.wgsl"),
+        "marks" => include_str!("wgsl/marks.wgsl"),
+        "marks_box" => include_str!("wgsl/marks_box.wgsl"),
+        "marks_composite" => include_str!("wgsl/marks_composite.wgsl"),
+        "marks_disc" => include_str!("wgsl/marks_disc.wgsl"),
+        "marks_glyph" => include_str!("wgsl/marks_glyph.wgsl"),
+        "marks_polyline" => include_str!("wgsl/marks_polyline.wgsl"),
         "paint" => include_str!("wgsl/paint.wgsl"),
         "quad" => include_str!("wgsl/quad.wgsl"),
         "sdf" => include_str!("wgsl/sdf.wgsl"),

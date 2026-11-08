@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use zgui::prelude::*;
-use zgui::reactive::{LocalStorage, RwSignal, UnsyncCallback};
+use zgui::reactive::{LocalStorage, Memo, RenderEffect, RwSignal, StoredValue, UnsyncCallback};
 use zgui_ui_primitives::{Binding, Collection, Controllable, ItemId};
 
 use crate::listbox::catalogue::ListboxCatalogue;
@@ -11,6 +11,20 @@ use crate::listbox::keys::{ListboxAction, action_for};
 use crate::listbox::labels::ListboxLabels;
 use crate::listbox::option::{ListboxEntry, ListboxOption};
 use crate::overlay::OverlayState;
+
+/// Which option the arrow keys are on, as it was last asked for.
+///
+/// Kept as the request and resolved against the options when it is read, because a list opens
+/// before its options mount: a highlight that resolved at once would find nothing to land on.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum Active {
+    /// The first option that can be chosen.
+    First,
+    /// The chosen option, or the first that can be chosen when no option has the value.
+    Chosen,
+    /// This option.
+    Item(ItemId),
+}
 
 /// A set of options, the one being walked, and the one that is chosen.
 ///
@@ -48,12 +62,16 @@ pub struct Listbox {
     collection: Collection,
     /// What is known about each of them.
     options: RwSignal<BTreeMap<ItemId, ListboxOption>, LocalStorage>,
-    /// Which one the arrow keys are on.
-    active: RwSignal<Option<ItemId>, LocalStorage>,
+    /// Which one the arrow keys are asked to be on.
+    active: RwSignal<Active, LocalStorage>,
+    /// The same, resolved against the options once per change, so each option compares an id.
+    resolved: Memo<Option<ItemId>>,
     /// Which one is chosen.
     value: Controllable<String>,
     /// What has been typed to narrow the list, for the controls that have a field.
     filter: RwSignal<String, LocalStorage>,
+    /// Whether the filter narrows the list: from the first keystroke until the query is reset.
+    query_active: RwSignal<bool, LocalStorage>,
     /// What each value reads as, learned from the options that say so.
     ///
     /// A closed select has no options mounted: they are its list, and its list is gone. Without
@@ -65,6 +83,11 @@ pub struct Listbox {
     surface: OverlayState,
     /// Whether choosing something closes that surface.
     dismisses: bool,
+    /// Whether the active option is to be scrolled into view once its element exists.
+    ///
+    /// Set by the keyboard, by opening the list on the chosen option and by the filter. A pointer
+    /// that moves over an option leaves it clear, so the list does not move under the pointer.
+    reveal: RwSignal<bool, LocalStorage>,
 }
 
 impl Listbox {
@@ -76,15 +99,60 @@ impl Listbox {
         default_value: Option<String>,
         on_change: Option<UnsyncCallback<String>>,
     ) -> Self {
-        Self {
-            collection: Collection::new(),
-            options: RwSignal::new_local(BTreeMap::new()),
-            active: RwSignal::new_local(None),
-            value: Controllable::new(value, default_value.unwrap_or_default(), on_change),
+        let collection = Collection::new();
+        let options = RwSignal::new_local(BTreeMap::new());
+        let active = RwSignal::new_local(Active::First);
+        let value = Controllable::new(value, default_value.unwrap_or_default(), on_change);
+        let chosen = value.signal();
+        let resolved = Memo::new(move |_| {
+            resolve(
+                active.get(),
+                || entries_of(collection, options, true),
+                || chosen.get(),
+            )
+        });
+        let listbox = Self {
+            collection,
+            options,
+            active,
+            resolved,
+            value,
             filter: RwSignal::new_local(String::new()),
+            query_active: RwSignal::new_local(false),
             labels: ListboxLabels::new(),
             surface,
             dismisses: true,
+            reveal: RwSignal::new_local(false),
+        };
+        listbox.reveal_active();
+        listbox
+    }
+
+    /// Scrolls the active option into view each time [`Listbox::reveal`] is set.
+    ///
+    /// The effect reads nothing else while the flag is clear. When it is set, the effect waits for
+    /// the option's element, because a list that opens in this turn mounts its options later.
+    fn reveal_active(&self) {
+        let listbox = *self;
+        let revealing = RenderEffect::new(move |_| {
+            if !listbox.reveal.get() {
+                return;
+            }
+            let node = listbox.active_node();
+            if node.get().is_none() {
+                return;
+            }
+            node.scroll_to(ScrollTarget::IntoView, ScrollBehavior::Instant);
+            listbox.reveal.set(false);
+        });
+        // Stored, so the effect lives as long as the scope that made the listbox.
+        StoredValue::new_local(revealing);
+    }
+
+    /// Asks for the active option to be scrolled into view.
+    fn reveal(&self) {
+        if !self.reveal.get_untracked() {
+            self.reveal.set(true);
         }
     }
 
@@ -127,6 +195,11 @@ impl Listbox {
         self.labels.learn(option);
     }
 
+    /// Learns that `value` reads as `text`, for an option that knows its text without an element.
+    pub fn remember(&self, value: &str, text: &str) {
+        self.labels.remember(value, text);
+    }
+
     /// Registers one option, and takes it out again when the calling scope goes away.
     pub fn register(&self, option: ListboxOption) -> ItemId {
         let id = self.collection.register(option.node());
@@ -145,16 +218,7 @@ impl Listbox {
     /// Every option, in tree order.
     #[must_use]
     pub fn entries(&self) -> Vec<ListboxEntry> {
-        let known = self.options.get();
-        self.collection
-            .items()
-            .into_iter()
-            .filter_map(|item| {
-                known
-                    .get(&item.id())
-                    .map(|option| ListboxEntry::new(item.id(), option.clone()))
-            })
-            .collect()
+        entries_of(self.collection, self.options, true)
     }
 
     /// The same, without subscribing to the set.
@@ -163,16 +227,7 @@ impl Listbox {
     /// that tried to subscribe there would subscribe nothing to anything.
     #[must_use]
     pub fn entries_untracked(&self) -> Vec<ListboxEntry> {
-        let known = self.options.get_untracked();
-        self.collection
-            .items_untracked()
-            .into_iter()
-            .filter_map(|item| {
-                known
-                    .get(&item.id())
-                    .map(|option| ListboxEntry::new(item.id(), option.clone()))
-            })
-            .collect()
+        entries_of(self.collection, self.options, false)
     }
 
     /// Every option that can actually be chosen, in tree order, without subscribing.
@@ -188,26 +243,17 @@ impl Listbox {
     ///
     /// Until something has been walked or chosen, that is the **first** option that can be
     /// chosen — so an open list always has somewhere for `active_descendant` to point and for
-    /// <kbd>Enter</kbd> to land, rather than a first arrow key that appears to do nothing.
+    /// <kbd>Enter</kbd> to land, rather than a first arrow key that appears to do nothing. After
+    /// [`highlight_chosen`](Self::highlight_chosen), it is the chosen option.
     #[must_use]
     pub fn active(&self) -> Option<ItemId> {
-        match self.active.get() {
-            Some(id) => Some(id),
-            None => self
-                .entries()
-                .into_iter()
-                .find(|entry| !entry.option().is_disabled())
-                .map(|entry| entry.id()),
-        }
+        self.resolved.get()
     }
 
     /// The same, without subscribing.
     #[must_use]
     fn active_untracked(&self) -> Option<ItemId> {
-        match self.active.get_untracked() {
-            Some(id) => Some(id),
-            None => self.choosable().first().map(ListboxEntry::id),
-        }
+        self.resolved.get_untracked()
     }
 
     /// The element of the option the arrow keys are on, which is what a reader is pointed at.
@@ -220,10 +266,16 @@ impl Listbox {
             .map_or_else(NodeRef::new, |entry| entry.option().node())
     }
 
-    /// Makes `id` the one the arrow keys are on.
+    /// Makes `id` the one the arrow keys are on, or the first option that can be chosen for
+    /// `None`.
     pub fn set_active(&self, id: Option<ItemId>) {
-        if self.active.get_untracked() != id {
-            self.active.set(id);
+        self.ask(id.map_or(Active::First, Active::Item));
+    }
+
+    /// Records where the arrow keys are asked to be, when that changes.
+    fn ask(&self, target: Active) {
+        if self.active.get_untracked() != target {
+            self.active.set(target);
         }
     }
 
@@ -278,6 +330,8 @@ impl Listbox {
         if entry.option().is_disabled() {
             return;
         }
+        self.labels
+            .remember(entry.option().value(), &entry.option().text());
         self.choose(entry.option().value());
         entry.option().select();
         if self.dismisses {
@@ -297,15 +351,41 @@ impl Listbox {
     /// away is a highlight on nothing, and Enter would choose something the user cannot see.
     pub fn set_filter(&self, text: impl Into<String>) {
         self.filter.set(text.into());
-        self.active.set(None);
+        if !self.query_active.get_untracked() {
+            self.query_active.set(true);
+        }
+        self.ask(Active::First);
+        self.reveal();
+    }
+
+    /// Whether something has been typed since the query was last reset.
+    #[must_use]
+    pub fn query_active(&self) -> bool {
+        self.query_active.get()
+    }
+
+    /// Ends the query: clears the filter, so every option survives it again.
+    ///
+    /// What a combobox does once its list has gone, so the next opening shows every option.
+    pub fn reset_query(&self) {
+        if self.filter.try_with_untracked(String::is_empty) == Some(false) {
+            self.filter.try_set(String::new());
+        }
+        if self.query_active.try_get_untracked() == Some(true) {
+            self.query_active.try_set(false);
+        }
     }
 
     /// Whether an option reading as `text` survives the filter.
     ///
     /// A substring rather than a prefix, and deliberately: a command palette is searched by any
-    /// word of a command, not only by how it starts.
+    /// word of a command, not only by how it starts. Every option survives while no query is
+    /// active.
     #[must_use]
     pub fn matches(&self, text: &str) -> bool {
+        if !self.query_active.get() {
+            return true;
+        }
         let filter = self.filter.get();
         filter.is_empty() || text.to_lowercase().contains(&filter.to_lowercase())
     }
@@ -330,6 +410,7 @@ impl Listbox {
         };
         let index = at.rem_euclid(length) as usize;
         self.set_active(Some(entries[index].id()));
+        self.reveal();
     }
 
     /// Moves the highlight to the last option that can be chosen, or the first.
@@ -342,21 +423,18 @@ impl Listbox {
         };
         if let Some(entry) = target {
             self.set_active(Some(entry.id()));
+            self.reveal();
         }
     }
 
     /// Puts the highlight on the chosen option, or on the first choosable one.
     ///
     /// What opening the list does: a select opened on *Amount* highlights *Amount*, so one press
-    /// of the down arrow moves to the next one rather than back to the top.
+    /// of the down arrow moves to the next one rather than back to the top. The options of a list
+    /// that opens in the same turn mount later, so the highlight finds its option when it is read.
     pub fn highlight_chosen(&self) {
-        let entries = self.choosable();
-        let chosen = self.value.get_untracked();
-        let target = entries
-            .iter()
-            .find(|entry| entry.option().value() == chosen)
-            .or_else(|| entries.first());
-        self.set_active(target.map(ListboxEntry::id));
+        self.ask(Active::Chosen);
+        self.reveal();
     }
 
     /// Carries out what a key press means, and reports whether anything came of it.
@@ -393,6 +471,54 @@ impl Listbox {
         }
         true
     }
+}
+
+/// The option `target` names among `entries`, with the chosen value from `chosen`.
+///
+/// Reads the entries and the chosen value only when `target` needs them.
+fn resolve(
+    target: Active,
+    entries: impl FnOnce() -> Vec<ListboxEntry>,
+    chosen: impl FnOnce() -> String,
+) -> Option<ItemId> {
+    if let Active::Item(id) = target {
+        return Some(id);
+    }
+    let entries = entries();
+    let mut choosable = entries.iter().filter(|entry| !entry.option().is_disabled());
+    let found = match target {
+        Active::Chosen => {
+            let chosen = chosen();
+            choosable
+                .clone()
+                .find(|entry| entry.option().value() == chosen)
+        }
+        Active::First | Active::Item(_) => None,
+    };
+    found.or_else(|| choosable.next()).map(ListboxEntry::id)
+}
+
+/// Every option of `collection` that `options` knows about, in tree order.
+///
+/// `tracked` subscribes the calling scope to both.
+fn entries_of(
+    collection: Collection,
+    options: RwSignal<BTreeMap<ItemId, ListboxOption>, LocalStorage>,
+    tracked: bool,
+) -> Vec<ListboxEntry> {
+    let (items, known) = if tracked {
+        (collection.items(), options.get())
+    } else {
+        (collection.items_untracked(), options.get_untracked())
+    };
+    items
+        .into_iter()
+        .filter_map(|item| {
+            known
+                .get(&item.id())
+                .map(|option| ListboxEntry::new(item.id(), option.clone()))
+        })
+        .collect()
 }
 
 /// Registers `node` as an option of the enclosing [`Listbox`], when there is one.

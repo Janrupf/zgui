@@ -7,6 +7,7 @@
 //! layout out of the compiler, so the comparison against what the shader declares is against what
 //! Rust actually chose rather than against what someone wrote down.
 
+#![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
 mod effect;

@@ -100,6 +100,41 @@ fn every_registered_cache_is_empty_after_forget() {
     );
 }
 
+/// How many primitives of each kind the window's last frame held.
+///
+/// Every kind, because the route a drawing takes decides the kind it arrives as: the triangle here
+/// is a coverage sprite beside the glyphs, and a larger one would be a vector item.
+fn primitives(window: &zgui_runtime::Window) -> [usize; 12] {
+    let held = &window.scene().primitives;
+    [
+        held.quads.len(),
+        held.shaded.len(),
+        held.shadows.len(),
+        held.decorations.len(),
+        held.mono_sprites.len(),
+        held.subpixel_sprites.len(),
+        held.color_sprites.len(),
+        held.marks.len(),
+        held.vectors.len(),
+        held.externals.len(),
+        held.backdrops.len(),
+        held.groups.len(),
+    ]
+}
+
+/// Every route the document's drawings took.
+fn routes(window: &zgui_runtime::Window) -> zgui_paint::VectorRoutes {
+    let root = {
+        let document = window.document().borrow();
+        document
+            .root_index()
+            .map(|index| document.store().key_of(index))
+    };
+    root.map_or(zgui_paint::VectorRoutes::NONE, |root| {
+        window.vector_routes_in_subtree(root)
+    })
+}
+
 /// Forgetting is a reset and not a wedge: the window produces the same content again.
 ///
 /// This is the half that makes `forget` usable as the oracle's cold side. A window that emptied its
@@ -111,16 +146,18 @@ fn a_window_that_has_forgotten_everything_fills_its_caches_again() {
     let mut app = window();
     app.settle(8);
 
-    let (glyphs, drawings) = {
+    let (held, glyphs, drawn) = {
         let window = &app.app().windows()[0];
         (
+            primitives(window),
             window.scene().primitives.mono_sprites.len(),
-            window.scene().primitives.vectors.len(),
+            routes(window),
         )
     };
     assert!(
-        glyphs > 0 && drawings > 0,
-        "the fixture drew {glyphs} glyphs and {drawings} vector items before anything was forgotten"
+        glyphs > 0 && !drawn.is_empty(),
+        "the fixture drew {glyphs} glyphs and a drawing by the routes {drawn:?} before anything \
+         was forgotten"
     );
 
     app.app_mut().windows_mut()[0].forget_caches();
@@ -128,14 +165,14 @@ fn a_window_that_has_forgotten_everything_fills_its_caches_again() {
 
     let window = &app.app().windows()[0];
     assert_eq!(
-        window.scene().primitives.mono_sprites.len(),
-        glyphs,
-        "the same document must draw the same glyphs after its caches were dropped"
+        primitives(window),
+        held,
+        "the same document must draw the same primitives after its caches were dropped"
     );
     assert_eq!(
-        window.scene().primitives.vectors.len(),
-        drawings,
-        "and the same drawings"
+        routes(window),
+        drawn,
+        "and its drawing must take the same routes"
     );
     assert!(
         !filled(&mut app.app_mut().windows_mut()[0]).is_empty(),

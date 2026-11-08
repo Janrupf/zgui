@@ -1,12 +1,13 @@
 //! The outlines a drawing draws, from the text they are written in to the curves a rasteriser
 //! flattens.
 //!
-//! A drawing arrives as path notation on an element, and what a rasteriser wants is Béziers already
-//! placed in the fragment's own space. Doing that conversion per frame would be a parse and a
-//! re-place per icon per frame — and worse than the cost, it would hand the rasteriser a new
-//! allocation every frame, which its encoding cache recognises by identity and would therefore miss
-//! on every single time. So the conversion is memoised here, by node, and the *same* shared path is
-//! handed back for as long as neither the notation nor the box it is fitted to has moved.
+//! A drawing arrives as path notation or as a document on an element. Its outlines stay in their
+//! own space, and the fit that places them in the fragment's space travels beside them. Parsing per
+//! frame would be a parse per icon per frame — and worse than the cost, it would hand the
+//! rasteriser a new allocation every frame, which its encoding cache recognises by identity and
+//! would therefore miss every single time. So a source text is read once for every element that
+//! draws it, and the *same* shared paths are handed back for as long as the text stands. A new box
+//! is a new fit and no new path.
 //!
 //! # Why this is a trait and not a function over the document
 //!
@@ -15,20 +16,40 @@
 //! is one implementation of it.
 
 mod cache;
+mod cpu;
+mod layer;
 mod mask;
+pub(crate) mod path_glyphs;
+pub(crate) mod payloads;
+mod recognitions;
 
 pub use crate::content::vectors::cache::{VectorCache, Vectors};
+#[doc(hidden)]
+pub use crate::content::vectors::layer::{
+    LayerAnswer, LayerFallback, LayerRequest, Tiles, VectorLayerSource,
+};
+pub(crate) use crate::content::vectors::layer::{VectorLayerCache, phase_of};
+#[doc(hidden)]
+pub use crate::content::vectors::mask::CachedMarks;
 pub(crate) use crate::content::vectors::mask::VectorMaskCache;
 pub use crate::content::vectors::mask::{
-    NoVectorMasks, VectorMask, VectorMaskRequest, VectorMaskSource, VectorMaskStyle,
+    AnalyticOnly, MarksOnly, NoVectorMasks, VectorMask, VectorMaskRequest, VectorMaskSource,
+    VectorMaskStyle,
 };
+#[doc(hidden)]
+pub use crate::content::vectors::path_glyphs::{GlyphRequest, GlyphSheets, Splits};
+#[doc(hidden)]
+pub use crate::content::vectors::payloads::MarkPayloads;
+pub(crate) use crate::content::vectors::recognitions::PartKey;
+#[doc(hidden)]
+pub use crate::content::vectors::recognitions::Recognitions;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use zgui_dom::NodeKey;
 use zgui_scene::kurbo::{Affine, BezPath};
 
-/// The outlines one element draws, placed in its fragment's own space.
+/// The outlines one element draws, and the matrix that places them in its fragment's own space.
 #[derive(Clone, Debug, Default)]
 pub struct Drawing {
     /// One outline per entry, in the order they are painted.
@@ -38,9 +59,91 @@ pub struct Drawing {
     /// would be a one-colour logo. An element that draws plain path notation produces shapes whose
     /// paint is the inherited one, which is the same list with the same type in it.
     ///
-    /// The outlines are shared rather than owned: the same curves are drawn every frame, and a
-    /// rasteriser keeps its encoding of them under the identity of the allocation.
-    pub shapes: Vec<zgui_svg::Shape>,
+    /// The outlines are shared rather than owned: every element drawing the same source draws the
+    /// same allocation, and a rasteriser keeps its encoding of a path under the identity of the
+    /// path's allocation.
+    pub shapes: Arc<[zgui_svg::Shape]>,
+    /// What places [`shapes`](Self::shapes) in the fragment's space: the identity for shapes
+    /// already placed.
+    ///
+    /// For a canvas, the box fit times the scene's view transform.
+    pub fit: Affine,
+    /// The series of a canvas, each with the number of shapes painted under it.
+    pub series: Arc<[zgui_canvas::SeriesAt]>,
+    /// Each shape placed by `fit`, made on first use and shared by every clone.
+    placed: Arc<[OnceLock<zgui_svg::Shape>]>,
+}
+
+impl Drawing {
+    /// A drawing of shapes already in the fragment's space.
+    pub fn placed_shapes(shapes: Vec<zgui_svg::Shape>) -> Self {
+        Self {
+            shapes: Arc::from(shapes),
+            fit: Affine::IDENTITY,
+            series: Arc::from([]),
+            placed: Arc::from([]),
+        }
+    }
+
+    /// A drawing of `shapes` in their own space, placed by `fit`.
+    ///
+    /// Every route draws from the source shape, so a hundred thousand markers never become a
+    /// second path. Only recognition under a fit that scales its axes differently places a shape.
+    pub fn fitted(shapes: Vec<zgui_svg::Shape>, fit: Affine) -> Self {
+        Self::fitted_shared(Arc::from(shapes), fit)
+    }
+
+    /// The same as [`Drawing::fitted`], for shapes another drawing may share.
+    pub fn fitted_shared(shapes: Arc<[zgui_svg::Shape]>, fit: Affine) -> Self {
+        let placed = (0..shapes.len()).map(|_| OnceLock::new()).collect();
+        Self {
+            shapes,
+            fit,
+            series: Arc::from([]),
+            placed,
+        }
+    }
+
+    /// The drawing of a canvas scene, placed by `fit` times the scene's view transform.
+    ///
+    /// The shapes and the series keep their source allocations, so a pan or a zoom alone
+    /// recognises nothing again, builds no new series payload and encodes no general shape again.
+    /// A mask-route shape rasterises again under each new view, and recognition places a shape
+    /// again under a turn or a stretch.
+    pub fn canvas(scene: &zgui_canvas::CanvasScene, fit: Affine) -> Self {
+        Self {
+            series: Arc::from(scene.series()),
+            ..Self::fitted(scene.shapes().to_vec(), fit * scene.transform())
+        }
+    }
+
+    /// Shape `index` placed in the fragment's space.
+    ///
+    /// Placed on first use and kept for as long as the drawing is held. Recognition under a fit
+    /// that scales its axes differently reads it, and so do tests.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `index` is not a shape of the drawing.
+    pub fn placed(&self, index: usize) -> &zgui_svg::Shape {
+        let shape = &self.shapes[index];
+        if self.fit == Affine::IDENTITY {
+            return shape;
+        }
+        self.placed[index].get_or_init(|| zgui_svg::document::place::shape(shape, self.fit))
+    }
+
+    /// Every shape placed in the fragment's space, in painting order.
+    pub fn placed_all(&self) -> Vec<zgui_svg::Shape> {
+        (0..self.shapes.len())
+            .map(|index| self.placed(index).clone())
+            .collect()
+    }
+
+    /// The cell shape `index` is placed into, for a drawing that places its shapes.
+    pub(crate) fn cell(&self, index: usize) -> Option<&OnceLock<zgui_svg::Shape>> {
+        self.placed.get(index)
+    }
 }
 
 /// Where the outlines an element draws come from.

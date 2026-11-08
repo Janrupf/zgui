@@ -1,7 +1,7 @@
 box block flow
 row block flex
 column block flex
-stack block flex
+stack block grid
 text inline flow
 label inline flow
 image inline flow-root

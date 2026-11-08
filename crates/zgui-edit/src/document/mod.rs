@@ -10,6 +10,7 @@
 //! under the element read in order is the text the editor holds — and so that a line break is a
 //! character the layout can break a line at. See [`content_of`].
 
+pub mod mask;
 pub mod projection;
 
 pub use crate::document::projection::{Projection, content_of};

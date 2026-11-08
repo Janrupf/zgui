@@ -1,55 +1,71 @@
 # Vendored crates
 
-## taffy 0.12.2
+## fontique 0.11.1 (crates.io)
 
-An unmodified copy of the published `taffy 0.12.2`, carrying three local changes.
+The font collection under parley, patched in through `[patch.crates-io]` so that parley resolves
+against the same copy. Without the examples. Every local change is marked `ZGUI-PATCH:` in the
+source. The source of 0.11.1 is the same as that of 0.11.0 (upstream commit 033e0b0); only its
+manifest differs, and it takes read-fonts 0.41.
 
-### Fixed-position content size (`CoreStyle::is_fixed_position`)
+### Published crates
 
-Taffy has no `position: fixed`; this workspace lays fixed boxes out as `Position::Absolute`. That
-conflated one thing that must differ: an absolutely positioned child contributes to its containing
-block's scrollable overflow (CSS Overflow §3), while a fixed one is anchored to the viewport, does
-not scroll with anything, and contributes none. The vendored copy adds a defaulted
-`CoreStyle::is_fixed_position()` (false, so plain taffy behaviour is unchanged) and skips such
-children when folding `absolute_content_size` in block, flexbox and grid layout. Without it the
-viewport-sized overlay root — sized `100vw`/`100vh` so sheets and scrims cover the scrollbar
-gutter — hands the page's scroller a sideways scrollbar the moment the page reserves one. The
-`a_wrapped_flex_claims_the_width_it_wrapped_to` fixture in `crates/zgui-ui/tests/cycle_scroll.rs`
-and the scrim suite in `crates/zgui-ui/tests/scrim.rs` hold the workspace to it.
+`[patch.crates-io]` applies only to a build of this workspace. An application that depends on
+zgui from crates.io builds against the released fontique: it gets the same fonts and resolves them
+more slowly. It can use this copy with the same patch, because cargo finds a package anywhere in a
+git repository:
 
-### Auto margins and `justify-content`
+```toml
+[patch.crates-io]
+fontique = { git = "https://github.com/zortax/zgui", tag = "v0.1.0" }
+```
 
-One local fix in `src/compute/flexbox.rs` (`distribute_remaining_free_space`, marked `zgui local
-patch`):
+### Query state kept across queries (`collection/query.rs`)
 
-When a flex line has main-axis `auto` margins and positive free space, the spec hands the free
-space to those margins *instead of* to `justify-content`
-(<https://www.w3.org/TR/css-flexbox-1/#algo-main-align>). Upstream distributed the space into the
-margins and then also resolved `justify-content` against the same un-zeroed free space, so any
-value other than `flex-start` moved every item by the absorbed space a second time — items past
-the container's edge, and a page with a phantom horizontal scrollbar behind them. The
-`an_end_justified_row_keeps_its_items_inside` fixture in `crates/zgui-ui/tests/cycle_scroll.rs`
-holds the workspace to the fixed behaviour.
+Upstream clears a collection's query state when a query starts and again when it ends, and parley
+starts one query per paragraph. For a generic family such as `sans-serif`, which a system
+collection resolves to some two hundred families, every paragraph then rebuilt that list, and
+every digit, which parley shapes as a possible emoji, rebuilt it again with the emoji families
+appended. The state now outlives the query:
 
-### The scaled flex shrink factor, in intrinsic main sizes
+- the current family list and the last three are kept with the families and faces they loaded,
+  and a `set_families` call that repeats one of them reuses it;
+- the fallback list is rebuilt only when its script and locale change;
+- loaded faces are dropped in `matches_with` when the attributes changed since they were matched;
+- a query that sets no families or fallbacks still matches none.
 
-One local fix in `src/compute/flexbox.rs` (`scaled_shrink_factor`, marked `zgui local patch`):
+`Collection` counts a generation, raised by every mutating method and by a sync that copies a
+shared clone's changes; a query that finds the state built against another generation clears it.
+`crates/zgui-text-parley/tests/fonts.rs`
+(`a_face_unregistered_after_shaping_is_not_drawn_with_again`) pins the invalidation.
 
-[§9.9.3](https://www.w3.org/TR/css-flexbox-1/#intrinsic-main-sizes) sizes a flex container to its
-content by dividing each item's shortfall — its content contribution less its flex base size — by a
-scaled shrink factor, taking the largest fraction on the line, and multiplying it back out. Upstream
-divided by `max(1, shrink × basis)` and multiplied by `max(1, shrink) × basis`; the two agree only
-once `flex-shrink` is at least one, and the spec's wording ("divide by its scaled flex shrink factor
-having floored the flex shrink factor at 1") is the multiplier. An item with `flex-shrink: 0` and a
-negative margin — an overlapping stack of avatars, a button pulling its mark out of its own padding
-— therefore had its overlap come back multiplied by its whole width, and the container measured at a
-fraction of its content or at nothing. Both halves now name one function, floored at one pixel so a
-sub-pixel base size cannot divide by zero. The `an_overlapping_stack_measures_its_whole_width`
-fixture in `crates/zgui-ui/tests/cycle_scroll.rs` holds the workspace to it.
+### System font cache (`backend/fontconfig.rs`, `backend/fontconfig_cache.rs`, `system_cache.rs`)
 
-The copy is consumed as a **path dependency** in the workspace `Cargo.toml`, not through
-`[patch.crates-io]`: a patch section only takes effect in the root manifest of the workspace being
-built, so any project depending on zgui by path would silently compile against the unpatched
-release — and, since `is_fixed_position` extends a trait `zgui-layout` implements, fail to compile
-at all. A path dependency travels with the crate graph wherever it is built from. Drop this copy
-the release after both changes land upstream.
+On Linux, a system collection spent about 27 ms of a cold start in fontconfig: it loaded the
+configuration and sorted all installed faces once for each of the eight generic families. Each
+family a document named then cost one more sort of all faces (about 1.5 ms each). The backend now
+keeps the results in a file:
+
+- the file holds the family names, the generic family lists, and each family and fallback that a
+  process resolved (a record is appended when a process resolves a new one);
+- a process that finds the file valid builds the collection from it and loads fontconfig only for
+  a question the file cannot answer;
+- the file is valid while every font directory and configuration file that fontconfig reported (and
+  the directories that hold the configuration files) has the same identity, size and modification
+  time, and while the fontconfig version and the environment variables that fontconfig reads are
+  the same; a font install or removal changes its directory, so the next process writes a new file;
+- a stamp that changed after the scan started, or less than two seconds before it, can hold a
+  change the scan did not see, so no file is written then;
+- the file is written again only when a stamp changes, so processes that run at the same time can
+  append the same record twice;
+- `ZGUI_FONT_CACHE=off` disables the file, `ZGUI_FONT_CACHE=<absolute dir>` moves it, and the
+  default is `$XDG_CACHE_HOME/zgui` or `$HOME/.cache/zgui`.
+
+`fontique::system_cache_counts` reports hits, misses, writes and configuration loads.
+`crates/zgui-text-parley/tests/font_cache.rs` compares names, generic lists, families and fallbacks
+with the cache off, on a miss and on a hit, and pins the invalidation on install and removal.
+
+### Script samples (`script.rs`)
+
+The sample table builds each `Script` with `Script::from_bytes`. Upstream calls
+`from_str_unchecked`, which parlance 0.1.1 deprecates, and every build that compiles this copy as a
+path dependency printed 161 warnings.

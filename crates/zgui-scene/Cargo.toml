@@ -3,6 +3,13 @@ name = "zgui-scene"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Renderer-independent display list for zgui frames"
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+include.workspace = true
 
 # L1 — contracts. Every dependency is inherited: `foo.workspace = true`.
 [dependencies]

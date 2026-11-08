@@ -51,6 +51,19 @@ pub struct PlannedPass {
     pub instanced: bool,
     /// Where in the painting order the composite belongs: the draw order of the pass's last item.
     pub composite_order: DrawOrder,
+    /// Whether the region was cut to the frame's damage, so its items reach past it.
+    ///
+    /// A rasteriser keeps the items of a cut pass inside the region: passes share a scratch layer,
+    /// and an item drawn past its cut region would draw into the region of the pass beside it. A
+    /// renderer that redraws more than the damage draws the passes of
+    /// [`Scene::plan_uncut_passes`](crate::scene::Scene::plan_uncut_passes).
+    pub clamped: bool,
+    /// Whether the ink of its items goes past the edge of the surface, where the region stops.
+    ///
+    /// A rasteriser keeps the items of such a pass inside the region, for the same reason as for a
+    /// cut pass. A redraw of more than the damage does not change it, so it does not make the pass
+    /// cut.
+    pub overhangs: bool,
 }
 
 /// Everything a frame's vector work amounts to.
@@ -81,6 +94,11 @@ impl ScenePassPlan {
     /// latency, so this is worth asking before anything else.
     pub fn is_empty(&self) -> bool {
         self.passes.is_empty()
+    }
+
+    /// Whether a pass was cut to the frame's damage.
+    pub fn is_cut(&self) -> bool {
+        self.passes.iter().any(|pass| pass.clamped)
     }
 
     /// How many passes the frame costs.

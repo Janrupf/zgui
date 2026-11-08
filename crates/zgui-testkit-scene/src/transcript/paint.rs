@@ -131,6 +131,7 @@ pub fn paint(table: &PaintTable, id: PaintId) -> Option<String> {
             transform.index(),
             if *repeating { " repeating" } else { "" }
         ),
+        Paint::Sides(colors) => format!("sides [{}]", colors.map(color).join(", ")),
     })
 }
 
@@ -181,6 +182,7 @@ fn kind(tag: u32) -> &'static str {
         tag if tag == PaintKind::Solid as u32 => "solid",
         tag if tag == PaintKind::Gradient as u32 => "gradient",
         tag if tag == PaintKind::Image as u32 => "image",
+        tag if tag == PaintKind::Sides as u32 => "sides",
         _ => "<unknown>",
     }
 }
@@ -218,6 +220,23 @@ mod tests {
         let id = table.solid(Color::BLACK);
         let lying = PaintRef::new(PaintKind::Gradient, id);
         assert!(reference(&table, lying).starts_with("<mismatched>"));
+    }
+
+    #[test]
+    fn a_sides_paint_renders_each_side() {
+        let mut table = PaintTable::new();
+        let grey = Color::srgb(0.5, 0.5, 0.5, 1.0);
+        let reference_to = table.add(zgui_scene::Paint::Sides([
+            grey,
+            grey,
+            grey,
+            Color::srgb(1.0, 0.0, 0.0, 1.0),
+        ]));
+        assert_eq!(
+            reference(&table, reference_to),
+            "sides [srgb(0.5, 0.5, 0.5, 1), srgb(0.5, 0.5, 0.5, 1), srgb(0.5, 0.5, 0.5, 1), \
+             srgb(1, 0, 0, 1)]"
+        );
     }
 
     #[test]

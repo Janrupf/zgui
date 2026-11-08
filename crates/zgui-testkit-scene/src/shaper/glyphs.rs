@@ -34,10 +34,9 @@ pub fn glyph_id(character: char) -> u16 {
 
 /// Visits the runs of one line, positioned against the line box's top-left corner.
 ///
-/// A run ends where the brush changes, which is the only thing that varies across a line here: the
-/// fixed face has one size and one shape, so two clusters differ in nothing else. Atomic inline
-/// boxes are not interleaved with the glyphs, because this shaper's own line geometry does not
-/// interleave them either.
+/// A run ends where the brush changes, which is the only style that varies across a line here: the
+/// fixed face has one size and one shape. A run also ends at an inline box, and the box moves the
+/// pen by its width before the character at its offset, as the line geometry places it.
 pub(crate) fn visit_line(
     shaped: &ShapedParagraph<MonoLayout>,
     line: u16,
@@ -59,12 +58,33 @@ pub(crate) fn visit_line(
     let mut pen = 0.0;
     let mut glyphs: Vec<ShapedGlyph> = Vec::new();
     let mut brush = None;
+    let mut run_start = 0;
     for cluster in &engine.clusters[start.min(end)..end] {
-        if brush.is_some_and(|held| held != cluster.brush) {
-            emit(visit, size, brush.take().expect("just checked"), &glyphs);
+        let boxed: f32 = shaped
+            .boxes()
+            .iter()
+            .filter(|geometry| geometry.offset == cluster.offset)
+            .map(|geometry| geometry.width.0)
+            .sum();
+        let at_box = shaped
+            .boxes()
+            .iter()
+            .any(|geometry| geometry.offset == cluster.offset);
+        if brush.is_some_and(|held| held != cluster.brush) || (brush.is_some() && at_box) {
+            emit(
+                visit,
+                size,
+                brush.take().expect("just checked"),
+                &glyphs,
+                run_start,
+            );
             glyphs.clear();
         }
+        if brush.is_none() {
+            run_start = cluster.offset;
+        }
         brush = Some(cluster.brush);
+        pen += boxed;
         let character = shaped.text()[cluster.offset..]
             .chars()
             .next()
@@ -77,7 +97,7 @@ pub(crate) fn visit_line(
         pen += cluster.advance.0;
     }
     if let Some(brush) = brush {
-        emit(visit, size, brush, &glyphs);
+        emit(visit, size, brush, &glyphs, run_start);
     }
 }
 
@@ -87,6 +107,7 @@ fn emit(
     size: f32,
     brush: zgui_text::Brush,
     glyphs: &[ShapedGlyph],
+    text_start: usize,
 ) {
     if glyphs.is_empty() {
         return;
@@ -94,11 +115,13 @@ fn emit(
     visit(ShapedRun {
         face: FACE,
         size,
+        instance: zgui_text::VariationInstance::DEFAULT,
         synthetic_bold: 0.0,
         synthetic_slant: 0.0,
         has_color: false,
         brush,
         glyphs,
+        text_start: u32::try_from(text_start).unwrap_or(u32::MAX),
     });
 }
 

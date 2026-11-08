@@ -85,7 +85,7 @@ impl Script {
             location: zgui_vocab::KeyLocation::Standard,
             repeat: false,
         };
-        self.press(event, Modifiers::CONTROL);
+        self.press(event, Modifiers::PRIMARY);
     }
 
     /// Delivers one pointer action at a point on the surface, in CSS pixels.
@@ -110,7 +110,7 @@ impl Script {
 
     /// The first line fragment's box, which is what every rectangle here is measured against.
     fn line(&self) -> Rect<DevicePx, Device> {
-        support::first_line_box(self.window())
+        support::first_line_on_device(self.window())
     }
 
     /// Every quad in the display list, with the colour it is filled in and where it sorts.
@@ -127,10 +127,19 @@ impl Script {
             .quads
             .iter()
             .map(|quad| Painted {
-                rect: Rect::new(
-                    Point::new(DevicePx(quad.bounds[0]), DevicePx(quad.bounds[1])),
-                    zgui_geom::Size::new(DevicePx(quad.bounds[2]), DevicePx(quad.bounds[3])),
-                ),
+                // Through the quad's own coordinate system, which puts it on the device.
+                rect: {
+                    let local = Rect::new(
+                        Point::new(DevicePx(quad.bounds[0]), DevicePx(quad.bounds[1])),
+                        zgui_geom::Size::new(DevicePx(quad.bounds[2]), DevicePx(quad.bounds[3])),
+                    );
+                    scene
+                        .spatial
+                        .resolve_at(quad.transform)
+                        .map_or(local, |matrix| {
+                            zgui_geom::transformed_bounds(&matrix, local)
+                        })
+                },
                 fill: quad
                     .fill
                     .id()
@@ -160,22 +169,21 @@ impl Script {
     /// "above every glyph in the document" is false of a correct caret, and asserting it would send
     /// somebody to fix a painter that is right.
     fn glyph_sprites(&self) -> Vec<(Rect<DevicePx, Device>, u32)> {
-        self.window()
-            .scene()
+        let scene = self.window().scene();
+        scene
             .primitives
             .mono_sprites
             .iter()
             .map(|sprite| {
-                (
-                    Rect::new(
-                        Point::new(DevicePx(sprite.bounds[0]), DevicePx(sprite.bounds[1])),
-                        zgui_geom::Size::new(
-                            DevicePx(sprite.bounds[2]),
-                            DevicePx(sprite.bounds[3]),
-                        ),
-                    ),
-                    sprite.order,
-                )
+                // Through the sprite's own coordinate system, which puts it on the device.
+                let local = sprite.ink();
+                let placed = scene
+                    .spatial
+                    .resolve_at(sprite.transform)
+                    .map_or(local, |matrix| {
+                        zgui_geom::transformed_bounds(&matrix, local)
+                    });
+                (placed, sprite.order)
             })
             .collect()
     }
@@ -620,7 +628,7 @@ fn an_element_nobody_can_type_into_gets_no_caret_from_a_click() {
     // is the higher of the two. Sorted rather than indexed: the layout reports its line boxes in
     // the order its tree walk produced, which is not document order, and a test that indexed into
     // that list would quietly click the wrong element while reading as if it clicked the right one.
-    let mut lines = support::line_boxes(script.window());
+    let mut lines = support::lines_on_device(script.window());
     lines.sort_by(|a, b| a.origin.y.0.total_cmp(&b.origin.y.0));
     assert_eq!(
         lines.len(),
@@ -710,7 +718,7 @@ fn a_caret_on_the_second_line_of_a_wrapped_field_is_drawn_on_that_line() {
     script.harness.settle(8);
     script.press_named(NamedKey::Tab, KeyCode::Tab);
 
-    let mut lines = support::line_boxes(script.window());
+    let mut lines = support::lines_on_device(script.window());
     lines.sort_by(|a, b| a.origin.y.0.total_cmp(&b.origin.y.0));
     assert_eq!(
         lines.len(),
@@ -851,5 +859,69 @@ fn a_field_emptied_of_everything_still_shows_its_caret() {
         script.caret_at(empty.origin.x.0 + ADVANCE),
         "the caret did not move on with the character that was typed: {:?}",
         script.carets()
+    );
+}
+
+#[test]
+fn a_caret_stands_in_the_focused_field_alone_when_another_shows_the_same_text() {
+    // Two empty fields with the same placeholder share one shaped paragraph. The caret belongs to
+    // the box of the field that holds focus, and a caret keyed by the paragraph alone stood in
+    // both.
+    const HINTED: &str = "root { display: block; width: 400px; height: 300px; padding: 12px 20px }
+                          editor { display: block; width: 200px; height: 40px; color: rgb(0, 102, 204) }
+                          editor { position: relative }
+                          editor:empty::before {
+                              content: \"of the image\";
+                              position: absolute;
+                              top: 0;
+                              bottom: 0;
+                              left: 12px;
+                              right: 12px;
+                              display: flex;
+                              flex-direction: row;
+                              align-items: center;
+                          }
+                          editor:hover { background-color: rgb(250, 250, 250) }";
+    let first = NodeRef::new();
+    let harness = support::app_with_text(HINTED, move |cx: &mut BuildCx<'_>| {
+        Box::new(
+            zgui_elements::column()
+                .class("root")
+                .child(zgui_elements::editor().node_ref(first))
+                .child(zgui_elements::editor())
+                .into_view()
+                .build(cx),
+        )
+    });
+    let mut script = Script {
+        harness,
+        editor: first,
+    };
+    script.harness.settle(8);
+    script.press_named(NamedKey::Tab, KeyCode::Tab);
+    assert_eq!(
+        script.selection(),
+        Some(0..0),
+        "the first field holds focus"
+    );
+    // A frame paints only what its damage reaches, and the caret damages its own field alone. The
+    // pointer over the second field repaints that one too, as anything else moving there would.
+    script.deliver(SurfaceEvent::Pointer {
+        action: PointerAction::Moved,
+        event: PointerEvent::mouse(Point::new(CssPx(60.0), CssPx(72.0))),
+        modifiers: Modifiers::NONE,
+        timestamp: Timestamp::ORIGIN,
+    });
+    let carets = script.carets();
+    assert_eq!(
+        carets.len(),
+        1,
+        "one field holds focus, and carets stood in {}: {carets:?}",
+        carets.len()
+    );
+    // The root pads its top by 12 and each field is 40 high, so the first field ends at 52.
+    assert!(
+        carets[0].rect.origin.y.0 < 52.0,
+        "the caret stands in the field without focus: {carets:?}"
     );
 }

@@ -5,7 +5,6 @@
 //! exactly that: a check nobody has ever seen fail is a check nobody should trust.
 
 pub(crate) mod check;
-pub(crate) mod phases;
 pub(crate) mod report;
 pub(crate) mod self_test;
 pub(crate) mod tree;

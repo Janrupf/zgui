@@ -28,18 +28,8 @@ pub fn transformed_bounds(
     matrix: &Matrix4,
     rect: Rect<DevicePx, Device>,
 ) -> Rect<DevicePx, Device> {
-    // A shift moves the box and leaves its shape alone, so the four corners are the two corners
-    // plus the shift and the general path's arithmetic collapses to an addition. Reached by the
-    // commonest transform there is — a box animating across the screen — and bit-for-bit what the
-    // loop below produces: every product the loop forms is against a one or a zero, `w` comes out
-    // as exactly one, and the reciprocal of one leaves a float alone.
-    if let Some((by_x, by_y)) = matrix.as_translation() {
-        let (left, right) = (rect.left().0 + by_x, rect.right().0 + by_x);
-        let (top, bottom) = (rect.top().0 + by_y, rect.bottom().0 + by_y);
-        return Rect::from_corners(
-            crate::point::Point::new(DevicePx(left.min(right)), DevicePx(top.min(bottom))),
-            crate::point::Point::new(DevicePx(left.max(right)), DevicePx(top.max(bottom))),
-        );
+    if let Some((x, y)) = matrix.plane_translation() {
+        return translated_bounds(x, y, rect);
     }
     let corners = [
         (rect.left().0, rect.top().0),
@@ -70,101 +60,104 @@ pub fn transformed_bounds(
     )
 }
 
+/// The axis-aligned rectangle that contains `rect` after a translation by `x` and `y` in the plane.
+///
+/// Equal in bits to [`transformed_bounds`] through the matrix of that translation. A caller that
+/// already knows its matrix is a plane translation uses this and skips the test of the matrix.
+///
+/// ```
+/// use zgui_geom::{Device, DevicePx, Matrix4, Point, Rect, Size, transformed_bounds, translated_bounds};
+///
+/// let rect: Rect<DevicePx, Device> = Rect::new(
+///     Point::new(DevicePx(0.5), DevicePx(2.0)),
+///     Size::new(DevicePx(10.0), DevicePx(4.0)),
+/// );
+/// let matrix = Matrix4::translation(3.0, -5.0, 0.0);
+/// assert_eq!(translated_bounds(3.0, -5.0, rect), transformed_bounds(&matrix, rect));
+/// ```
+#[inline]
+pub fn translated_bounds(x: f32, y: f32, rect: Rect<DevicePx, Device>) -> Rect<DevicePx, Device> {
+    // Each corner moves by the same amount. The sums are the ones the corner path of
+    // [`transformed_bounds`] makes, so both paths give the same rectangle.
+    let (left, right) = (rect.left().0 + x, rect.right().0 + x);
+    let (top, bottom) = (rect.top().0 + y, rect.bottom().0 + y);
+    // Edges in order are their own minimum and maximum, so the comparisons below give this.
+    if left < right && top < bottom {
+        return Rect::new(
+            crate::point::Point::new(DevicePx(left), DevicePx(top)),
+            crate::size::Size::new(DevicePx(right - left), DevicePx(bottom - top)),
+        );
+    }
+    Rect::from_corners(
+        crate::point::Point::new(DevicePx(left.min(right)), DevicePx(top.min(bottom))),
+        crate::point::Point::new(DevicePx(left.max(right)), DevicePx(top.max(bottom))),
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::transformed_bounds;
-    use crate::point::Point;
-    use crate::rect::Rect;
-    use crate::space::Device;
-    use crate::transform::Matrix4;
-    use crate::unit::DevicePx;
+    use super::*;
+    use crate::{Point, Size};
 
-    /// The general path, kept here so the shortcut can be held against it.
-    fn by_corners(matrix: &Matrix4, rect: Rect<DevicePx, Device>) -> Rect<DevicePx, Device> {
-        let corners = [
-            (rect.left().0, rect.top().0),
-            (rect.right().0, rect.top().0),
-            (rect.right().0, rect.bottom().0),
-            (rect.left().0, rect.bottom().0),
-        ];
-        let mut min = (f32::INFINITY, f32::INFINITY);
-        let mut max = (f32::NEG_INFINITY, f32::NEG_INFINITY);
-        for (x, y) in corners {
-            let projected = matrix.transform_vector4([x, y, 0.0, 1.0]);
-            let inverse_w = projected[3].recip();
-            let (px, py) = (projected[0] * inverse_w, projected[1] * inverse_w);
-            min = (min.0.min(px), min.1.min(py));
-            max = (max.0.max(px), max.1.max(py));
-        }
-        Rect::from_corners(
-            Point::new(DevicePx(min.0), DevicePx(min.1)),
-            Point::new(DevicePx(max.0), DevicePx(max.1)),
-        )
-    }
-
-    fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect<DevicePx, Device> {
-        Rect::new(
-            Point::new(DevicePx(x), DevicePx(y)),
-            crate::size::Size::new(DevicePx(w), DevicePx(h)),
-        )
-    }
-
-    /// The shortcut is an optimisation and owes bit-for-bit agreement, rather than nearness: it
-    /// feeds damage and culling, and a box that disagrees by one unit in the last place with the
-    /// answer the general path would have given is a box that redraws differently.
     #[test]
-    fn the_shortcut_for_a_shift_agrees_to_the_last_bit() {
-        let awkward = [
-            0.0, 1.0, -1.0, 0.1, -0.1, 1e-7, -1e-7, 1e7, -1e7, 1234.567_9, -0.000_003,
-        ];
-        for &by_x in &awkward {
-            for &by_y in &awkward {
-                let matrix = Matrix4::translation(by_x, by_y, 0.0);
-                assert!(matrix.as_translation().is_some(), "{by_x} {by_y}");
-                for &(x, y, w, h) in &[
-                    (0.0, 0.0, 10.0, 4.0),
-                    (-3.5, 7.25, 0.0, 0.0),
-                    (1e6, -1e6, 0.333, 1e-6),
-                    (-0.000_001, 0.000_001, 1e7, 1e7),
-                ] {
-                    let subject = rect(x, y, w, h);
-                    let fast = transformed_bounds(&matrix, subject);
-                    let slow = by_corners(&matrix, subject);
-                    assert_eq!(
-                        fast.origin.x.0.to_bits(),
-                        slow.origin.x.0.to_bits(),
-                        "x: {by_x} {by_y} {x} {y} {w} {h}",
+    fn a_translation_gives_the_rectangle_its_corners_give() {
+        let rect: Rect<DevicePx, Device> = Rect::new(
+            Point::new(DevicePx(-3.25), DevicePx(17.1)),
+            Size::new(DevicePx(120.7), DevicePx(0.3)),
+        );
+        for (x, y) in [(0.0, -1234.56), (0.1, 0.2), (-4096.0, -4096.0), (7.5, 3e6)] {
+            let matrix = Matrix4::translation(x, y, 0.0);
+            assert!(matrix.plane_translation().is_some());
+            let corners = [
+                matrix.transform_point(rect.left().0, rect.top().0, 0.0),
+                matrix.transform_point(rect.right().0, rect.bottom().0, 0.0),
+            ];
+            let expected = Rect::from_corners(
+                Point::new(DevicePx(corners[0][0]), DevicePx(corners[0][1])),
+                Point::new(DevicePx(corners[1][0]), DevicePx(corners[1][1])),
+            );
+            assert_eq!(transformed_bounds(&matrix, rect), expected);
+        }
+        assert!(Matrix4::scale(2.0, 1.0, 1.0).plane_translation().is_none());
+        let mut tilted = Matrix4::IDENTITY;
+        tilted.columns[0][3] = 0.01;
+        assert!(tilted.plane_translation().is_none());
+    }
+
+    #[test]
+    fn a_translation_gives_the_rectangle_the_ordered_edges_give() {
+        let reference = |x: f32, y: f32, rect: Rect<DevicePx, Device>| {
+            let (left, right) = (rect.left().0 + x, rect.right().0 + x);
+            let (top, bottom) = (rect.top().0 + y, rect.bottom().0 + y);
+            Rect::from_corners(
+                Point::new(DevicePx(left.min(right)), DevicePx(top.min(bottom))),
+                Point::new(DevicePx(left.max(right)), DevicePx(top.max(bottom))),
+            )
+        };
+        let bits = |rect: Rect<DevicePx, Device>| {
+            [
+                rect.origin.x,
+                rect.origin.y,
+                rect.size.width,
+                rect.size.height,
+            ]
+            .map(|v| v.0.to_bits())
+        };
+        let values = [-7.5, -0.0, 0.0, 0.1, 0.3, 22_040.0, f32::INFINITY, f32::NAN];
+        for &origin in &values {
+            for &extent in &values {
+                for &by in &[-22_000.0, -0.0, 0.0, 0.1, f32::NAN] {
+                    let rect = Rect::new(
+                        Point::new(DevicePx(origin), DevicePx(extent)),
+                        Size::new(DevicePx(extent), DevicePx(origin)),
                     );
-                    assert_eq!(fast.origin.y.0.to_bits(), slow.origin.y.0.to_bits());
-                    assert_eq!(fast.size.width.0.to_bits(), slow.size.width.0.to_bits());
-                    assert_eq!(fast.size.height.0.to_bits(), slow.size.height.0.to_bits());
+                    assert_eq!(
+                        bits(translated_bounds(by, -by, rect)),
+                        bits(reference(by, -by, rect)),
+                        "{rect:?} by {by}"
+                    );
                 }
             }
         }
-    }
-
-    /// Anything that is not purely a shift has to reach the general path, or it is answered by
-    /// arithmetic that does not apply to it.
-    #[test]
-    fn only_a_shift_takes_the_shortcut() {
-        assert!(Matrix4::IDENTITY.as_translation() == Some((0.0, 0.0)));
-        assert!(Matrix4::translation(2.0, 3.0, 0.0).as_translation() == Some((2.0, 3.0)));
-        assert!(Matrix4::scale(2.0, 2.0, 1.0).as_translation().is_none());
-        assert!(Matrix4::perspective(400.0).as_translation().is_none());
-        assert!(
-            Matrix4::translation(1.0, 2.0, 3.0)
-                .as_translation()
-                .is_none()
-        );
-    }
-
-    /// A scale still goes the long way round and still answers correctly.
-    #[test]
-    fn a_scale_is_bounded_by_its_transformed_corners() {
-        let scaled = transformed_bounds(&Matrix4::scale(2.0, 3.0, 1.0), rect(1.0, 1.0, 4.0, 4.0));
-        assert_eq!(scaled.origin.x, DevicePx(2.0));
-        assert_eq!(scaled.origin.y, DevicePx(3.0));
-        assert_eq!(scaled.size.width, DevicePx(8.0));
-        assert_eq!(scaled.size.height, DevicePx(12.0));
     }
 }

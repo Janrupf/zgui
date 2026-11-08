@@ -177,23 +177,30 @@ pub fn NativeSelect(
 ) -> impl IntoView {
     install_stylesheet(SHEET, NativeSelectStyle::CSS);
     let surface = OverlayState::uncontrolled(false, None);
+    // A caller's ref becomes the overlay's own handle, so the list is anchored to the element the
+    // caller's ref binds.
+    let surface = match node_ref {
+        Some(trigger) => surface.anchored_to(trigger),
+        None => surface,
+    };
     let listbox = Listbox::new(surface, value, default_value, on_change).provide();
-    let first = FirstShown::new().provide();
-    // The overlay's own handle rather than a fresh one, because the list is anchored to whatever
-    // that handle binds — a caller's ref is honoured the same way a date picker honours one.
-    let element = node_ref.unwrap_or_else(|| surface.trigger());
+    // A placeholder takes the place of the first option's text, so with one no option offers it.
+    let first = placeholder.is_none().then(|| FirstShown::new().provide());
+    let element = surface.trigger();
     // Held rather than moved: the options are written once and built in two places — the open
     // list, and the hidden catalogue that teaches the closed control what its value reads as.
     let children = StoredValue::new_local(children);
 
     let hint = placeholder.unwrap_or_default();
-    let empty = move || listbox.chosen_text().is_none() && first.shown().is_none();
+    let empty = move || {
+        listbox.chosen_text().is_none() && first.is_none_or(|first| first.shown().is_none())
+    };
     let shown = {
         let hint = hint.clone();
         move || {
             listbox
                 .chosen_text()
-                .or_else(|| first.shown())
+                .or_else(|| first.and_then(|first| first.shown()))
                 .unwrap_or_else(|| hint.clone())
         }
     };

@@ -3,6 +3,13 @@ name = "zgui-custom"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Trait-based custom elements with their own layout and paint"
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+include.workspace = true
 
 # L6 — frontend. Every dependency is inherited: `foo.workspace = true`.
 #
@@ -26,6 +33,7 @@ workspace = true
 
 [dev-dependencies]
 zgui-geom = { path = "../zgui-geom", version = "0.1.0" }
+zgui-css = { path = "../zgui-css", version = "0.1.0" }
 zgui-color = { path = "../zgui-color", version = "0.1.0" }
 zgui-dom = { path = "../zgui-dom", version = "0.1.0" }
 zgui-profile = { path = "../zgui-profile", version = "0.1.0" }

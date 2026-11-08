@@ -83,6 +83,19 @@ impl<'doc> Node<'doc> {
         self.record().local_name()
     }
 
+    /// Whether this is a custom element: one whose implementation reads its style in its own
+    /// `layout`, out of reach of the rule chains a reader of custom properties is found by.
+    ///
+    /// A comparison of two interned names.
+    pub fn is_custom_element(self) -> bool {
+        static CUSTOM: std::sync::LazyLock<ElementName> = std::sync::LazyLock::new(|| {
+            ElementName::new(zgui_interned::ElementName::new(
+                zgui_vocab::prop::custom::TAG,
+            ))
+        });
+        *self.tag_name() == *CUSTOM
+    }
+
     /// This element's namespace.
     pub fn namespace_uri(self) -> &'doc web_atoms::Namespace {
         self.store().namespace(self.record().namespace_id())

@@ -2,7 +2,13 @@
 name = "zgui-drm"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+# `src/sys.rs` and the vendored uapi headers are the kernel's, under the MIT License (see NOTICE).
+license = "Apache-2.0 AND MIT"
+description = "Linux DRM/KMS display access: modes, planes, framebuffers and page flips"
+repository.workspace = true
+homepage.workspace = true
+# Experimental: part of the console stack, kept in this repository and not published.
+publish = false
 
 # L2 — backends. Every dependency is inherited: `foo.workspace = true`.
 #

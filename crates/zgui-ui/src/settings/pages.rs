@@ -6,7 +6,7 @@ use zgui_ui_primitives::prelude::*;
 
 use crate::settings::style;
 
-/// The list of pages of a [`Settings`](crate::Settings).
+/// The list of pages of a [`Settings`](crate::settings::Settings).
 ///
 /// ```
 /// # use zgui::prelude::*;

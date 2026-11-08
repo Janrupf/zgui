@@ -238,8 +238,8 @@ struct Shape {
 ///
 /// Everything else that has no shape here falls back to the arrow, which is the rule
 /// [`CursorStyle`] states for every platform: a busy indicator, a no-entry sign, an open hand and a
-/// four-way arrow are drawings rather than translations, and a milestone spent on them is a
-/// milestone not spent on the pointer underneath.
+/// four-way arrow are drawings rather than translations, and this backend draws the pointer
+/// underneath them instead.
 fn shape(style: CursorStyle) -> Option<Shape> {
     let (rows, hotspot, turn) = match style {
         CursorStyle::None => return None,

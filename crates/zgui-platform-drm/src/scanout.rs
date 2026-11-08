@@ -89,7 +89,6 @@ use zgui_drm::resources::Mode;
 use zgui_drm::{Device, Event};
 use zgui_geom::{Device as DeviceSpace, Rect};
 use zgui_platform::{PlatformError, Watchdog, refresh_interval};
-use zgui_render_wgpu::target::swapchain::PeerCopy;
 use zgui_render_wgpu::{Gpu, Pixels, wgpu};
 
 use crate::cursor::Cursor;
@@ -560,7 +559,7 @@ impl Scanout {
     /// the frame it belongs to, so a loop parked on them learns that a frame is ready to be shown
     /// where it is allowed to block — beside the card, the input devices and its own timers.
     /// Nothing else here has to be asked, and asking the graphics driver instead is what
-    /// [`watched`] says the cost of is.
+    /// the `watched` module says the cost of is.
     ///
     /// Empty on every shape but the drawn one, and empty where the frames carry no descriptor.
     pub fn drawing(&self) -> impl Iterator<Item = BorrowedFd<'_>> {
@@ -614,95 +613,6 @@ impl Scanout {
             }
         }
     }
-
-    /// Returns something that can copy between these buffers without the renderer's device.
-    ///
-    /// **Only where the two are different devices.** The buffers a display scans out of are the
-    /// display's, and on a machine that renders elsewhere every pixel of a copy into them crosses
-    /// the link between the two. A rotated buffer is owed the damage it missed while it was not the
-    /// one being written, and those pixels are already correct in the buffer presented last — which
-    /// is on the far side already. Copying them there is the difference between sending a frame's
-    /// damage and sending as many frames of it as the set is deep.
-    ///
-    /// `node` is the **display's** node, because that is the device the buffers live on and the one
-    /// a copier has to be opened over.
-    ///
-    /// Answers `None` where this display keeps the copied shape, where the machine has no EGL for
-    /// that device, and where any step of opening one refuses. Each of those is a display that goes
-    /// on sending every owed rectangle the long way, which is what it did before.
-    pub fn peer_copy(&mut self, node: BorrowedFd<'_>) -> Option<Box<dyn PeerCopy>> {
-        let Buffers::DrawnGl {
-            buffers, signal, ..
-        } = &mut self.buffers
-        else {
-            return None;
-        };
-        // Read before the buffers are borrowed again below.
-        let covered = matches!(*signal, gl::Signal::Kernel | gl::Signal::Written);
-        // Exported in one pass and read back in another: the export takes `&mut`, and a list of
-        // descriptors is several of those borrows at once.
-        for buffer in buffers.iter_mut() {
-            if let Err(reason) = buffer.descriptor() {
-                warn!("a scanout buffer would not export, so nothing repairs them: {reason}");
-                return None;
-            }
-        }
-        let mut described = Vec::with_capacity(buffers.len());
-        for buffer in buffers.iter() {
-            let descriptor = buffer.exported()?;
-            let modifier = buffer.modifier();
-            described.push(zgui_scanout::Buffer {
-                descriptor,
-                width: buffer.texture().width(),
-                height: buffer.texture().height(),
-                fourcc: gl::FOURCC,
-                stride: buffer.stride(),
-                offset: buffer.offset(),
-                // Named only where the driver named one, as the allocation asked for it.
-                modifier: (modifier != gbm::IMPLICIT).then_some(modifier),
-            });
-        }
-        // **Off unless asked for, and the reason is measured rather than argued.** Filling a
-        // rotated buffer's debt from a neighbour halves what crosses the link — 566,800 pixels a
-        // frame become 277,610 — and still makes every frame *slower*, because the copy that ends
-        // the frame has to wait for it. The two devices write the same buffer, so the graphics
-        // device's first draw into it waits for the display device to finish: one draw, 5 to 11 ms,
-        // every frame, found at command 13 of 37 with a probe inside the backend's command replay.
-        //
-        // | scene | repaired | not |
-        // | ----- | -------- | --- |
-        // | 48 shadowed blocks | 53.9 frames a second | **58.9** |
-        // | 12 large blocks | 56.1 | **62.2**, at the timer's cap |
-        // | a page of glyphs | 19.2 ms a frame | **17.9 ms** |
-        // | a scrolling list | 62.2 | 62.2, unchanged |
-        //
-        // What would make it worth having is repairing the slot the **next** frame will draw into
-        // rather than this one's, so the display device's copy has a whole frame to finish in and
-        // nothing waits for it. That needs the rotation's next slot to reach the renderer, and it
-        // has to beat 58.9 to earn its place back.
-        if std::env::var_os("ZGUI_SCANOUT_REPAIR").is_none() {
-            return None;
-        }
-        match zgui_scanout::egl::Egl::open(node, &described) {
-            Ok(copier) => {
-                info!(
-                    target: "zgui::platform",
-                    covered,
-                    "these scanout buffers repair each other on the display's own device: {copier:?}"
-                );
-                Some(Box::new(Peer { copier, covered }))
-            }
-            Err(reason) => {
-                info!(
-                    target: "zgui::platform",
-                    "this display's own device cannot copy between its buffers, so every rectangle \
-                     a rotated buffer is owed is drawn again: {reason}"
-                );
-                None
-            }
-        }
-    }
-
     /// Returns what the kernel knows this display's buffers by, in the order they were registered.
     ///
     /// A caller reports them. A framebuffer id came back from a `drm_mode_fb_cmd2`, so whether
@@ -1156,8 +1066,7 @@ impl Scanout {
             // Only where the one behind carries a descriptor. Where it does not, finding out costs
             // a wait for the card, and a frame is not worth waiting for in order to throw it away.
             if submitted
-                .iter()
-                .nth(1)
+                .get(1)
                 .and_then(|next| next.watched.as_ref())
                 .is_some_and(watched::Watched::drawn)
             {
@@ -1327,7 +1236,7 @@ impl Scanout {
     /// Gives up on a completion that has not arrived, and carries on as though it had.
     ///
     /// Answers whether it gave up on one. A completion is the only thing that frees the buffer the
-    /// display was reading, so one that never arrives leaves [`Rotation::drawing`] refusing a
+    /// display was reading, so one that never arrives leaves `Rotation::drawing` refusing a
     /// buffer to every frame for the rest of the program — a display that goes dark and stays dark.
     /// The same state a session coming back recovers from, reached without anyone taking the
     /// terminal away.
@@ -2033,6 +1942,87 @@ fn allocate(
     }
 }
 
+/// Whether `fence` has already signalled, which is a poll of no length.
+///
+/// For the trace above and for nothing else. Answers `true` where the kernel refuses the question,
+/// which is the same answer [`watched::Watched::drawn`] gives and for the same reason.
+fn already_drawn(fence: BorrowedFd<'_>) -> bool {
+    let mut asked = [rustix::event::PollFd::from_borrowed_fd(
+        fence,
+        rustix::event::PollFlags::IN,
+    )];
+    !matches!(
+        rustix::event::poll(&mut asked, Some(&rustix::event::Timespec::default())),
+        Ok(0)
+    )
+}
+
+/// Opens the device that composites a frame onto a scanout buffer, over the display's own node.
+///
+/// It is given the scanout buffers first and the staging buffers after them, so a scanout slot is
+/// its own index and a staging one is `DRAWN + stage`. One copier holding both is what lets a
+/// composite be two copies into the same buffer rather than two copiers arguing over a thread.
+///
+/// Answers nothing where the node gives no copier — no EGL, no import of a descriptor, no way to
+/// copy. The caller falls back to a shape that needs none.
+fn composite_over(
+    device: &Device,
+    scanout: &[gl::Drawn],
+    staging: &mut [gl::Drawn],
+) -> Option<zgui_scanout::egl::Egl> {
+    // Exported in one pass and read back in another: the export takes `&mut`, and a list of
+    // descriptors is several of those borrows at once.
+    for buffer in staging.iter_mut() {
+        if let Err(reason) = buffer.descriptor() {
+            warn!("a staging buffer would not export, so nothing can composite it: {reason}");
+            return None;
+        }
+    }
+    let mut described = Vec::with_capacity(scanout.len() + staging.len());
+    for buffer in scanout.iter().chain(staging.iter()) {
+        let modifier = buffer.modifier();
+        described.push(zgui_scanout::Buffer {
+            descriptor: buffer.exported()?,
+            width: buffer.texture().width(),
+            height: buffer.texture().height(),
+            fourcc: gl::FOURCC,
+            stride: buffer.stride(),
+            offset: buffer.offset(),
+            // Named only where the driver named one, as the allocation asked for it.
+            modifier: (modifier != gbm::IMPLICIT).then_some(modifier),
+        });
+    }
+    match zgui_scanout::egl::Egl::open(device.as_fd(), &described) {
+        Ok(copier) => {
+            info!(
+                target: "zgui::platform",
+                "this display composites its own frames: {copier:?}"
+            );
+            Some(copier)
+        }
+        Err(reason) => {
+            info!(
+                target: "zgui::platform",
+                "this display's own device cannot composite ({reason}), so it is driven another way"
+            );
+            None
+        }
+    }
+}
+
+/// The rectangles a copier is asked for, in its own shape.
+fn named(rects: &[Rect<i32, DeviceSpace>]) -> Vec<zgui_scanout::Rect> {
+    rects
+        .iter()
+        .map(|rect| zgui_scanout::Rect {
+            x: rect.origin.x,
+            y: rect.origin.y,
+            width: rect.size.width,
+            height: rect.size.height,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     //! The decisions a device cannot help with: which fourcc a readback is, the copy, and the four
@@ -2305,133 +2295,4 @@ mod tests {
             "and a fifth plane would reach the kernel as a plane the image does not have"
         );
     }
-}
-
-/// A [`zgui_scanout`] copier, as the renderer asks for one.
-///
-/// The copy is made and waited for in one call, which is the measured answer rather than the
-/// obvious one. A copier on a thread of its own is *slower* here — the machine has one core and the
-/// driver composing the frame holds it — and splitting the copy so that the frame is composed inside
-/// it hides a millisecond and changes no frame rate.
-#[derive(Debug)]
-struct Peer {
-    /// The device that does the copying.
-    copier: zgui_scanout::egl::Egl,
-    /// Whether the frame's own descriptor already covers this copy.
-    ///
-    /// A sync file taken from the buffer covers **everything** writing it, this copy included — see
-    /// [`gl::Signal::Written`] — so under the tiers that take one there is nothing here to wait
-    /// for and the copy is only started. Under the tiers that do not, the frame goes up when the
-    /// graphics device has finished and this copy is on another device, so it has to be waited for
-    /// before it can be handed on.
-    covered: bool,
-}
-
-impl PeerCopy for Peer {
-    fn copy(&mut self, from: usize, to: usize, rects: &[Rect<i32, DeviceSpace>]) -> bool {
-        let rects: Vec<zgui_scanout::Rect> = rects
-            .iter()
-            .map(|rect| zgui_scanout::Rect {
-                x: rect.origin.x,
-                y: rect.origin.y,
-                width: rect.size.width,
-                height: rect.size.height,
-            })
-            .collect();
-        // Started either way. The issue flushes, so the copy is on its way to the kernel by the
-        // time this answers, and a buffer asked for its writers then reports it.
-        let issued = if self.covered {
-            zgui_scanout::Copier::begin(&mut self.copier, from, to, &rects)
-        } else {
-            zgui_scanout::Copier::copy(&mut self.copier, from, to, &rects)
-        };
-        match issued {
-            Ok(()) => true,
-            Err(reason) => {
-                warn!("the buffers could not be repaired from each other: {reason}");
-                false
-            }
-        }
-    }
-}
-
-/// Whether `fence` has already signalled, which is a poll of no length.
-///
-/// For the trace above and for nothing else. Answers `true` where the kernel refuses the question,
-/// which is the same answer [`watched::Watched::drawn`] gives and for the same reason.
-fn already_drawn(fence: BorrowedFd<'_>) -> bool {
-    let mut asked = [rustix::event::PollFd::from_borrowed_fd(
-        fence,
-        rustix::event::PollFlags::IN,
-    )];
-    !matches!(
-        rustix::event::poll(&mut asked, Some(&rustix::event::Timespec::default())),
-        Ok(0)
-    )
-}
-
-/// Opens the device that composites a frame onto a scanout buffer, over the display's own node.
-///
-/// It is given the scanout buffers first and the staging buffers after them, so a scanout slot is
-/// its own index and a staging one is `DRAWN + stage`. One copier holding both is what lets a
-/// composite be two copies into the same buffer rather than two copiers arguing over a thread.
-///
-/// Answers nothing where the node gives no copier — no EGL, no import of a descriptor, no way to
-/// copy. The caller falls back to a shape that needs none.
-fn composite_over(
-    device: &Device,
-    scanout: &[gl::Drawn],
-    staging: &mut [gl::Drawn],
-) -> Option<zgui_scanout::egl::Egl> {
-    // Exported in one pass and read back in another: the export takes `&mut`, and a list of
-    // descriptors is several of those borrows at once.
-    for buffer in staging.iter_mut() {
-        if let Err(reason) = buffer.descriptor() {
-            warn!("a staging buffer would not export, so nothing can composite it: {reason}");
-            return None;
-        }
-    }
-    let mut described = Vec::with_capacity(scanout.len() + staging.len());
-    for buffer in scanout.iter().chain(staging.iter()) {
-        let modifier = buffer.modifier();
-        described.push(zgui_scanout::Buffer {
-            descriptor: buffer.exported()?,
-            width: buffer.texture().width(),
-            height: buffer.texture().height(),
-            fourcc: gl::FOURCC,
-            stride: buffer.stride(),
-            offset: buffer.offset(),
-            // Named only where the driver named one, as the allocation asked for it.
-            modifier: (modifier != gbm::IMPLICIT).then_some(modifier),
-        });
-    }
-    match zgui_scanout::egl::Egl::open(device.as_fd(), &described) {
-        Ok(copier) => {
-            info!(
-                target: "zgui::platform",
-                "this display composites its own frames: {copier:?}"
-            );
-            Some(copier)
-        }
-        Err(reason) => {
-            info!(
-                target: "zgui::platform",
-                "this display's own device cannot composite ({reason}), so it is driven another way"
-            );
-            None
-        }
-    }
-}
-
-/// The rectangles a copier is asked for, in its own shape.
-fn named(rects: &[Rect<i32, DeviceSpace>]) -> Vec<zgui_scanout::Rect> {
-    rects
-        .iter()
-        .map(|rect| zgui_scanout::Rect {
-            x: rect.origin.x,
-            y: rect.origin.y,
-            width: rect.size.width,
-            height: rect.size.height,
-        })
-        .collect()
 }

@@ -5,11 +5,14 @@ use zgui::style;
 style! { pub PopoverStyle =>
     // The border, the radius, the background and the shadow are the shared surface's, and a
     // popover is the surface those were measured from. What is left is how wide it is and how far
-    // its content sits from its edges.
+    // its content sits from its edges. It is never taller than the room left in the window, and
+    // scrolls past that.
     ":scope {
         width: 288px;
+        max-height: var(--zui-popper-available-height, none);
         padding: var(--zui-space-lg);
         outline: none;
+        overflow-y: auto;
     }"
 
     ".zui-popover__header {

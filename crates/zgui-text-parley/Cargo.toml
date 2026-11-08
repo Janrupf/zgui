@@ -3,6 +3,13 @@ name = "zgui-text-parley"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Text engine for zgui, built on Parley"
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+include.workspace = true
 
 # L4 — engines. This is the one crate in the workspace that names a font engine, which is why
 # every other crate can be built, tested and reasoned about without one.
@@ -33,6 +40,7 @@ smallvec.workspace = true
 # The counters have to hold in an optimised build as well as a debug one, and they are compiled
 # out unless this feature asks for them.
 zgui-profile = { path = "../zgui-profile", version = "0.1.0", features = ["counters"] }
+proptest.workspace = true
 
 [lints]
 workspace = true

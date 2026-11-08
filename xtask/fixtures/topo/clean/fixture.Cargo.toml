@@ -1,3 +1,0 @@
-# Fixture workspace for `cargo xtask ledger topo`.
-[workspace]
-members = ["crates/*"]

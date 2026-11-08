@@ -49,6 +49,9 @@ const PORT: f32 = 120.0;
 struct Drawn {
     /// Every quad's top, height and green channel, which is what names its row.
     quads: Vec<(f32, f32, u8)>,
+    /// Whether the frame damaged nothing, so its walk emitted nothing and nothing on the screen
+    /// changed.
+    undamaged: bool,
 }
 
 impl Drawn {
@@ -93,7 +96,7 @@ impl Renderer for Recorder {
         self.target
     }
 
-    fn draw(&mut self, scene: &Scene, _damage: &DamageSet) -> FrameOutcome {
+    fn draw(&mut self, scene: &Scene, damage: &DamageSet) -> FrameOutcome {
         self.log.borrow_mut().push(Drawn {
             quads: scene
                 .primitives
@@ -108,6 +111,7 @@ impl Renderer for Recorder {
                     Some((quad.bounds[1], quad.bounds[3], green))
                 })
                 .collect(),
+            undamaged: damage.is_empty(),
         });
         FrameOutcome::Presented(zgui_render::FrameStats {
             vector_passes: 0,
@@ -227,12 +231,13 @@ fn first_row_top(harness: &zgui_platform_headless::Harness<Runtime>) -> f32 {
             if matches!(fragment.kind, zgui_layout::FragmentKind::Scrollbar { .. }) {
                 continue;
             }
-            if (fragment.border_box.size.height.0 - ROW).abs() > 0.5 {
+            let border = fragment.on_device(fragment.border_box, &window.placements());
+            if (border.size.height.0 - ROW).abs() > 0.5 {
                 continue;
             }
             top = Some(match top {
-                Some(held) => held.min(fragment.border_box.origin.y.0),
-                None => fragment.border_box.origin.y.0,
+                Some(held) => held.min(border.origin.y.0),
+                None => border.origin.y.0,
             });
         }
     }
@@ -274,10 +279,16 @@ fn a_row_scrolled_into_a_port_is_in_the_frame_that_brought_it_in() {
             if log.borrow().len() == before {
                 continue;
             }
+            // The last steps of a smooth scroll can move the port by less than a device pixel,
+            // and a frame that damaged nothing keeps every pixel of the frame before it.
+            let last = log.borrow().last().expect("a frame was drawn").clone();
+            if last.undamaged {
+                continue;
+            }
             frames += 1;
             let top = first_row_top(&harness);
             let want = covered(top);
-            let drawn = log.borrow().last().expect("a frame was drawn").rows();
+            let drawn = last.rows();
             let missing: Vec<usize> = want
                 .iter()
                 .copied()

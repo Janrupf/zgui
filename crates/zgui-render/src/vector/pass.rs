@@ -21,6 +21,12 @@ pub struct VectorPass {
     pub raster_region: Rect<i32, Device>,
     /// Where the implementation put the result.
     pub target: VectorTarget,
+    /// The round that rasterises this pass.
+    ///
+    /// Rounds are runs of the plan in order: a pass is never in an earlier round than the pass
+    /// before it. A renderer rasterises a round, composites its passes, and then rasterises the
+    /// next one into the same targets.
+    pub round: usize,
     /// The pass's items, indexing the plan's item list.
     pub items: Range<usize>,
     /// The clip a whole-pass composite binds.
@@ -37,4 +43,11 @@ pub struct VectorPass {
     /// sets it exactly when no two of the pass's items overlap each other, so no part of the
     /// scratch is composited twice.
     pub instanced: bool,
+    /// Whether the items reach past the region, because the region was cut to the frame's damage
+    /// or stops at the edge of the surface.
+    ///
+    /// Set from the display list's plan. An implementation keeps the pass's items inside
+    /// [`VectorPass::raster_region`], because the pass beside it in the same scratch begins where
+    /// the region ends.
+    pub clamped: bool,
 }

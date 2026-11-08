@@ -181,12 +181,11 @@ impl ScenePainter<'_> {
     /// element's `color`. Dearer than [`fill`](ScenePainter::fill) — a shape is rasterised — so a
     /// widget reaches for it for the geometry quads cannot say.
     pub fn shape(&mut self, shape: &zgui_svg::Shape) {
-        let placed = zgui_svg::document::place::shape(
-            shape,
-            kurbo::Affine::translate((
-                f64::from(self.content_box.origin.x.0),
-                f64::from(self.content_box.origin.y.0),
-            )),
+        // The painter's coordinates start at the content box, so the shape is placed there by a
+        // translation and the path itself is not copied.
+        let offset = kurbo::Vec2::new(
+            f64::from(self.content_box.origin.x.0),
+            f64::from(self.content_box.origin.y.0),
         );
         self.shapes_pushed += 1;
         // The fragment's identity in the high bits, the shape's index in the low: stable across
@@ -196,7 +195,7 @@ impl ScenePainter<'_> {
         let emitted = crate::emit::vector::document::emit_tracked(
             self.scene,
             id,
-            &placed,
+            &crate::emit::vector::ShapeSource::translated(shape, offset),
             &self.shape_paint,
             self.vector_masks,
             crate::emit::vector::VectorPlacement {
@@ -215,7 +214,7 @@ impl ScenePainter<'_> {
     ///
     /// `origin` is the line box's top-left corner in painter coordinates. The run's glyph positions
     /// are relative to it, each `y` being the distance down to the baseline, which is what
-    /// [`Shaper::shape_line`](zgui_text_parley::Shaper::shape_line) answers in.
+    /// `Shaper::shape_line` answers in.
     ///
     /// `color` paints the run, and the run's own brush slot is not read: an element that shaped its
     /// own text names its own colour. A colour face keeps its own colours and is drawn at `color`'s
@@ -248,32 +247,47 @@ impl ScenePainter<'_> {
 
         let color = self.faded(color);
         let format = crate::content::glyphs::format_of(style);
-        for glyph in &placed {
-            let landed = match format {
+        let transform = self.transform.index();
+        let sprites: Vec<GlyphSprite> = placed
+            .iter()
+            .map(|glyph| match format {
                 // A colour glyph is a picture rather than a coverage mask, so it carries its own
                 // colours and is not tinted.
                 GlyphFormat::Color => {
                     let mut sprite =
                         ColorSprite::new(glyph.bounds, glyph.resource).clipped(self.clip);
-                    sprite.transform = self.transform.index();
+                    sprite.transform = transform;
                     sprite.opacity = color.alpha();
-                    self.scene.push_color_sprite(sprite).is_some()
+                    GlyphSprite::Color(sprite)
                 }
                 GlyphFormat::Subpixel => {
                     let mut sprite =
                         SubpixelSprite::new(glyph.bounds, glyph.resource, color).clipped(self.clip);
-                    sprite.transform = self.transform.index();
-                    self.scene.push_subpixel_sprite(sprite).is_some()
+                    sprite.transform = transform;
+                    GlyphSprite::Subpixel(sprite)
                 }
                 GlyphFormat::Mono => {
                     let mut sprite =
                         MonoSprite::new(glyph.bounds, glyph.resource, color).clipped(self.clip);
-                    sprite.transform = self.transform.index();
-                    self.scene.push_mono_sprite(sprite).is_some()
+                    sprite.transform = transform;
+                    GlyphSprite::Mono(sprite)
                 }
+            })
+            .collect();
+
+        // The glyphs of one run sit side by side in one colour, so the scene orders them as one
+        // group: one question to its tree for the whole run.
+        let inks: Vec<Rect<DevicePx, Device>> = sprites.iter().map(GlyphSprite::ink).collect();
+        self.scene.begin_run(&inks, self.clip, transform);
+        for sprite in sprites {
+            let landed = match sprite {
+                GlyphSprite::Color(sprite) => self.scene.push_color_sprite(sprite),
+                GlyphSprite::Subpixel(sprite) => self.scene.push_subpixel_sprite(sprite),
+                GlyphSprite::Mono(sprite) => self.scene.push_mono_sprite(sprite),
             };
-            self.pushed += usize::from(landed);
+            self.pushed += usize::from(landed.is_some());
         }
+        self.scene.end_run();
     }
 
     /// A path convenience over [`ScenePainter::shape`]: fills `path` with one colour.
@@ -309,6 +323,38 @@ impl ScenePainter<'_> {
     fn push_quad(&mut self, quad: Quad) {
         let quad = quad.transformed(self.transform);
         self.pushed += usize::from(self.scene.push_quad(quad).is_some());
+    }
+}
+
+/// One glyph of a run, built before the run is pushed.
+enum GlyphSprite {
+    /// A colour glyph.
+    Color(ColorSprite),
+    /// A glyph with per-channel coverage.
+    Subpixel(SubpixelSprite),
+    /// A glyph with one coverage channel.
+    Mono(MonoSprite),
+}
+
+impl GlyphSprite {
+    /// The rectangle the glyph paints.
+    fn ink(&self) -> Rect<DevicePx, Device> {
+        match self {
+            Self::Color(sprite) => sprite.ink(),
+            Self::Subpixel(sprite) => sprite.ink(),
+            Self::Mono(sprite) => sprite.ink(),
+        }
+    }
+}
+
+/// Uniform corner radii in the shape quads carry them.
+fn corners(radius: f32) -> Corners<Vec2<DevicePx>> {
+    let corner = Vec2::new(DevicePx(radius), DevicePx(radius));
+    Corners {
+        top_left: corner,
+        top_right: corner,
+        bottom_left: corner,
+        bottom_right: corner,
     }
 }
 
@@ -370,11 +416,13 @@ mod tests {
         ShapedRun {
             face: FaceId(1),
             size: 16.0,
+            instance: zgui_text::VariationInstance::DEFAULT,
             synthetic_bold: 0.0,
             synthetic_slant: 0.0,
             has_color,
             brush: zgui_scene::PaintSlot(3),
             glyphs: &GLYPHS,
+            text_start: 0,
         }
     }
 
@@ -408,6 +456,47 @@ mod tests {
             vector_routes: crate::emit::vector::VectorRoutes::NONE,
             pushed: 0,
         }
+    }
+
+    /// A shape is drawn from its own path, placed at the content box by a translation.
+    #[test]
+    fn a_custom_shape_is_placed_at_its_content_box() {
+        let mut scene = Scene::new();
+        scene.begin_frame(Size::new(200, 100));
+        let placements = FixedTiles::default();
+        let mut path = zgui_scene::kurbo::BezPath::new();
+        path.move_to((0.0, 0.0));
+        path.line_to((12.0, 1.0));
+        path.line_to((3.0, 9.0));
+        path.close_path();
+        let shape = zgui_svg::Shape {
+            path: std::sync::Arc::new(path),
+            fill: Some(zgui_svg::Fill {
+                paint: zgui_svg::Paint::Solid(zgui_svg::Ink::Inherited { alpha: 1.0 }),
+                rule: zgui_scene::peniko::Fill::NonZero,
+            }),
+            stroke: None,
+            clips: Vec::new(),
+        };
+        let mut painter = painter(&mut scene, &placements, false, 1.0);
+        painter.clip = ClipId::ROOT;
+        painter.shape(&shape);
+
+        let item = &scene.primitives.vectors[0];
+        assert!(
+            std::sync::Arc::ptr_eq(&item.path, &shape.path),
+            "the painter's own path is drawn, not a copy"
+        );
+        assert_eq!(
+            item.placement,
+            zgui_scene::kurbo::Affine::translate((10.5, 20.25))
+        );
+        let bounds = item.placed_bounds();
+        assert_eq!((bounds.x0, bounds.y0), (10.5, 20.25));
+        assert_eq!(
+            item.local_ink.origin,
+            Point::new(DevicePx(10.5), DevicePx(20.25))
+        );
     }
 
     #[test]
@@ -535,15 +624,42 @@ mod tests {
         assert_eq!(painter.pushed, 0);
         assert!(scene.primitives.mono_sprites.is_empty());
     }
-}
 
-/// Uniform corner radii in the shape quads carry them.
-fn corners(radius: f32) -> Corners<Vec2<DevicePx>> {
-    let corner = Vec2::new(DevicePx(radius), DevicePx(radius));
-    Corners {
-        top_left: corner,
-        top_right: corner,
-        bottom_left: corner,
-        bottom_right: corner,
+    #[test]
+    fn a_run_of_glyphs_stands_above_its_band_at_one_order_without_overlaps() {
+        let mut scene = Scene::new();
+        scene.begin_frame(zgui_geom::Size::new(400, 400));
+        let band = scene.paints.solid(Color::srgb(0.2, 0.2, 0.2, 1.0));
+        scene.push_quad(zgui_scene::Quad::filled(
+            Rect::new(
+                Point::new(DevicePx(0.0), DevicePx(0.0)),
+                Size::new(DevicePx(200.0), DevicePx(60.0)),
+            ),
+            zgui_scene::PaintRef::solid(band),
+        ));
+        let placements = FixedTiles {
+            tiles: 4,
+            ..FixedTiles::default()
+        };
+        let mut painter = painter(&mut scene, &placements, false, 1.0);
+        painter.clip = ClipId::ROOT;
+        painter.glyphs(
+            &run(false),
+            Point::new(DevicePx(0.0), DevicePx(0.0)),
+            Color::srgb(1.0, 1.0, 1.0, 1.0),
+        );
+
+        let orders: Vec<_> = scene
+            .primitives
+            .mono_sprites
+            .iter()
+            .map(|sprite| sprite.order)
+            .collect();
+        assert_eq!(
+            orders,
+            [2, 2, 2, 2],
+            "the run stands above the band, side by side"
+        );
+        assert_eq!(scene.order_overlaps().map(|found| found.len()), Ok(0));
     }
 }

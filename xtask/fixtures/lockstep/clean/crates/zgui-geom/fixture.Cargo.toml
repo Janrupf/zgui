@@ -1,0 +1,4 @@
+[package]
+name = "zgui-geom"
+version.workspace = true
+edition = "2024"

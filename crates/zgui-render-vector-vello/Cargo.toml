@@ -3,11 +3,19 @@ name = "zgui-render-vector-vello"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Vector rasterizer built on Vello"
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+include.workspace = true
 
 # L2 — backends. Every dependency is inherited: `foo.workspace = true`.
 [dependencies]
 kurbo.workspace = true
 peniko.workspace = true
+rustc-hash.workspace = true
 tracing.workspace = true
 vello.workspace = true
 wgpu.workspace = true
@@ -41,6 +49,13 @@ zgui-color = { path = "../zgui-color", version = "0.1.0" }
 # one whose colours resolved rightly, so only the pixels tell them apart.
 zgui-dom = { path = "../zgui-dom", version = "0.1.0" }
 zgui-vocab = { path = "../zgui-vocab", version = "0.1.0" }
+
+# Shapes built directly, so one list is drawn by the analytic route and by this crate's rasteriser
+# and the two pictures are compared.
+zgui-svg = { path = "../zgui-svg", version = "0.1.0" }
+
+# Canvas series and views, drawn by the real emitter and compared with fresh encodings.
+zgui-canvas = { path = "../zgui-canvas", version = "0.1.0" }
 
 [lints]
 workspace = true

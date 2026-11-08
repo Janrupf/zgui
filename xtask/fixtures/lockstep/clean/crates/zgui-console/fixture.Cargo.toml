@@ -1,0 +1,9 @@
+[package]
+name = "zgui-console"
+version.workspace = true
+edition = "2024"
+publish = false
+
+# Not published, so a bare path is no fault here.
+[dependencies]
+zgui-render = { path = "../zgui-render" }

@@ -133,6 +133,7 @@ fn a_timer_costs_exactly_one_wake_and_one_frame_and_leaves_no_deadline() {
     assert_eq!(harness.pump(), 1, "and it produced exactly one frame");
     assert_eq!(harness.frames_requested(), 1);
     assert_eq!(fired.get(), 1, "the callback ran, once");
+    support::cross_maintenance(&mut harness);
     assert!(
         harness.parked_deadline().is_none(),
         "an expired deadline was re-installed, which is the spin"
@@ -155,6 +156,7 @@ fn an_idle_window_parks_and_draws_nothing_for_ten_seconds() {
         Box::new(view.into_view().build(cx))
     });
     harness.settle(8);
+    support::cross_maintenance(&mut harness);
     harness.reset_counts();
 
     let frames = harness.run_for(Duration::from_secs(10), Duration::from_millis(16));

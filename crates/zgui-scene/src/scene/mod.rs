@@ -3,6 +3,7 @@
 pub mod batching;
 pub mod chunk;
 pub mod depends;
+pub(crate) mod device;
 pub mod finish;
 pub mod insert;
 pub(crate) mod live;
@@ -10,6 +11,7 @@ pub mod opaque;
 pub mod ordering;
 pub mod primitives;
 pub mod resolve;
+pub mod run;
 
 #[cfg(test)]
 mod tests;
@@ -29,7 +31,7 @@ use crate::scene::resolve::Unresolved;
 use crate::shader::{FrameClock, ShaderParamsTable};
 use crate::spatial::{SpatialId, SpatialTree};
 
-pub use crate::scene::chunk::{ChunkPrims, ChunkSlot, ChunkUpload, TableHolds};
+pub use crate::scene::chunk::{ChunkNote, ChunkPrims, ChunkSlot, TableHolds};
 pub use crate::scene::depends::SpatialFault;
 pub use crate::scene::opaque::OpaqueCover;
 pub use crate::scene::ordering::OrderOverlap;
@@ -131,14 +133,13 @@ pub struct Scene {
     remap: Remap,
     /// Where each instanced primitive came from, parallel to its array — see
     /// [`Scene::provenance`].
-    provenance: [Vec<crate::scene::chunk::ChunkSlot>; 7],
+    provenance: [Vec<crate::scene::chunk::ChunkSlot>; 8],
     /// Positions pushed under the open capture, awaiting the revision the encoding is stamped
     /// with: (kind, index in the frame array, index in the capture's lane).
     capture_stamped: Vec<(PrimitiveKind, u32, u32)>,
-    /// Chunks encoded since the notes were last cleared — see [`Scene::chunk_inserted`].
-    chunk_inserted: Vec<crate::scene::chunk::ChunkUpload>,
-    /// Chunk revisions dropped since the notes were last cleared.
-    chunk_retired: Vec<u64>,
+    /// Chunks encoded and dropped since the notes were last cleared, in note order — see
+    /// [`Scene::chunk_notes`].
+    chunk_notes: Vec<crate::scene::chunk::ChunkNote>,
     /// How far each chunk replayed away from where it was encoded, this frame, by revision.
     ///
     /// What lets a moved replay keep its resident bytes: the renderer serves the encode-position
@@ -147,6 +148,21 @@ pub struct Scene {
     chunk_offsets: rustc_hash::FxHashMap<u64, [f32; 2]>,
     /// The draw-order assigner.
     order: BoundsTree,
+    /// The device matrix of each slot an order was placed through, kept between tree writes.
+    device: crate::scene::device::DeviceMatrices,
+    /// The last clip cull asked of the clip table, and its answer.
+    ///
+    /// Consecutive primitives nearly always share a clip and a coordinate system, and the answer
+    /// is a walk up the whole chain. The key holds the table's version, so a rewrite of any link
+    /// in place asks again.
+    clip_cull: Option<ClipCull>,
+    /// Every slot's matrix, resolved by [`Scene::finish`] at the tree's stamp in `kept_stamp`.
+    ///
+    /// Read through [`Scene::placements`].
+    kept_placements: crate::spatial::Placements,
+    /// The tree's [write stamp](crate::PropertyTree::writes) when `kept_placements` was resolved;
+    /// zero before that.
+    kept_stamp: u64,
     /// The region each moving coordinate system declared it would visit.
     ///
     /// Read when a matrix is written after the ordering is done, which is the one moment the
@@ -161,6 +177,8 @@ pub struct Scene {
     /// where the chunk now sits is a question. Set and taken once per push, so nothing can leak
     /// past the primitive it was reserved for.
     pub(crate) replay_order: Option<DrawOrder>,
+    /// The orders of the run being pushed, while [`Scene::begin_run`] has one open.
+    run: Option<crate::scene::run::RunOrders>,
     /// Every order a layer forced this frame, so a check knows which classes it does not own.
     forced_orders: Vec<DrawOrder>,
     /// Where the nth marker of each direction sits in [`Primitives::groups`].
@@ -173,6 +191,8 @@ pub struct Scene {
     markers: Markers,
     /// This frame's vector work.
     pass_plan: ScenePassPlan,
+    /// This frame's union bins for marks.
+    mark_plan: crate::pass::MarkPlan,
     /// The surface's extent, which pass regions are clamped to.
     viewport: Size<i32, Device>,
     /// What application effects are told about this frame.
@@ -186,6 +206,22 @@ pub struct Scene {
     /// Empty for a frame every one of whose rasters was already where it was going to be, which is
     /// the ordinary case and costs a pointer. See [`mod@resolve`].
     unresolved: Vec<Unresolved>,
+}
+
+/// One clip cull: the chain, the slot it was read for, the table's version, and the answer.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClipCull {
+    /// The chain culled against.
+    clip: crate::id::ClipId,
+    /// The slot whose links were read.
+    space: u32,
+    /// The clip table's version when it was read.
+    version: crate::table::TableVersion,
+    /// The spatial tree's write stamp when it was read, because a link from a content system's
+    /// container is carried by the matrices.
+    stamp: u64,
+    /// What [`ClipTable::bounds_in_carried`] gave.
+    admitted: zgui_geom::Rect<zgui_geom::DevicePx, Device>,
 }
 
 /// The draw-order permutation of each sortable array, as indices into it.
@@ -210,6 +246,8 @@ pub(crate) struct Remap {
     pub(crate) subpixel_sprites: Vec<u32>,
     /// Full-colour sprites.
     pub(crate) color_sprites: Vec<u32>,
+    /// Recognised shapes drawn from a shared payload.
+    pub(crate) marks: Vec<u32>,
     /// Textures the renderer did not draw.
     pub(crate) externals: Vec<u32>,
     /// Filters over the composite beneath them.
@@ -228,6 +266,7 @@ impl Remap {
         self.mono_sprites.clear();
         self.subpixel_sprites.clear();
         self.color_sprites.clear();
+        self.marks.clear();
         self.externals.clear();
         self.backdrops.clear();
         self.groups.clear();
@@ -281,19 +320,24 @@ impl Scene {
             capture: None,
             capture_order: BoundsTree::new(),
             replay_order: None,
+            run: None,
             checking: crate::invariant::enabled(),
             remap: Remap::default(),
             provenance: Default::default(),
             capture_stamped: Vec::new(),
-            chunk_inserted: Vec::new(),
-            chunk_retired: Vec::new(),
+            chunk_notes: Vec::new(),
             chunk_offsets: rustc_hash::FxHashMap::default(),
             order: BoundsTree::new(),
+            device: Default::default(),
+            clip_cull: None,
+            kept_placements: crate::spatial::Placements::new(),
+            kept_stamp: 0,
             travel: Travels::new(),
             layer_stack: Vec::new(),
             forced_orders: Vec::new(),
             markers: Markers::default(),
             pass_plan: ScenePassPlan::default(),
+            mark_plan: crate::pass::MarkPlan::default(),
             viewport: Size::new(0, 0),
             frame_clock: FrameClock::default(),
             finished: false,
@@ -337,9 +381,11 @@ impl Scene {
         // clears them once a draw has retired its damage.
         self.order.clear();
         self.layer_stack.clear();
+        self.run = None;
         self.forced_orders.clear();
         self.markers.clear();
         self.pass_plan.clear();
+        self.mark_plan.clear();
         self.unresolved.clear();
         self.viewport = viewport;
         self.finished = false;
@@ -376,6 +422,11 @@ impl Scene {
     /// This frame's vector work, valid once [`Scene::finish`] has run.
     pub fn pass_plan(&self) -> &ScenePassPlan {
         &self.pass_plan
+    }
+
+    /// This frame's union bins for marks, valid once [`Scene::finish`] has run.
+    pub fn mark_plan(&self) -> &crate::pass::MarkPlan {
+        &self.mark_plan
     }
 
     /// The draw-order assigner, for a caller that needs to ask it a question directly.

@@ -108,88 +108,67 @@ fn rect_coverage(point: vec2<f32>, bounds: Bounds, radii: Radii, shape: f32) -> 
     return saturate(0.5 - quad_sdf(point, bounds, radii, shape));
 }
 
+// Whether a point lies outside an upright box.
+fn outside_bounds(point: vec2<f32>, b: Bounds) -> bool {
+    return point.x < b.x || point.y < b.y || point.x > b.x + b.w || point.y > b.y + b.h;
+}
+
 // Coverage of a device pixel by a whole clip chain. Every pipeline that draws into the composed
 // target applies exactly this function, so one clip means one thing whatever draws through it.
+//
+// Each field is read where it is used, through the array. Some drivers load all fields of a copy
+// of the whole record before the first branch, so every fragment then pays for the kept part and
+// for both rounded tests, also when the chain has none of them.
 fn clip_coverage(point: vec2<f32>, clip_id: u32) -> f32 {
-    // Read a texel at a time rather than through `load_clip`, which reads all eleven. Nearly every
-    // primitive in a document is clipped by nothing at all, and that case needs two of them: the
-    // box, and the count that says there are no rounded tests. On a device that reads its tables
-    // out of textures the other nine fetches are paid per *fragment*, which is where the frame
-    // goes.
-    //
-    // The offsets are the record's own, and `the_clip_record_is_laid_out_the_way_the_shader_reads_it`
-    // fails the build if the record ever moves under them.
-    let aabb = bitcast<vec4<f32>>(textureLoad(clips, table_texel(clip_id * 11u + 0u), 0));
     // The intersection rectangle is a hard edge: it is an axis-aligned box in device space, and
     // antialiasing it would bleed content one pixel outside a scrollport.
-    if point.x < aabb.x || point.y < aabb.y
-        || point.x > aabb.x + aabb.z || point.y > aabb.y + aabb.w {
+    if outside_bounds(point, clip_aabb(clip_id)) {
         return 0.0;
     }
-    let count = textureLoad(clips, table_texel(clip_id * 11u + 9u), 0).x;
-    if count == 0u {
-        return 1.0;
+    // The kept links are tested in their own system, which only translates: the point moves
+    // back by that translation.
+    var first = point;
+    var second = point;
+    let space = clip_space(clip_id);
+    if space != NO_SPACE {
+        let kept = point - load_spatial(space)[3].xy;
+        if outside_bounds(kept, clip_kept_aabb(clip_id)) {
+            return 0.0;
+        }
+        let tests = clip_kept_tests(clip_id);
+        first = select(point, kept, (tests & 1u) != 0u);
+        second = select(point, kept, (tests & 2u) != 0u);
     }
-    var coverage = rect_coverage(
-        point,
-        clip_rect(clip_id, 1u),
-        clip_radii(clip_id, 2u),
-        clip_shape(clip_id, 4u),
-    );
+    let count = clip_count(clip_id);
+    var coverage = 1.0;
+    if count > 0u {
+        let test = clip_rounded(clip_id, 0u);
+        coverage *= rect_coverage(first, test.rect, test.radii, test.shape);
+    }
     if count > 1u {
-        coverage *= rect_coverage(
-            point,
-            clip_rect(clip_id, 5u),
-            clip_radii(clip_id, 6u),
-            clip_shape(clip_id, 8u),
-        );
+        let test = clip_rounded(clip_id, 1u);
+        coverage *= rect_coverage(second, test.rect, test.radii, test.shape);
     }
     return coverage;
 }
 
-/// Coverage by a clip's rounded tests alone, for a caller that has already rejected the box.
-///
-/// `count` is the clip's own, carried from wherever it was read. Zero means the clip is a box and
-/// nothing else, which is nearly every clip in a document, and then this reads no table at all.
+// Coverage by a clip's rounded tests alone, for a caller that has already tested the box.
+//
+// `count` is the clip's own, carried from wherever it was read. Zero means the clip is a box and
+// nothing else, which is nearly every clip in a document, and then this reads no table at all.
+// A clip measured in a system of its own is not for this function: the kept part needs the table.
 fn clip_rounded_coverage(point: vec2<f32>, clip_id: u32, count: u32) -> f32 {
     if count == 0u {
         return 1.0;
     }
-    var coverage = rect_coverage(
-        point,
-        clip_rect(clip_id, 1u),
-        clip_radii(clip_id, 2u),
-        clip_shape(clip_id, 4u),
-    );
+    let first = clip_rounded(clip_id, 0u);
+    var coverage = rect_coverage(point, first.rect, first.radii, first.shape);
     if count > 1u {
-        coverage *= rect_coverage(
-            point,
-            clip_rect(clip_id, 5u),
-            clip_radii(clip_id, 6u),
-            clip_shape(clip_id, 8u),
-        );
+        let second = clip_rounded(clip_id, 1u);
+        coverage *= rect_coverage(point, second.rect, second.radii, second.shape);
     }
     return coverage;
 }
-
-/// One of a clip's rounded tests, as the rectangle at `texel` of its record.
-fn clip_rect(clip_id: u32, texel: u32) -> Bounds {
-    let held = bitcast<vec4<f32>>(textureLoad(clips, table_texel(clip_id * 11u + texel), 0));
-    return Bounds(held.x, held.y, held.z, held.w);
-}
-
-/// The eight radii that go with it, which are the two texels from `texel`.
-fn clip_radii(clip_id: u32, texel: u32) -> Radii {
-    let low = bitcast<vec4<f32>>(textureLoad(clips, table_texel(clip_id * 11u + texel), 0));
-    let high = bitcast<vec4<f32>>(textureLoad(clips, table_texel(clip_id * 11u + texel + 1u), 0));
-    return Radii(low.x, low.y, low.z, low.w, high.x, high.y, high.z, high.w);
-}
-
-/// The superellipse exponent beside them, on the first component of `texel`.
-fn clip_shape(clip_id: u32, texel: u32) -> f32 {
-    return bitcast<f32>(textureLoad(clips, table_texel(clip_id * 11u + texel), 0).x);
-}
-
 
 // Modulus that has the same sign as `a`.
 fn sdf_fmod(a: f32, b: f32) -> f32 {

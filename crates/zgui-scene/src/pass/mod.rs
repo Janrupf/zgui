@@ -36,7 +36,9 @@
 //! draw order is allocated from what a primitive overlaps and so does not rise with emission order.
 //! Both facts are only decidable once the pass is complete, which is where rule 5 applies them.
 
+pub(crate) mod cells;
 pub mod coalesce;
+pub mod marks;
 pub mod overlap;
 pub mod plan;
 pub mod region;
@@ -48,6 +50,7 @@ mod fixture;
 #[cfg(test)]
 mod tests;
 
+pub use crate::pass::marks::{MarkBin, MarkPlan};
 pub use crate::pass::overlap::{Intervening, Overlap};
 pub use crate::pass::plan::{PlannedItem, PlannedPass, ScenePassPlan};
 pub use crate::pass::warning::PassWarning;

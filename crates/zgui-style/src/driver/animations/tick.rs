@@ -26,6 +26,7 @@ use zgui_vocab::Pseudo;
 
 use crate::driver::animations::sample::{self, AnimatedProperties};
 use crate::driver::animations::set::{self, Animations};
+use crate::driver::animations::zero;
 
 /// Whether an edge belongs to a keyframe animation or to a transition.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -247,6 +248,11 @@ pub(crate) fn advance(
     });
     drop(sets);
 
+    for row in &folded {
+        if row.crossed {
+            animations.note_crossed(row.index);
+        }
+    }
     report.elements = folded
         .into_iter()
         .map(|row| {
@@ -392,12 +398,30 @@ fn step(
     let before = report.edges.len();
     for animation in &mut set.animations {
         let name = animation.name.to_string();
+        let instant = animation.duration == 0.0;
+        // An animation of no length that the cascade added finished has started and ended by the
+        // time this tick first sees it.
+        if instant && animation.is_new && animation.state == AnimationState::Finished {
+            for lifecycle in [Lifecycle::Started, Lifecycle::Ended] {
+                report.edges.push(AnimationEdge {
+                    node,
+                    kind: TimedKind::Animation,
+                    name: name.clone(),
+                    pseudo,
+                    lifecycle,
+                    elapsed: Duration::ZERO,
+                });
+            }
+        }
         // The engine marks an animation it has just created and never clears the mark; clearing it
         // here is what makes "this tick is the first to see it" answerable at all. An animation has
         // no event at creation — only a transition does — so the mark is spent rather than reported.
         animation.is_new = false;
         if animation.state == AnimationState::Pending && now >= animation.started_at {
             animation.state = AnimationState::Running;
+            if instant {
+                zero::after_phase(animation);
+            }
             report.edges.push(AnimationEdge {
                 node,
                 kind: TimedKind::Animation,
@@ -407,7 +431,8 @@ fn step(
                 elapsed: begun_at(animation.delay, animation.duration),
             });
         }
-        if animation.iterate_if_necessary(now) {
+        // An animation of no length has no iteration to move on from.
+        if !instant && animation.iterate_if_necessary(now) {
             report.edges.push(AnimationEdge {
                 node,
                 kind: TimedKind::Animation,
@@ -417,7 +442,7 @@ fn step(
                 elapsed: active_duration(animation, iterations_done(animation)),
             });
         }
-        if animation.state == AnimationState::Running && animation.has_ended(now) {
+        if animation.state == AnimationState::Running && zero::ended(animation, now) {
             animation.state = AnimationState::Finished;
             report.edges.push(AnimationEdge {
                 node,
@@ -483,7 +508,7 @@ fn step(
 }
 
 /// Whether a finished animation's last keyframe stays in force.
-fn fills_forwards(animation: &Animation) -> bool {
+pub(crate) fn fills_forwards(animation: &Animation) -> bool {
     matches!(animation.fill_mode, FillMode::Forwards | FillMode::Both)
 }
 

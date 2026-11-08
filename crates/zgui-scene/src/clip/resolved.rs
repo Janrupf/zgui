@@ -22,10 +22,10 @@ pub struct RoundedTest {
 /// A whole clip chain, flattened into what one draw call can apply.
 ///
 /// A chain of any length collapses to an intersection rectangle plus at most two rounded tests plus
-/// at most one coverage mask. A chain that needs more than that is not truncated — truncating a
-/// clip is a silently wrong pixel — but promoted: the content is drawn into a target of its own and
-/// composited, and [`ClipTable::needs_group_target`](crate::ClipTable::needs_group_target) is the
-/// question that decides it.
+/// at most one coverage mask. Rounded tests that change no pixel inside the rectangle are left out.
+/// When more than two remain, the two innermost are kept and [`ResolvedClip::dropped`] counts the
+/// others; [`ClipTable::needs_group_target`](crate::ClipTable::needs_group_target) names the chains
+/// a target of their own would draw exactly.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ResolvedClip {
     /// The intersection of every rectangle in the chain, as `[x, y, width, height]`.
@@ -34,6 +34,8 @@ pub struct ResolvedClip {
     pub rounded: [RoundedTest; 2],
     /// How many of `rounded` are meaningful.
     pub rounded_count: u32,
+    /// How many rounded tests that change pixels could not be applied.
+    pub dropped: u8,
     /// The coverage tile the chain samples, if it has one.
     pub mask: Option<AtlasTile>,
 }
@@ -57,6 +59,7 @@ impl ResolvedClip {
             ],
             rounded: [RoundedTest::default(); 2],
             rounded_count: 0,
+            dropped: 0,
             mask: None,
         }
     }
@@ -89,4 +92,21 @@ impl ResolvedClip {
     pub fn is_empty(&self) -> bool {
         self.aabb[2] <= 0.0 || self.aabb[3] <= 0.0
     }
+}
+
+/// A whole clip chain, flattened with the links of one coordinate system kept in its coordinates.
+///
+/// What [`ClipTable::resolve_kept`](crate::ClipTable::resolve_kept) gives. The links measured in
+/// the kept system are moved by its translation when the clip is applied, so the system can move
+/// and the flattened chain stays valid.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KeptClip {
+    /// The chain, with [`ResolvedClip::aabb`] the intersection of the links measured elsewhere.
+    ///
+    /// The rounded tests are of both parts.
+    pub clip: ResolvedClip,
+    /// The intersection of the links measured in the kept system, in its coordinates.
+    pub kept_aabb: [f32; 4],
+    /// Bit `i` is set when `clip.rounded[i]` is measured in the kept system.
+    pub kept_tests: u32,
 }

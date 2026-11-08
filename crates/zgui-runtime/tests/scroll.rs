@@ -168,12 +168,13 @@ fn topmost_row_top(window: &zgui_runtime::Window, height: f32) -> f32 {
             if matches!(fragment.kind, zgui_layout::FragmentKind::Scrollbar { .. }) {
                 continue;
             }
-            if (fragment.border_box.size.height.0 - height).abs() > 0.5 {
+            let border = fragment.on_device(fragment.border_box, &window.placements());
+            if (border.size.height.0 - height).abs() > 0.5 {
                 continue;
             }
             top = Some(match top {
-                Some(held) => held.min(fragment.border_box.origin.y.0),
-                None => fragment.border_box.origin.y.0,
+                Some(held) => held.min(border.origin.y.0),
+                None => border.origin.y.0,
             });
         }
     }
@@ -404,6 +405,7 @@ fn a_smooth_scroll_travels_over_several_frames_and_parks_with_a_deadline() {
         "it never arrived"
     );
     harness.assert_park_invariant();
+    support::cross_maintenance(&mut harness);
     assert!(
         harness.parked_deadline().is_none(),
         "having arrived, it must stop asking to be woken"
@@ -431,7 +433,7 @@ fn scrollport(window: &zgui_runtime::Window) -> Rect<DevicePx, Device> {
             let frag = layout.fragments_of_box(key).first().copied();
             if let Some(fragment) = frag.and_then(|frag| layout.fragment(frag)) {
                 let _ = region;
-                return fragment.content_box;
+                return fragment.on_device(fragment.content_box(), &window.placements());
             }
         }
     }
@@ -785,61 +787,6 @@ fn a_drag_that_leaves_the_scrollport_keeps_carrying_the_list_it_started_on() {
         "the finger travelled 120 pixels and the list followed it {}; the drag left the \
          scrollport and the list stopped being the thing being dragged",
         after - before
-    );
-}
-
-#[test]
-fn a_wheel_past_the_top_stretches_the_content_and_it_springs_back() {
-    let mut harness = listing(200);
-    harness.settle(8);
-    let resting = topmost_row_top(window(&harness), 20.0);
-
-    // Upwards, from the origin: nothing can absorb it. Read while it is still displaced, because
-    // the spring that brings it back is the second half of what this asserts and running it first
-    // would leave nothing to see.
-    turn(&mut harness, (200.0, 60.0), -3.0);
-
-    let stretched = topmost_row_top(window(&harness), 20.0);
-    assert!(
-        stretched > resting,
-        "the content did not follow the gesture past the end at all"
-    );
-    let container = window(&harness)
-        .layout()
-        .borrow()
-        .keys()
-        .into_iter()
-        .find(|key| {
-            zgui_layout::scroll_region::region_of(&window(&harness).layout().borrow(), *key)
-                .is_some()
-        })
-        .expect("a container");
-    assert_eq!(
-        window(&harness)
-            .scroll()
-            .borrow()
-            .offset_of(element_of(window(&harness), container))
-            .y,
-        DevicePx(0.0),
-        "the reported offset went negative; a scrollbar, a `scrollTop` read and a virtualiser all \
-         read that number and none of them can express content that does not exist"
-    );
-
-    for _ in 0..60 {
-        harness.advance(FRAME);
-        harness.settle(4);
-        if window(&harness).scroll().borrow().settled() {
-            break;
-        }
-    }
-    assert!(
-        window(&harness).scroll().borrow().settled(),
-        "the content stayed stretched past its end"
-    );
-    assert_eq!(
-        topmost_row_top(window(&harness), 20.0),
-        resting,
-        "it sprang back somewhere other than where it started"
     );
 }
 

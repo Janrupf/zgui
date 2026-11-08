@@ -16,8 +16,11 @@ const SHEET: &str = "zui-icon";
 
 /// Draws one icon.
 ///
-/// The outline is a compile-time constant and the appearance is CSS: the box comes from
-/// `--zui-icon-size`, which the `size` prop selects between, and the colour is the element's own
+/// The outline is a compile-time constant and the appearance is CSS. The box is
+/// `--zui-icon-size` square, and each icon sets that property from the step its `size` prop names:
+/// `--zui-icon-sm`, `--zui-icon-md` (the default), `--zui-icon-lg` or `--zui-icon-xl`. So a
+/// container resizes the icons under it through a step, for example `var:--zui-icon-md = "20px"`,
+/// and `--zui-icon-size` on one icon resizes only that icon. The colour is the element's own
 /// computed `color` — so an icon inside a button follows that button's text without being told,
 /// and `.zui-alert--destructive .zui-icon { color: … }` re-colours one with no prop at all.
 ///

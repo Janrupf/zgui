@@ -249,7 +249,7 @@ fn an_item_whose_residual_clip_has_no_shape_is_left_out_and_counted() {
     let mut compute =
         zgui_render_vector_vello::VelloRaster::new(&gpu, 128, 128).expect("a rasteriser");
     let plan = zgui_render::VectorRaster::plan(&mut compute, scene.pass_plan());
-    zgui_render::VectorRaster::clear_targets(&mut compute, &plan);
+    zgui_render::VectorRaster::clear_targets(&mut compute, &plan, 0);
     let placements = zgui_scene::Placements::of(&scene.spatial);
     let mut frame = zgui_render::VectorFrame::new(
         &plan,
@@ -267,7 +267,7 @@ fn an_item_whose_residual_clip_has_no_shape_is_left_out_and_counted() {
 
     let mut fallback = zgui_render_vector_coverage::CoverageRaster::new(&gpu, 128, 128);
     let plan = zgui_render::VectorRaster::plan(&mut fallback, scene.pass_plan());
-    zgui_render::VectorRaster::clear_targets(&mut fallback, &plan);
+    zgui_render::VectorRaster::clear_targets(&mut fallback, &plan, 0);
     let placements = zgui_scene::Placements::of(&scene.spatial);
     let mut frame = zgui_render::VectorFrame::new(
         &plan,
@@ -282,4 +282,118 @@ fn an_item_whose_residual_clip_has_no_shape_is_left_out_and_counted() {
         1,
         "and the fallback made the same decision, which is what makes it one contract"
     );
+}
+
+/// A placement that stretches one axis stretches the pen with it, on both rasterisers.
+///
+/// A stroke is in path space with the path, so a circle stroked two units wide under a placement
+/// that doubles the horizontal axis draws a band four pixels wide at its left and right and two
+/// pixels wide at its top and bottom.
+#[test]
+fn a_stretched_stroke_matches_on_both_rasterisers() {
+    let Some((mut compute, mut coverage)) = both() else {
+        return;
+    };
+    let mut scene = scene();
+    quad(&mut scene, rect(0.0, 0.0, 128.0, 128.0), opaque(0, 0, 0));
+    let paint = support::solid(&mut scene, opaque(255, 255, 255));
+    let item = zgui_scene::VectorItem::stroked(
+        zgui_scene::VectorId(0),
+        circle(0.0, 0.0, 10.0),
+        paint,
+        2.0,
+    )
+    .placed(kurbo::Affine::translate((40.0, 40.0)) * kurbo::Affine::scale_non_uniform(2.0, 1.0));
+    scene.push_vector(item);
+    scene.finish(&DamageSet::full());
+    let by_compute = present(&mut compute.renderer, &scene);
+    let by_coverage = present(&mut coverage, &scene);
+
+    // Whole pixels the band covers to at least half, along each centre line before the centre.
+    let across = |pixels: &zgui_render_wgpu::Pixels| {
+        (0..40).filter(|x| pixels.rgba(*x, 40)[0] >= 128).count()
+    };
+    let down = |pixels: &zgui_render_wgpu::Pixels| {
+        (0..40).filter(|y| pixels.rgba(40, *y)[0] >= 128).count()
+    };
+    for (name, pixels) in [("vello", &by_compute), ("coverage", &by_coverage)] {
+        let (across, down) = (across(pixels), down(pixels));
+        println!("{name}: across {across}, down {down}");
+        assert!(
+            across.abs_diff(4) <= 1,
+            "{name} draws the stretched side {across} px wide"
+        );
+        assert!(
+            down.abs_diff(2) <= 1,
+            "{name} draws the unstretched side {down} px wide"
+        );
+    }
+    let (worst, _, _) = compare(&by_compute, &by_coverage);
+    assert!(
+        worst <= 72,
+        "the two rasterisers disagree by {worst} on a stretched stroke"
+    );
+}
+
+/// A scene of a red square that goes past the bottom of the surface, and two small green ones in a
+/// pass of their own that is packed below it in the scratch.
+fn over_the_edge() -> Scene {
+    let mut scene = scene();
+    quad(&mut scene, rect(0.0, 0.0, 128.0, 128.0), opaque(0, 0, 0));
+    let red = rect(16.0, 100.0, 32.0, 60.0);
+    vector(&mut scene, 0, path(red), opaque(255, 0, 0), ClipId::ROOT);
+    // Painted over the red square, so the green one cannot join its pass.
+    quad(&mut scene, red, zgui_color::Color::srgb_u8(0, 0, 0, 0));
+    // Two green squares that overlap, so their pass composites its whole region.
+    for (index, x) in [(1, 8.0), (2, 10.0)] {
+        vector(
+            &mut scene,
+            index,
+            path(rect(x, 84.0, 8.0, 8.0)),
+            opaque(0, 255, 0),
+            ClipId::ROOT,
+        );
+    }
+    scene.finish(&DamageSet::full());
+    scene
+}
+
+/// A pass whose ink goes past the edge of the surface stays inside its bin.
+///
+/// The region of the red square stops at the bottom of the surface, and the bin of the green pass
+/// starts right below the red square's bin. Ink past the region would land in the green pass's bin
+/// and be composited as part of it.
+#[test]
+fn a_pass_past_the_edge_of_the_surface_stays_in_its_bin() {
+    for which in [Which::Vello, Which::Coverage] {
+        let Some(mut harness) = harness(which) else {
+            return;
+        };
+        let scene = over_the_edge();
+        let plan = scene.pass_plan();
+        assert_eq!(plan.len(), 2, "the fixture needs two passes");
+        assert!(plan.passes[0].overhangs, "the red square has to overhang");
+        assert!(
+            !plan.passes[1].instanced,
+            "the green pass has to composite its whole region"
+        );
+        let pixels = present(&mut harness.renderer, &scene);
+        assert_eq!(
+            pixels.rgba(12, 88),
+            [0, 255, 0, 255],
+            "{which:?}: the green square"
+        );
+        for (x, y) in [(2, 80), (2, 90), (24, 82)] {
+            assert_eq!(
+                pixels.rgba(x, y),
+                [0, 0, 0, 255],
+                "{which:?}: the green pass drew the red square's ink at ({x}, {y})"
+            );
+        }
+        assert_eq!(
+            pixels.rgba(32, 120),
+            [255, 0, 0, 255],
+            "{which:?}: the red square"
+        );
+    }
 }

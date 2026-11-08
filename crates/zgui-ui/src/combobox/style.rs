@@ -11,12 +11,13 @@ style! { pub ComboboxStyle =>
     // Quiet, and no target of its own: the whole frame opens the list, so a mark that took a press
     // would be a second thing to hit inside one control.
     ".zui-combobox__mark { color: var(--zui-color-muted-foreground); pointer-events: none; }"
-    // Tall enough to be worth scrolling and short enough to stay a list rather than a page. The
-    // scroll is the list's own, so the field above it stays put while the options move.
+    // Tall enough to be worth scrolling and short enough to stay a list rather than a page, and
+    // never taller than the room left in the window. The scroll is the list's own, so the field
+    // above it stays put while the options move.
     ".zui-combobox__list {
         padding: var(--zui-space-xs);
         min-width: 220px;
-        max-height: 384px;
+        max-height: min(384px, var(--zui-popper-available-height, 384px));
         overflow-x: hidden;
         overflow-y: auto;
     }"

@@ -1,18 +1,19 @@
 //! The bars a scrollport shows in the gutter it reserved.
 //!
 //! A scroll container that reserved a gutter has a strip of its padding box that its content was
-//! moved out of. Two things go there. A *track* fills the whole strip and is drawn whenever the
-//! gutter exists at all, because the strip is space the content will never cover and an unpainted
-//! one is a hole in the window — and nothing laid out as a fraction of the viewport can fill it
-//! either, the viewport being the window less exactly these gutters. A *thumb* is drawn over it only
-//! when the content really can move, is as long as the fraction of the content that is visible, and
-//! sits where the scroll offset puts it.
+//! moved out of. As in CSS, the strip is between the inner border edge and the padding: the bar
+//! touches the border, and the padding stays on the content's side of the bar. Two things go
+//! there. A *track* fills the whole strip whenever the gutter exists at all, and it is what catches
+//! a press that pages the content. Its paint is the theme's to decide; the default paint draws
+//! nothing there. A *thumb* sits on the track only when the content really can move, is as long as
+//! the fraction of the scrollport that is visible, and sits where the scroll offset puts it.
 //!
-//! Every rectangle here is derived from two numbers layout has already produced: the box's inner
-//! rectangle — its padding box less its padding — and its content box, which differ by exactly the
-//! gutter. Deriving from their difference rather than from the scrollbar width a second time is
-//! what keeps a track flush with the content at a fractional scale, where two roundings of the
-//! same quantity part company and leave a seam.
+//! Every rectangle here is derived from numbers layout has already produced: the padding box, the
+//! inner rectangle — the padding box less its padding — and the content box. The inner rectangle
+//! and the content box differ by exactly the gutter. Deriving the thickness from their difference
+//! rather than from the scrollbar width a second time keeps a track edge on the same number as
+//! the edge it meets at a fractional scale, where two roundings of the same quantity part company
+//! and leave a seam.
 
 pub mod live;
 pub mod place;
@@ -32,6 +33,8 @@ use crate::tree::store::ResolvedLayout;
 /// second and is deliberately not layout state.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Scrollport {
+    /// The padding box: the inner border edge, which the bars touch.
+    pub padding_box: Rect<DevicePx, Device>,
     /// The padding box less the padding: the content box plus whatever gutters were reserved.
     pub inner: Rect<DevicePx, Device>,
     /// The rectangle the content is laid out in, which is `inner` less the gutters.
@@ -58,6 +61,18 @@ impl Scrollport {
     /// Whether `axis` reserved a gutter, and therefore has a track.
     pub fn reserves(&self, axis: Axis) -> bool {
         self.thickness(axis) > 0.0
+    }
+
+    /// The padding between the content box and the bar on `axis`.
+    ///
+    /// The right padding for the vertical bar and the bottom padding for the horizontal one. Zero
+    /// exactly when the box has no padding there, so a bar on an unpadded box starts on the same
+    /// number the content box ends on.
+    pub fn bar_padding(&self, axis: Axis) -> f32 {
+        match axis {
+            Axis::Vertical => self.padding_box.right().0 - self.inner.right().0,
+            Axis::Horizontal => self.padding_box.bottom().0 - self.inner.bottom().0,
+        }
     }
 
     /// How much of the content is visible along `axis`.
@@ -160,6 +175,10 @@ mod tests {
     /// height of content.
     pub(super) fn tall() -> Scrollport {
         Scrollport {
+            padding_box: Rect::new(
+                Point::new(DevicePx(0.0), DevicePx(0.0)),
+                Size::new(DevicePx(200.0), DevicePx(200.0)),
+            ),
             inner: Rect::new(
                 Point::new(DevicePx(0.0), DevicePx(0.0)),
                 Size::new(DevicePx(200.0), DevicePx(200.0)),

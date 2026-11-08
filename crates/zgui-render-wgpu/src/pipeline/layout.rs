@@ -39,6 +39,13 @@ pub struct Layouts {
     /// because the parameters are the same for every rectangle of a draw: two rectangles that
     /// disagree about them are two draws, and the batcher breaks the run where they do.
     pub effect: wgpu::BindGroupLayout,
+    /// One mark draw's block, and the payload of the kind it draws.
+    ///
+    /// The block names the item and its bin. The payload is a table walked by the draw's
+    /// instances, one prim each.
+    pub marks: wgpu::BindGroupLayout,
+    /// One mark draw's block, and the bin pages a union item's composite reads.
+    pub mark_composite: wgpu::BindGroupLayout,
 }
 
 impl Layouts {
@@ -54,13 +61,34 @@ impl Layouts {
                 label: Some("zgui.bind.effect"),
                 entries: &[dynamic_uniform(0)],
             }),
+            marks: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("zgui.bind.marks"),
+                entries: &[dynamic_uniform(0), table(1)],
+            }),
+            mark_composite: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("zgui.bind.mark_composite"),
+                entries: &[
+                    dynamic_uniform(0),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2Array,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                ],
+            }),
             instances: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("zgui.bind.instances"),
-                // The instances alone. They keep push order, and the draw order that used to sit
-                // beside them here — with the chunk offset its entries named — is now an instanced
-                // vertex attribute: the slot, and the shift resolved beside it. See
-                // `buffer::tables`.
-                entries: &[table(0)],
+                // The instance arena, which keeps push order, and the draw order beside it. The
+                // order is vertex input for every lane but one, so this binding of it is for the
+                // mark lane alone: a mark's draw names its position in the order rather than its
+                // instance index, and indexing needs the stream bound. The chunk offsets that
+                // used to be a third binding are resolved into the order on the host.
+                entries: &[table(0), table(1)],
             }),
             sampled: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("zgui.bind.sampled"),
@@ -153,10 +181,10 @@ fn dynamic_uniform(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-/// A side table, read one texel at a time with no sampler.
+/// One side table, as a `rgba32uint` texture rather than a storage buffer.
 ///
-/// The tables were storage buffers, which a GL 3.3 context and WebGL 2 have none of. See
-/// `buffer::tables` for what that costs and what pays for it.
+/// Storage buffers arrive in OpenGL 4.3 and OpenGL ES 3.1, so a GL 3.3 context has none; a
+/// texture read one texel at a time gives the same random access on every device.
 fn table(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,

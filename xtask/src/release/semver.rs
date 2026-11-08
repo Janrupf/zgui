@@ -4,9 +4,10 @@
 //! machine compare the surface against the one that was published last. `cargo-semver-checks` does
 //! that comparison; this decides what to compare against and turns its answer into an exit code.
 //!
-//! The baseline is the newest release tag. Before the first release there is nothing a consumer
-//! could have depended on, so the comparison is reported as having no baseline rather than being
-//! quietly passed: a gate that says "ok" when it did not run is worse than no gate.
+//! The baseline is the newest release tag before the checked commit. Before the first release there
+//! is nothing a consumer could have depended on, so the comparison is reported as having no
+//! baseline rather than being quietly passed: a gate that says "ok" when it did not run is worse
+//! than no gate.
 
 use std::path::Path;
 use std::process::Command;
@@ -67,7 +68,11 @@ fn installed() -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
-/// The newest release tag, or `None` before the first release.
+/// The newest release tag that does not contain the commit being checked, or `None` before the
+/// first release.
+///
+/// A tag on the checked commit itself is left out. That is the release being made, and comparing
+/// it with itself would pass every time.
 fn baseline(root: &Path) -> Option<String> {
     let output = Command::new("git")
         .current_dir(root)
@@ -76,6 +81,8 @@ fn baseline(root: &Path) -> Option<String> {
             "--list",
             &format!("{TAG_PREFIX}*"),
             "--sort=-v:refname",
+            "--no-contains",
+            "HEAD",
         ])
         .output()
         .ok()?;

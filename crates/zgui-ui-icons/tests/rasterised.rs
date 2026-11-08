@@ -68,11 +68,6 @@ fn a_mounted_icon_puts_ink_on_the_device_in_the_colour_of_the_text_around_it() {
     let runs = runs!();
     let frame = page::Runs::settled(&runs.marked);
     assert!(frame.items > 0, "the display list held no drawing at all");
-    assert!(
-        frame.vector_passes > 0,
-        "the frame planned no rasterisation pass for a display list with {} drawings in it",
-        frame.items
-    );
 
     let covered = measure::count(&frame.full, in_band);
     assert!(
@@ -267,9 +262,15 @@ fn a_document_with_no_drawing_in_it_costs_no_rasterisation() {
             "a frame with no drawing in it planned a rasterisation pass"
         );
     }
-    // The other document, on the same device through the same renderer, does plan one — so the
-    // count above is about this document rather than about a number nothing ever moves.
-    assert!(page::Runs::settled(&runs.marked).vector_passes > 0);
+    // The turned icon, on the same device through the same renderer, does plan one — so the count
+    // above is about this document rather than about a number nothing ever moves. The upright icon
+    // is no comparison: it arrives as a coverage mask, which needs no pass.
+    let turned = page::Runs::settled(&runs.turned);
+    assert!(
+        turned.vector_passes > 0,
+        "a turned icon planned no rasterisation pass ({} drawings)",
+        turned.items
+    );
     let bare = page::Runs::settled(&runs.bare);
     if let Some((x, y, found)) = measure::first_unlike(&bare.full, |_, _| true, PANEL) {
         panic!("({x}, {y}) of the bare panel came back {found:?} rather than {PANEL:?}");

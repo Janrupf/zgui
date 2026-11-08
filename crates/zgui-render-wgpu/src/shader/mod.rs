@@ -36,11 +36,21 @@ pub enum Module {
     External,
     /// Compositing a rasterised vector batch back into the target.
     Vector,
+    /// The discs of a mark.
+    MarksDisc,
+    /// The boxes of a mark.
+    MarksBox,
+    /// The polylines of a mark.
+    MarksPolyline,
+    /// The glyphs of a mark.
+    MarksGlyph,
+    /// Painting a union mark through its bin.
+    MarksComposite,
 }
 
 impl Module {
     /// Every module, which is what makes "each one compiles" a statement about all of them.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 17] = [
         Self::Quad,
         Self::Shadow,
         Self::Decoration,
@@ -53,6 +63,11 @@ impl Module {
         Self::Composite,
         Self::External,
         Self::Vector,
+        Self::MarksDisc,
+        Self::MarksBox,
+        Self::MarksPolyline,
+        Self::MarksGlyph,
+        Self::MarksComposite,
     ];
 
     /// Whether this module reads the frame's globals and side tables.
@@ -79,6 +94,11 @@ impl Module {
             Self::Composite => "zgui.shader.composite",
             Self::External => "zgui.shader.external",
             Self::Vector => "zgui.shader.vector",
+            Self::MarksDisc => "zgui.shader.marks_disc",
+            Self::MarksBox => "zgui.shader.marks_box",
+            Self::MarksPolyline => "zgui.shader.marks_polyline",
+            Self::MarksGlyph => "zgui.shader.marks_glyph",
+            Self::MarksComposite => "zgui.shader.marks_composite",
         }
     }
 }
@@ -91,7 +111,9 @@ impl Module {
 pub fn structures(module: Module) -> Vec<Reflected> {
     use crate::bind::globals::Globals;
     use crate::bind::tables::{GpuClip, GpuPaint, GpuSpatial, GpuStop};
-    use zgui_scene::{ColorSprite, Decoration, MonoSprite, Quad, Shadow, SubpixelSprite};
+    use zgui_scene::{
+        ColorSprite, Decoration, MarkBox, MarkItem, MonoSprite, Quad, Shadow, SubpixelSprite,
+    };
 
     if !module.uses_tables() {
         // A module that reads no side tables declares only its own block, or nothing at all.
@@ -99,17 +121,23 @@ pub fn structures(module: Module) -> Vec<Reflected> {
             Module::Blur => vec![reflected!(
                 crate::pipeline::blur::BlurParams,
                 "BlurParams",
-                [extents, kernel, sampling, valid]
+                [extents, kernel, sampling, valid, origins]
             )],
             _ => Vec::new(),
         };
     }
     let mut structures = vec![
-        reflected!(Globals, "Globals", [viewport, gamma_ratios, text, frame]),
+        reflected!(
+            Globals,
+            "Globals",
+            [viewport, gamma_ratios, text, frame, origin]
+        ),
         reflected!(
             GpuClip,
             "Clip",
-            [aabb, first, second, count, has_mask, mask]
+            [
+                aabb, first, second, kept_aabb, count, space, kept_tests, pad
+            ]
         ),
         reflected!(
             GpuPaint,
@@ -121,6 +149,47 @@ pub fn structures(module: Module) -> Vec<Reflected> {
         reflected!(GpuStop, "Stop", [color, offset, pad]),
         reflected!(GpuSpatial, "Spatial", [matrix]),
     ];
+    if matches!(
+        module,
+        Module::MarksDisc
+            | Module::MarksBox
+            | Module::MarksPolyline
+            | Module::MarksGlyph
+            | Module::MarksComposite
+    ) {
+        structures.push(reflected!(
+            MarkItem,
+            "MarkItem",
+            [
+                order,
+                flags,
+                bounds,
+                paint,
+                clip,
+                transform,
+                paint_origin,
+                origin,
+                discs,
+                boxes,
+                vertices,
+                half_width,
+                axes,
+                glyphs,
+                tiles,
+                texture,
+                first
+            ]
+        ));
+        structures.push(reflected!(
+            crate::pipeline::marks::MarkDraw,
+            "MarkDraw",
+            [position, page, shift, region]
+        ));
+        if module == Module::MarksBox {
+            structures.push(reflected!(MarkBox, "MarkBox", [rect, radii, shape]));
+        }
+        return structures;
+    }
     structures.push(match module {
         Module::Quad => reflected!(
             Quad,
@@ -132,7 +201,7 @@ pub fn structures(module: Module) -> Vec<Reflected> {
                 radii,
                 border,
                 fill,
-                strokes,
+                stroke,
                 clip,
                 transform,
                 shape,
@@ -146,6 +215,7 @@ pub fn structures(module: Module) -> Vec<Reflected> {
                 order,
                 blur,
                 bounds,
+                shape_bounds,
                 radii,
                 element_bounds,
                 element_radii,
@@ -192,7 +262,8 @@ pub fn structures(module: Module) -> Vec<Reflected> {
                 matrix1,
                 matrix2,
                 matrix3,
-                matrix_offset
+                matrix_offset,
+                origin
             ]
         ),
         Module::External => reflected!(
@@ -207,6 +278,13 @@ pub fn structures(module: Module) -> Vec<Reflected> {
         ),
         Module::Blit | Module::Clear | Module::Blur => {
             unreachable!("a module reading no side tables was answered above")
+        }
+        Module::MarksDisc
+        | Module::MarksBox
+        | Module::MarksPolyline
+        | Module::MarksGlyph
+        | Module::MarksComposite => {
+            unreachable!("a mark module was answered above")
         }
     });
     structures

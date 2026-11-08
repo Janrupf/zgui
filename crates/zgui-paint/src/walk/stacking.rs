@@ -16,7 +16,7 @@ use std::borrow::Cow;
 use smallvec::SmallVec;
 use zgui_dom::side::BoxKey;
 use zgui_layout::LayoutStore;
-use zgui_layout::fragment::stacking::{level, z_index};
+use zgui_layout::fragment::stacking::{PaintKey, paint_key};
 
 /// What a walk does at each box.
 pub trait Visitor {
@@ -45,18 +45,14 @@ pub fn walk(store: &LayoutStore, root: BoxKey, visitor: &mut impl Visitor) {
         return;
     }
     if let Some(node) = store.get(root) {
-        let mut kept: SmallVec<[(u8, i32, usize, BoxKey); 16]> = SmallVec::new();
+        let mut kept: SmallVec<[(PaintKey, BoxKey); 16]> = SmallVec::new();
         for (position, &child) in node.children.iter().enumerate() {
             if visitor.descends(store, child) {
-                kept.push((0, 0, position, child));
+                kept.push((paint_key(store, root, node, position, child), child));
             }
         }
-        for entry in &mut kept {
-            entry.0 = level(store, entry.3) as u8;
-            entry.1 = z_index(store, entry.3);
-        }
-        kept.sort_by_key(|(pass, index, position, _)| (*pass, *index, *position));
-        for (_, _, _, child) in kept {
+        kept.sort_by_key(|(key, _)| *key);
+        for (_, child) in kept {
             walk(store, child, visitor);
         }
     }
@@ -65,47 +61,9 @@ pub fn walk(store: &LayoutStore, root: BoxKey, visitor: &mut impl Visitor) {
 
 /// One box's children, in the order they are painted.
 ///
-/// The sort is stable, so two children in the same pass with the same `z-index` keep the order they
-/// are laid out in — which is the tie-break the specification gives, and which `order` on a flex
-/// item has already moved, exactly as it moves painting.
-///
-/// Borrowed where the two orders already agree, which is nearly every box: a container of ordinary
-/// block or inline children puts all of them in one pass at one index, and a stable sort of that is
-/// the list it started with. Recognising it costs one walk and saves two allocations and the sort,
-/// per entered box, per frame.
+/// The layout crate's answer, re-exported where the walk and the shift test read it.
 pub fn children_in_paint_order(store: &LayoutStore, key: BoxKey) -> Cow<'_, [BoxKey]> {
-    let Some(node) = store.get(key) else {
-        return Cow::Borrowed(&[]);
-    };
-    let mut ranks = node
-        .children
-        .iter()
-        .map(|&child| (level(store, child) as u8, z_index(store, child)));
-    let mut previous = ranks.next();
-    let sorted = ranks.all(|rank| {
-        let ordered = previous.is_some_and(|last| last <= rank);
-        previous = Some(rank);
-        ordered
-    });
-    if sorted {
-        return Cow::Borrowed(&node.children);
-    }
-
-    let mut children: Vec<(u8, i32, usize, BoxKey)> = node
-        .children
-        .iter()
-        .enumerate()
-        .map(|(position, &child)| {
-            (
-                level(store, child) as u8,
-                z_index(store, child),
-                position,
-                child,
-            )
-        })
-        .collect();
-    children.sort_by_key(|(pass, index, position, _)| (*pass, *index, *position));
-    Cow::Owned(children.into_iter().map(|(_, _, _, child)| child).collect())
+    zgui_layout::fragment::stacking::children_in_paint_order(store, key)
 }
 
 #[cfg(test)]

@@ -64,6 +64,20 @@ pub trait Renderer {
         false
     }
 
+    /// Whether the picture composed before the last [`Renderer::configure`] is still there to draw
+    /// over.
+    ///
+    /// A renderer answering true keeps its composed target through a change of size whenever it
+    /// still fits, so the caller damages what the new extent exposes and what the layout moved,
+    /// and leaves the rest of the picture standing. One answering false is drawn for in full after
+    /// every configure — and so is one that had to allocate its target again, which is why this is
+    /// asked after each configure and not once.
+    ///
+    /// False by default, so a renderer that has not thought about it is correct.
+    fn composed_survives_configure(&self) -> bool {
+        false
+    }
+
     /// Moves the still-valid pixels of a composed region, before the next [`Renderer::draw`].
     ///
     /// Only ever called on a renderer that answered true to
@@ -161,6 +175,15 @@ pub trait Renderer {
     /// **A wrapper renderer must forward this to what it wraps**, or everything behind the wrapper
     /// silently loses the capability.
     fn as_any_mut(&mut self) -> Option<&mut dyn core::any::Any> {
+        None
+    }
+
+    /// The shared form of [`Renderer::as_any_mut`], for a caller that only reads.
+    ///
+    /// A harness that reads the presented texture back between frames reaches its own
+    /// renderer through [`Window::renderer`](https://docs.rs/zgui) with this. The same rule
+    /// applies: a wrapper forwards it, or answers with itself when it is the type being asked for.
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
         None
     }
 }

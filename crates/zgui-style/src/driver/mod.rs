@@ -9,6 +9,9 @@
 
 pub mod animations;
 pub mod context;
+mod memo;
+mod recalc;
+pub(crate) mod share;
 pub mod snapshots;
 pub mod traversal;
 
@@ -23,7 +26,7 @@ use style::traversal::DomTraversal;
 use style::traversal_flags::TraversalFlags;
 use zgui_dom::{Document, Node};
 
-use crate::driver::animations::AnimationTime;
+use crate::driver::animations::{AnimationTime, fill};
 use crate::driver::traversal::{RecalcStyle, Restyled};
 use crate::engine::guards;
 
@@ -66,6 +69,12 @@ pub struct Restyle {
     pub records: Vec<Restyled>,
     /// Time spent inside the style engine.
     pub engine_time: Duration,
+    /// The elements whose running or filling animations took new keyframe values, because a
+    /// custom property their `@keyframes` read moved.
+    ///
+    /// The animation tick reads the new values. A loop with nothing else to run parks before it
+    /// does, so whoever drives the frames asks for one more.
+    pub refreshed: Vec<zgui_dom::NodeIndex>,
 }
 
 impl Restyle {
@@ -111,6 +120,40 @@ pub(crate) struct Pass<'a> {
     pub(crate) animations: DocumentAnimationSet,
     /// The instant animation-derived values are resolved at.
     pub(crate) now: AnimationTime,
+    /// What each rule chain reads and declares, as far as earlier traversals found out.
+    pub(crate) refs: &'a traversal::RefsCache,
+    /// The computed styles earlier cascades produced, by rule chain.
+    pub(crate) shared: &'a share::SharedStyles,
+    /// The elements whose animations crossed a lifecycle edge since their last cascade, or `None`
+    /// when every animation tick cascades.
+    pub(crate) settling: Option<&'a rustc_hash::FxHashSet<zgui_dom::NodeIndex>>,
+}
+
+/// What one traversal did.
+pub(crate) struct PassOutcome {
+    /// What it styled.
+    pub(crate) records: Vec<Restyled>,
+    /// The elements whose keyframes it computed again.
+    pub(crate) refreshed: Vec<zgui_dom::NodeIndex>,
+    /// How many distinct workers ran.
+    pub(crate) workers: usize,
+    /// Whether it ran at all.
+    pub(crate) traversed: bool,
+    /// Time spent inside the style engine.
+    pub(crate) time: Duration,
+}
+
+impl PassOutcome {
+    /// A traversal that did nothing, which took `time` to decide.
+    fn nothing(time: Duration) -> Self {
+        Self {
+            records: Vec::new(),
+            refreshed: Vec::new(),
+            workers: 0,
+            traversed: false,
+            time,
+        }
+    }
 }
 
 /// Runs one traversal over the document and reports what it styled.
@@ -128,16 +171,19 @@ pub(crate) fn run_pass(
     lock: &SharedRwLock,
     pass: Pass<'_>,
     flags: TraversalFlags,
-) -> (Vec<Restyled>, usize, bool, Duration) {
+) -> PassOutcome {
     let Pass {
         document,
         snapshots,
         pool,
         animations,
         now,
+        refs,
+        shared,
+        settling,
     } = pass;
     let Some(root) = document.root() else {
-        return (Vec::new(), 0, false, Duration::ZERO);
+        return PassOutcome::nothing(Duration::ZERO);
     };
     let start = Instant::now();
 
@@ -151,6 +197,7 @@ pub(crate) fn run_pass(
 
     zgui_profile::latency::mark("st.context");
     let read = lock.read();
+    let table = animations.clone();
     let context = context::build(
         stylist,
         guards::guards(&read),
@@ -159,14 +206,22 @@ pub(crate) fn run_pass(
         now,
         flags,
     );
-    let token = <RecalcStyle<'_> as DomTraversal<Node<'_>>>::pre_traverse(root, &context);
+    let from = if flags.for_animation_only() {
+        root
+    } else {
+        traversal_start(document, root)
+    };
+    let token = <RecalcStyle<'_> as DomTraversal<Node<'_>>>::pre_traverse(from, &context);
     if !token.should_traverse() {
         drop(context);
-        return (Vec::new(), 0, false, start.elapsed());
+        return PassOutcome::nothing(start.elapsed());
     }
 
     zgui_profile::latency::mark("st.traverse");
-    let traverser = RecalcStyle::new(context);
+    // The traversal styles each element against the table it drops a finished animation from,
+    // so the animations that fill forwards are held running for its length.
+    let held = fill::hold(&table);
+    let traverser = RecalcStyle::new(context, refs, shared, settling);
     // A worker that panics leaves per-element bookkeeping in a state no later traversal can
     // interpret, and the worker that panicked holds nothing anyone can inspect, so the document is
     // poisoned on the way out and the panic keeps going.
@@ -174,9 +229,66 @@ pub(crate) fn run_pass(
         .guarded(|| style::driver::traverse_dom(&traverser, token, pool))
         .expect("the document is not poisoned");
     zgui_profile::latency::mark("st.finish");
-    let (records, workers) = traverser.finish();
+    let (records, refreshed, workers) = traverser.finish();
+    held.release(&table, now.seconds());
     drop(read);
-    (records, workers, true, start.elapsed())
+    PassOutcome {
+        records,
+        refreshed,
+        workers,
+        traversed: true,
+        time: start.elapsed(),
+    }
+}
+
+/// The element the traversal starts at: the deepest one that every obligation lies at or below.
+///
+/// The engine's own traversal starts at the root and, at every element it enters, asks each
+/// child whether it needs a visit — which is a probe of every row of a list for a class toggled
+/// on one cell of one of them. The document's dirty-child records already say which child that
+/// is, so the start descends while an element owes nothing itself, carries no snapshot and no
+/// hint of the engine's, and has exactly one child with style work under it. An element with a
+/// snapshot stops the descent above it, because the invalidation the snapshot runs can reach the
+/// element's later siblings, and those are only visited from their parent.
+fn traversal_start<'doc>(document: &'doc Document, root: Node<'doc>) -> Node<'doc> {
+    use style::dom::TElement;
+
+    let store = document.store();
+    let mut current = root;
+    loop {
+        let index = current.index();
+        let record = store.core(index);
+        let (own, _) = record.dirty().get();
+        if own.intersects(zgui_dom::stylo::flags::STYLE_WORK)
+            || current.has_snapshot()
+            || current.has_custom_map_changed()
+            || current
+                .borrow_data()
+                .is_none_or(|data| !data.has_styles() || !data.hint.is_empty())
+        {
+            return current;
+        }
+        let mut only = None;
+        for child in record.dirty_children().iter(store, index) {
+            let child_record = store.core(child);
+            let (child_own, child_subtree) = child_record.dirty().get();
+            if !(child_own | child_subtree).intersects(zgui_dom::stylo::flags::STYLE_WORK) {
+                continue;
+            }
+            if child_record.kind() != zgui_dom::NodeKind::Element || only.is_some() {
+                return current;
+            }
+            only = Some(child);
+        }
+        let Some(child) = only else {
+            return current;
+        };
+        let next = document.node(child);
+        if next.has_snapshot() {
+            return current;
+        }
+        current = next;
+    }
 }
 
 /// Whether anything at or below the root owes the style engine work.

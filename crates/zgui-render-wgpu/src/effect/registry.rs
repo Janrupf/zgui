@@ -142,12 +142,11 @@ impl Effects {
         format: wgpu::TextureFormat,
     ) -> Option<&wgpu::RenderPipeline> {
         let effect = self.registered.get(&id)?;
-        let key = (id, format);
-        if !self.built.contains_key(&key) {
-            let pipeline = build(gpu, layouts, cache, effect, format);
-            self.built.insert(key, pipeline);
-        }
-        self.built.get(&key)
+        Some(
+            self.built
+                .entry((id, format))
+                .or_insert_with(|| build(gpu, layouts, cache, effect, format)),
+        )
     }
 }
 
@@ -259,11 +258,12 @@ fn build(
                 module: &effect.module,
                 entry_point: Some(zgui_wgsl::vertex_entry(effect.mode)),
                 compilation_options: Default::default(),
-                // A primitive effect draws out of the shaded lane exactly as the framework's own
-                // pipelines draw out of theirs: the order stream is its vertex input. A filter
-                // effect covers a rectangle and reads a texture; it has no instances to order.
+                // An effect drawing out of an instance lane fetches the draw order exactly as
+                // the six built-in per-instance pipelines do. A filter or a backdrop draws one
+                // quad over a region instead, with no instance to name — and a pipeline that
+                // declared a vertex buffer it never bound would fail validation.
                 buffers: if effect.mode.is_primitive() {
-                    &crate::pipeline::REMAP
+                    crate::pipeline::ORDER_LAYOUT
                 } else {
                     &[]
                 },

@@ -11,7 +11,8 @@
 //! can be dropped: without it a page with a handful of atomic inlines re-lays out its whole
 //! contents on every frame that changes any width.
 
-use taffy::{AvailableSpace, LayoutInput, LayoutPartialTree, RunMode, Size, SizingMode};
+use cephal::tree::{LayoutInput, LayoutTree as EngineTree, RequestedAxis, RunMode, SizingMode};
+use cephal::{AvailableSpace, Line, Size};
 use zgui_dom::side::BoxKey;
 
 use crate::key::to_node_id;
@@ -33,16 +34,23 @@ pub struct Constraint {
     available_width: SpaceKey,
     /// The space available on the block axis.
     available_height: SpaceKey,
+    /// The block size a percentage height resolves against, if definite.
+    basis_height: Option<u32>,
 }
 
 impl Constraint {
     /// The constraint a measurement was taken under.
-    pub fn new(known: Size<Option<f32>>, available: Size<AvailableSpace>) -> Self {
+    pub fn new(
+        known: Size<Option<f32>>,
+        available: Size<AvailableSpace>,
+        basis_height: Option<f32>,
+    ) -> Self {
         Self {
             known_width: known.width.map(f32::to_bits),
             known_height: known.height.map(f32::to_bits),
             available_width: SpaceKey::new(available.width),
             available_height: SpaceKey::new(available.height),
+            basis_height: basis_height.map(f32::to_bits),
         }
     }
 }
@@ -71,7 +79,7 @@ impl SpaceKey {
 
 /// The pass's tally of shrink-to-fit questions.
 ///
-/// The answers themselves live on each box (see [`AtomicAnswers`]), where the box's own
+/// The answers themselves live on each box (see `AtomicAnswers`), where the box's own
 /// invalidation clears them and an unchanged box keeps them across frames. The tally stays on the
 /// pass because it describes the pass: what a test asserts is that *this* layout asked and was
 /// answered.
@@ -163,13 +171,17 @@ impl AtomicAnswers {
 }
 
 /// Measures an atomic inline by running a nested layout of its own subtree.
+///
+/// `basis_height` is the block size of the containing block, which a percentage height resolves
+/// against. It is separate from `available`, which is the room the line offers.
 pub(crate) fn measure<C: MeasureContent>(
     tree: &mut LayoutTree<'_, C>,
     key: BoxKey,
     known: Size<Option<f32>>,
     available: Size<AvailableSpace>,
+    basis_height: Option<f32>,
 ) -> Measured {
-    let constraint = Constraint::new(known, available);
+    let constraint = Constraint::new(known, available, basis_height);
     let held = tree
         .state(key)
         .and_then(|state| state.atomic.as_deref())
@@ -184,18 +196,24 @@ pub(crate) fn measure<C: MeasureContent>(
         LayoutInput {
             run_mode: RunMode::PerformLayout,
             sizing_mode: SizingMode::InherentSize,
-            axis: taffy::RequestedAxis::Both,
+            axis: RequestedAxis::Both,
             known_dimensions: known,
-            parent_size: available.into_options(),
+            known_dimensions_are_definite: Size::TRUE,
+            parent_size: Size {
+                width: available.width.into_option(),
+                height: basis_height,
+            },
             available_space: available,
-            vertical_margins_are_collapsible: taffy::Line::FALSE,
+            vertical_margins_are_collapsible: Line::FALSE,
+            context_key: 0,
         },
+        None,
     );
     let last = tree.state(key).and_then(|state| state.last_baseline);
     let measured = Measured {
         size: output.size,
-        first_baseline: output.first_baselines.y,
-        last_baseline: last.or(output.first_baselines.y),
+        first_baseline: output.baselines.first,
+        last_baseline: last.or(output.baselines.first),
     };
     let state = tree.state_mut(key);
     match state.atomic.as_deref_mut() {
@@ -207,7 +225,7 @@ pub(crate) fn measure<C: MeasureContent>(
 
 #[cfg(test)]
 mod tests {
-    use taffy::{AvailableSpace, Size};
+    use cephal::{AvailableSpace, Size};
 
     use crate::measure::Measured;
 
@@ -220,6 +238,7 @@ mod tests {
                 width,
                 height: AvailableSpace::MaxContent,
             },
+            None,
         )
     }
 

@@ -233,6 +233,9 @@ pub fn InputGroupInput(
     /// Where to record the field's own element, for relating it to something else.
     #[prop(optional)]
     node_ref: Option<NodeRef>,
+    /// Whether the value is a secret, such as a password. See [`Input`](crate::Input).
+    #[prop(into, optional)]
+    secure: Option<Signal<bool, LocalStorage>>,
     /// Classes merged after its own.
     #[prop(into, optional)]
     class: Classes,
@@ -250,6 +253,7 @@ pub fn InputGroupInput(
             disabled = disabled,
             invalid = invalid,
             node_ref = node_ref,
+            secure = secure,
             class = "zui-input-group__field",
             {..attrs},
             class = class

@@ -8,7 +8,7 @@ use smithay_client_toolkit::seat::pointer::{PointerData, ThemedPointer};
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::{
     ChangeCause, ZwpTextInputV3,
 };
-use zgui_platform::{CursorStyle, SurfaceId, TextInput, Unsupported};
+use zgui_platform::{CursorStyle, SurfaceId, TextInput, TextInputPurpose, Unsupported};
 
 use crate::input::pointer::cursor;
 use crate::input::text_input;
@@ -56,6 +56,8 @@ struct State {
     enabled: bool,
     /// The caret rectangle last sent, so an unchanged one is not sent again.
     caret: Option<(i32, i32, i32, i32)>,
+    /// The purpose last sent, so a changed one is sent again even when the caret stayed.
+    purpose: TextInputPurpose,
     /// How many request batches have been committed, which is the serial answers are matched on.
     serial: u32,
     /// The activations asked for and not yet carried out.
@@ -195,7 +197,8 @@ impl SeatLink {
                 // A field that has not moved is not restated: the rectangle crosses as whole
                 // numbers, the runtime states the caret on every frame that touches it, and some
                 // input methods re-place their candidate window on every request.
-                if inner.enabled && !text_input::moved(inner.caret, rectangle) {
+                let before = inner.caret.map(|caret| (caret, inner.purpose));
+                if inner.enabled && !text_input::restate(before, (rectangle, state.purpose)) {
                     return;
                 }
                 if !inner.enabled {
@@ -209,6 +212,7 @@ impl SeatLink {
                 ime.set_cursor_rectangle(x, y, width, height);
                 inner.enabled = true;
                 inner.caret = Some(rectangle);
+                inner.purpose = state.purpose;
             }
         }
         ime.commit();

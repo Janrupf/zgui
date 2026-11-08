@@ -438,7 +438,7 @@ fn the_echo_of_a_value_a_field_already_holds_leaves_the_caret_and_the_history_al
     script.type_letter("x");
     assert_eq!(script.shown(), "xabc");
 
-    script.press(letter("z"), Modifiers::CONTROL);
+    script.press(letter("z"), Modifiers::PRIMARY);
     assert_eq!(
         script.shown(),
         "abc",
@@ -450,7 +450,7 @@ fn the_echo_of_a_value_a_field_already_holds_leaves_the_caret_and_the_history_al
         "an undo put the caret back where the change it took out had begun"
     );
 
-    script.press(letter("z"), Modifiers::CONTROL);
+    script.press(letter("z"), Modifiers::PRIMARY);
     assert_eq!(
         script.shown(),
         "",
@@ -479,6 +479,7 @@ fn the_window_losing_the_keyboard_settles_the_field_exactly_once() {
         "the element lost focus too, so coming back puts the caret nowhere"
     );
 
+    support::cross_maintenance(&mut script.harness);
     assert_eq!(
         script.next_wake(),
         None,
@@ -569,8 +570,8 @@ fn the_window_losing_the_keyboard_keeps_the_composed_text_and_ends_the_compositi
         "the composition is still open, so every key from here is refused for ever"
     );
     // And what was composed is one undoable change rather than none.
-    script.press(letter("z"), Modifiers::CONTROL);
-    script.press(letter("z"), Modifiers::CONTROL);
+    script.press(letter("z"), Modifiers::PRIMARY);
+    script.press(letter("z"), Modifiers::PRIMARY);
     assert_eq!(script.shown(), "ab");
 }
 

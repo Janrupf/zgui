@@ -5,9 +5,24 @@
 //! back is therefore reading text and parsing it as whatever the reader expects — a colour, a
 //! length — with the reader deciding what an unparsable value means.
 
+use std::sync::OnceLock;
+
 use style::custom_properties::Name;
 
 use crate::computed::style::ComputedStyle;
+
+/// The custom properties whose presence makes an element read custom properties by any name.
+///
+/// A shader or filter takes its parameters from custom properties named after the effect, so an
+/// element that declares one of these reads names no declaration of its own mentions. The names
+/// mirror `zgui_scene::property`, which this crate sits below; the scene crate's tests hold the
+/// two lists equal.
+pub const WILDCARD_DECLARERS: [&str; 4] = [
+    "zgui-shader",
+    "zgui-shape",
+    "zgui-filter",
+    "zgui-backdrop-filter",
+];
 
 /// The computed text of the custom property `name` on `style`, without its `--` prefix.
 ///
@@ -17,14 +32,91 @@ use crate::computed::style::ComputedStyle;
 ///
 /// `None` means nothing declared it anywhere up the tree.
 pub fn text<'a>(style: &'a ComputedStyle, name: &str) -> Option<&'a str> {
-    let name = Name::from(name);
+    with_name(name, |name| lookup(style, name))
+}
+
+/// The computed text of the custom property the engine interned as `name`.
+fn lookup<'a>(style: &'a ComputedStyle, name: &Name) -> Option<&'a str> {
     let properties = style.custom_properties();
     properties
         .inherited
-        .get(&name)
-        .or_else(|| properties.non_inherited.get(&name))
+        .get(name)
+        .or_else(|| properties.non_inherited.get(name))
         .and_then(|value| value.as_universal())
         .map(|value| value.css.as_str())
+}
+
+/// A custom property with a name that is fixed when the program is built.
+///
+/// The engine's name for it is interned once per process, on first use. A reader that asks for
+/// it on every frame thus does no string hashing and no table lookup to find the name.
+#[derive(Debug)]
+pub struct Property {
+    /// The name, without its `--` prefix.
+    text: &'static str,
+    /// The engine's interned name, set on first use.
+    name: OnceLock<Name>,
+}
+
+impl Property {
+    /// The property called `text`, without its `--` prefix.
+    pub const fn new(text: &'static str) -> Self {
+        Self {
+            text,
+            name: OnceLock::new(),
+        }
+    }
+
+    /// The name, without its `--` prefix.
+    pub const fn as_str(&self) -> &'static str {
+        self.text
+    }
+
+    /// The computed text of this property on `style`, as [`text`] reads it.
+    pub fn text<'a>(&self, style: &'a ComputedStyle) -> Option<&'a str> {
+        lookup(style, self.name.get_or_init(|| Name::from(self.text)))
+    }
+
+    /// Whether anything up the tree declared this property on `style`.
+    pub fn is_declared(&self, style: &ComputedStyle) -> bool {
+        self.text(style).is_some()
+    }
+}
+
+/// `--zgui-shader`, the first of [`WILDCARD_DECLARERS`].
+pub static SHADER: Property = Property::new(WILDCARD_DECLARERS[0]);
+/// `--zgui-shape`, the second of [`WILDCARD_DECLARERS`].
+pub static SHAPE: Property = Property::new(WILDCARD_DECLARERS[1]);
+/// `--zgui-filter`, the third of [`WILDCARD_DECLARERS`].
+pub static FILTER: Property = Property::new(WILDCARD_DECLARERS[2]);
+/// `--zgui-backdrop-filter`, the fourth of [`WILDCARD_DECLARERS`].
+pub static BACKDROP_FILTER: Property = Property::new(WILDCARD_DECLARERS[3]);
+
+/// [`WILDCARD_DECLARERS`] as interned properties, in the same order.
+pub static WILDCARD_PROPERTIES: [&Property; 4] = [&SHADER, &SHAPE, &FILTER, &BACKDROP_FILTER];
+
+/// Runs `body` with `name` as the engine's interned name for it.
+///
+/// Interning a name the engine has not seen is a write to a process-wide set, and dropping the
+/// handle is another; the framework reads the same few names on every lowering, so the handles
+/// are kept per thread and interned once each.
+fn with_name<R>(name: &str, body: impl FnOnce(&Name) -> R) -> R {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    thread_local! {
+        static NAMES: RefCell<std::collections::HashMap<String, Name>> = RefCell::new(HashMap::new());
+    }
+    NAMES.with(|names| {
+        let mut names = names.borrow_mut();
+        if let Some(interned) = names.get(name) {
+            return body(interned);
+        }
+        let interned = Name::from(name);
+        let result = body(&interned);
+        names.insert(name.to_owned(), interned);
+        result
+    })
 }
 
 /// The custom property `name` on `style`, read as a colour.
@@ -125,7 +217,7 @@ fn parse_color(text: &str) -> Option<style::values::specified::Color> {
 }
 
 /// The base a colour's URL-valued components would resolve against, of which a colour has none.
-fn url_data() -> style::stylesheets::UrlExtraData {
+pub(crate) fn url_data() -> style::stylesheets::UrlExtraData {
     use core::str::FromStr;
     fn parsed<T: FromStr>(text: &str) -> T
     where
@@ -140,7 +232,10 @@ fn url_data() -> style::stylesheets::UrlExtraData {
 mod tests {
     use crate::StyleDraft;
 
-    use super::{color, length, text};
+    use super::{
+        BACKDROP_FILTER, FILTER, Property, WILDCARD_DECLARERS, WILDCARD_PROPERTIES, color, length,
+        text,
+    };
 
     #[test]
     fn nothing_is_declared_on_an_initial_style() {
@@ -148,6 +243,30 @@ mod tests {
         assert_eq!(text(&style, "zgui-fill"), None);
         assert_eq!(color(&style, "zgui-fill"), None);
         assert_eq!(length(&style, "zgui-stroke-width"), None);
+        assert_eq!(FILTER.text(&style), None);
+        assert!(!FILTER.is_declared(&style));
+    }
+
+    #[test]
+    fn a_static_property_reads_what_its_name_reads() {
+        let style = StyleDraft::initial()
+            .with_custom_property("zgui-filter", "glow")
+            .with_custom_property("zgui-thing", "2px")
+            .build();
+        static THING: Property = Property::new("zgui-thing");
+        assert_eq!(FILTER.text(&style), text(&style, "zgui-filter"));
+        assert_eq!(FILTER.text(&style), Some("glow"));
+        assert_eq!(THING.text(&style), text(&style, "zgui-thing"));
+        assert!(THING.is_declared(&style));
+        // A second read finds the name interned by the first.
+        assert_eq!(THING.text(&style), text(&style, "zgui-thing"));
+        assert_eq!(BACKDROP_FILTER.text(&style), None);
+    }
+
+    #[test]
+    fn the_wildcard_properties_are_the_wildcard_names() {
+        let names = WILDCARD_PROPERTIES.map(Property::as_str);
+        assert_eq!(names, WILDCARD_DECLARERS);
     }
 
     #[test]

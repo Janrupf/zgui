@@ -6,11 +6,14 @@ use crate::new_crate::Layer;
 pub(crate) const USAGE: &str = "\
 usage:
   cargo xtask ci                      run the full definition of done
+  cargo xtask ci --hosted             the same, without `perf` and `tails`, which compare
+                                      against numbers taken on the reference machine, and
+                                      without `resize`, `workloads`, `verify` and `growth`
   cargo xtask lint                    run clippy over every target in both profiles,
                                       which is also a step of `ci`
   cargo xtask wall-clock              run the wall-clock budget targets in release,
                                       which is also a step of `ci`
-  cargo xtask perf                    run the five end-to-end scenarios against their
+  cargo xtask perf                    run the seven end-to-end scenarios against their
                                       bands, store the run and regenerate
                                       docs/performance.md, which is also a step of `ci`
   cargo xtask perf pacing [size] [s]  measure a scripted scroll's frame intervals as a
@@ -48,13 +51,13 @@ usage:
                                       running window are those of one rebuilt from nothing, at
                                       every document size, which is also a step of `ci`
   cargo xtask docs                    run the documentation gate, which is also a step of `ci`
-  cargo xtask release                 check that the tree can be released in lockstep and that
-                                      its public surface still keeps the last release's promise,
-                                      which is also a step of `ci`
+  cargo xtask release                 check that the tree can be released in lockstep, build
+                                      every published crate from its package, and check that its
+                                      public surface still keeps the last release's promise;
+                                      `ci` runs it without building the packages
   cargo xtask ledger [check]          run every ledger check, or just one of
                                       engines, unsafe, attribution, versions, pinned,
-                                      topo, counters, skips, clock, mutation, inert,
-                                      tag-syntax, spikes
+                                      counters, skips, clock, mutation, inert, tag-syntax
   cargo xtask ledger --self-test      prove every check fails on its planted fixture
   cargo xtask tsan                    run the thread sanitiser over the threaded targets,
                                       and its positive control, which must fire
@@ -66,7 +69,10 @@ usage:
 #[derive(Debug, PartialEq)]
 pub(crate) enum Command {
     /// Run every gate in the definition of done.
-    Ci,
+    Ci {
+        /// Whether to skip the gates a hosted machine cannot pass: see `ci::run`.
+        hosted: bool,
+    },
     /// Run clippy over every target of every member, in both profiles.
     Lint,
     /// Run the wall-clock budget targets in an optimised build.
@@ -102,7 +108,7 @@ pub(crate) enum Command {
     Verify,
     /// Run the documentation gate.
     Docs,
-    /// Run the lockstep and public-surface compatibility gates.
+    /// Run the lockstep, packaging and public-surface compatibility gates.
     Release,
     /// Run the ledger checks, optionally narrowed to one of them.
     Ledger {
@@ -132,7 +138,11 @@ impl Command {
         let mut args = args.iter().map(String::as_str);
         match args.next() {
             None | Some("help" | "-h" | "--help") => Ok(Self::Help),
-            Some("ci") => Ok(Self::Ci),
+            Some("ci") => match args.next() {
+                None => Ok(Self::Ci { hosted: false }),
+                Some("--hosted") => Ok(Self::Ci { hosted: true }),
+                Some(other) => Err(format!("unknown ci option `{other}`")),
+            },
             Some("lint") => Ok(Self::Lint),
             Some("wall-clock") => Ok(Self::WallClock),
             Some("perf") => match args.next() {
@@ -208,7 +218,8 @@ mod tests {
 
     #[test]
     fn parses_every_command_form() {
-        assert_eq!(parse("ci"), Ok(Command::Ci));
+        assert_eq!(parse("ci"), Ok(Command::Ci { hosted: false }));
+        assert_eq!(parse("ci --hosted"), Ok(Command::Ci { hosted: true }));
         assert_eq!(parse("lint"), Ok(Command::Lint));
         assert_eq!(parse("wall-clock"), Ok(Command::WallClock));
         assert_eq!(parse("perf"), Ok(Command::Perf));

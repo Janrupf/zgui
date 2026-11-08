@@ -16,7 +16,9 @@ fn hot_box_records_stay_within_the_memory_budget() {
     let node = core::mem::size_of::<BoxNode>();
     let layout = core::mem::size_of::<BoxLayout>();
     assert!(node <= 112, "BoxNode grew to {node} bytes");
-    assert!(layout <= 480, "BoxLayout grew to {layout} bytes");
+    // The engine's cache is held inline: one final answer and three size answers, each a
+    // complete question and its answer, before anything spills to the heap.
+    assert!(layout <= 896, "BoxLayout grew to {layout} bytes");
 }
 
 #[test]
@@ -88,6 +90,38 @@ fn paragraph_ids_are_interned_while_active_and_reused_after_reclamation() {
         "a dead paragraph left its slot growing forever"
     );
     assert_eq!(store.paragraph_key(replacement), Some(ParagraphKey(22)));
+}
+
+#[test]
+fn released_paragraphs_past_the_record_drain_once_as_unknown() {
+    fn drained(store: &mut LayoutStore) -> Option<Vec<ParagraphKey>> {
+        let mut seen = None;
+        store.drain_released_paragraphs(|keys, _| seen = keys.map(<[ParagraphKey]>::to_vec));
+        seen
+    }
+
+    let mut store = LayoutStore::new(DocumentId::FIRST);
+    let key = ParagraphKey(7);
+    let id = store.intern_paragraph(key);
+    store.retain_paragraph(id);
+    store.release_paragraph(id);
+    assert_eq!(drained(&mut store), Some(vec![key]));
+    assert_eq!(drained(&mut store), Some(Vec::new()));
+
+    // More releases than the store records.
+    for _ in 0..=super::fragments::RELEASED_KEEP {
+        store.retain_paragraph(id);
+        store.release_paragraph(id);
+    }
+    assert_eq!(drained(&mut store), None);
+
+    store.retain_paragraph(id);
+    store.release_paragraph(id);
+    assert_eq!(
+        drained(&mut store),
+        Some(vec![key]),
+        "the drain did not reset the overflow"
+    );
 }
 
 #[test]

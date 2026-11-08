@@ -249,6 +249,8 @@ const SHAPES: &[&str] = &[
     "listener_bound_to_a_name",
     "cut_pass_a11y_role",
     "cut_pass_state_closure",
+    "cut_pass_attr_owned_string",
+    "cut_pass_a11y_label_closure_str",
 ];
 
 /// Where the fixtures live.

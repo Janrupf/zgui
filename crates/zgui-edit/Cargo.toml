@@ -3,6 +3,13 @@ name = "zgui-edit"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Text editing: caret, selection, undo, IME composition and hit testing"
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+include.workspace = true
 
 # L5 — systems. Every dependency is inherited: `foo.workspace = true`.
 #

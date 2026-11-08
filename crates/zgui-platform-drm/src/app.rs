@@ -203,7 +203,7 @@ use crate::waker::EventfdWaker;
 
 /// Runs `handler` on the displays this machine's first usable device drives.
 ///
-/// Blocks until the application asks to finish. This is the driver `App::run_drm` hands to the
+/// Blocks until the application asks to finish. This is the driver `zgui_console::RunDrm::run_drm` hands to the
 /// framework, and the two belong together: a frame reaches a display through a renderer that draws
 /// into this loop's scanouts, and through nothing else.
 ///
@@ -598,25 +598,20 @@ fn drive(
                 // waits for up to two refreshes — and a loop that reads flips, deadlines and input
                 // on one thread does none of the three while it waits. One turn is one wake, so a
                 // person moving the mouse gets one move per report all the same.
-                // Nowhere at all until something moves the pointer, and nowhere again once a
-                // contact touches the glass. A machine whose only pointing device is a touchscreen
-                // would otherwise show an arrow that sits where it started for the whole session:
-                // a contact is a pointer of its own and moves this one nowhere. Asked each turn, so
-                // the first movement of a mouse brings the cursor back.
-                let steerable = seat.steered();
                 for (drawn, cursor) in surfaces[..claimed].iter().zip(&cursors) {
                     let mut cursor = cursor.borrow_mut();
                     if let Some(style) = drawn.take_cursor() {
                         cursor.set_style(style);
                     }
-                    cursor.place(steerable.then(|| pointer.on(&screens)).flatten().and_then(
-                        |screen| {
-                            (screen.id == drawn.id()).then(|| {
+                    cursor.place(
+                        pointer
+                            .on(&screens)
+                            .filter(|screen| screen.id == drawn.id())
+                            .map(|screen| {
                                 let (x, y) = pointer.union();
                                 ((x - screen.left) as i32, y as i32)
-                            })
-                        },
-                    ));
+                            }),
+                    );
                     if !cursor.changed() {
                         continue;
                     }
@@ -745,10 +740,11 @@ fn drive(
             // above runs under. A sync file stays readable once it has signalled, so a frame that
             // is watched and never settled would end every wait at once for as long as it sat
             // there — a turn that answers nothing, taken as fast as the processor allows.
-            let drawing: Vec<_> = presence
-                .is_active()
-                .then(|| scanouts.iter().map(|scanout| scanout.borrow()).collect())
-                .unwrap_or_default();
+            let drawing: Vec<_> = if presence.is_active() {
+                scanouts.iter().map(|scanout| scanout.borrow()).collect()
+            } else {
+                Vec::new()
+            };
             let frames: Vec<BorrowedFd<'_>> = drawing
                 .iter()
                 .flat_map(|scanout| scanout.drawing())

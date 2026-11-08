@@ -4,6 +4,9 @@ use zgui::prelude::*;
 use zgui::view::CustomPropertyName;
 use zgui::{component, view};
 
+use crate::chart::SHEET;
+use crate::chart::style::ChartStyle;
+
 /// Which side of the plot a key sits on.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub enum LegendAlign {
@@ -66,6 +69,7 @@ pub fn ChartLegendContent(
     #[prop(attrs)]
     attrs: Attrs,
 ) -> impl IntoView {
+    install_stylesheet(SHEET, ChartStyle::CSS);
     let keys: Vec<AnyView> = entries
         .into_iter()
         .map(|entry| {

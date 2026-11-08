@@ -2,7 +2,15 @@
 name = "zgui-wgsl"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+# `src/wgsl/text.wgsl` is derived from the Windows Terminal project under the MIT License (see NOTICE).
+license = "Apache-2.0 AND MIT"
+description = "WGSL building blocks for zgui shaders"
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+include.workspace = true
 
 # L1 — contracts. Every dependency is inherited: `foo.workspace = true`.
 #

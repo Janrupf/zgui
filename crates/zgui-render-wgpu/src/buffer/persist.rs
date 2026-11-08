@@ -6,6 +6,10 @@
 //! insertions, and offset replays, outlines and unresolved sprites travel as per-frame copies —
 //! plus the resolved remap lists themselves.
 //!
+//! Mark payloads are resident once per payload allocation, whatever chunks hold them. A canvas
+//! panned by its view re-encodes its chunk with the same payload, and the new chunk takes a hold on
+//! the payload the old one held, so the pan uploads no payload.
+//!
 //! Ranges are reclaimed through a ledger keyed by submission: a replaced or retired chunk's
 //! ranges, and every frame's transient ranges, go into the current bucket, and the bucket is
 //! offered back to the arenas once the device reports the submission that could still read them
@@ -19,18 +23,16 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::mpsc;
 
+use rustc_hash::FxHashMap;
 use zgui_profile::{Counter, counter};
-use zgui_scene::{ChunkPrims, PrimitiveKind, Scene};
+use zgui_scene::{ChunkNote, ChunkPrims, PrimitiveKind, Scene};
 
-use crate::buffer::tables::{TEXELS_WIDE, write_texels};
+use crate::buffer::tables::{TEXEL, TEXELS_WIDE, allocate_rows, write_texels};
 use crate::buffer::upload::UploadBelt;
 use crate::gpu::device::Gpu;
 
-/// How many bytes one texel of an arena holds. `buffer::tables` states the format.
-const TEXEL: u32 = 16;
-
 /// The instanced kinds with persistent storage, in lane order.
-pub(crate) const LANES: [PrimitiveKind; 7] = [
+pub(crate) const LANES: [PrimitiveKind; 8] = [
     PrimitiveKind::Quad,
     PrimitiveKind::Shadow,
     PrimitiveKind::Decoration,
@@ -38,33 +40,66 @@ pub(crate) const LANES: [PrimitiveKind; 7] = [
     PrimitiveKind::SubpixelSprite,
     PrimitiveKind::ColorSprite,
     PrimitiveKind::Shaded,
+    PrimitiveKind::Marks,
 ];
 
-/// How many low bits of a resolved remap entry name the arena slot.
-///
-/// The bits above name an entry in the frame's offset table, which is how a chunk that merely
-/// moved keeps its residence: the resident bytes stay where they are and the shader adds the
-/// chunk's offset to what it reads. Twenty-four bits is sixteen million elements a lane — over a
-/// gigabyte of quads — and a resident slot past it falls back to the transient gather, which is
-/// correct and merely copies.
-pub(crate) const SLOT_BITS: u32 = 24;
+/// The lane mark items live in.
+pub(crate) const MARKS_LANE: usize = 7;
 
-/// The mask that keeps a resolved remap entry's arena slot.
-pub(crate) const SLOT_MASK: u32 = (1 << SLOT_BITS) - 1;
+/// How many payload kinds a mark has: discs, boxes, polyline vertices and glyph words.
+pub(crate) const PAYLOAD_LANES: usize = 4;
+
+/// Every arena: one per lane, then one per payload kind.
+const ARENAS: usize = LANES.len() + PAYLOAD_LANES;
+
+/// The arena a payload kind lives in.
+const fn payload_arena(kind: usize) -> usize {
+    LANES.len() + kind
+}
 
 /// One entry of a lane's draw order, as the vertex stream carries it.
 ///
-/// The slot into the lane's arena, and the shift the chunk it belongs to moved by this frame. The
-/// two are resolved together here so that a shader reads neither a remap nor an offsets table: the
-/// order stream is fetched per instance anyway, and twelve bytes in it cost less than the
-/// indirection they replace.
+/// The arena slot the instance's record is at, and the shift the chunk holding it moved by this
+/// frame. The two are resolved together here so that a shader reads neither a remap nor an
+/// offsets table: the order stream is fetched per instance anyway, and twelve bytes in it cost
+/// less than the indirection they replace.
+///
+/// Resolving the shift on the host is also what retires the packing that used to carry it. A slot
+/// now has a whole `u32`, so neither the slot's range nor the number of offsets a frame can name
+/// is bounded by how the two shared a word.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct OrderEntry {
     /// The arena slot the instance's record is at.
     pub slot: u32,
-    /// How far the chunk holding that record moved, in device pixels.
+    /// How far the chunk holding that record moved this frame, in device pixels.
     pub shift: [f32; 2],
+}
+
+/// The bytes one kind holds in a chunk or in a frame's arrays, which share their field names.
+///
+/// One exhaustive match for every reader, so a new kind cannot be read through another kind's
+/// array. A kind with no lane holds no bytes here.
+macro_rules! lane_slice {
+    ($prims:expr, $kind:expr) => {{
+        let prims = &$prims;
+        let bytes: &[u8] = match $kind {
+            PrimitiveKind::Quad => bytemuck::cast_slice(&prims.quads),
+            PrimitiveKind::Shadow => bytemuck::cast_slice(&prims.shadows),
+            PrimitiveKind::Decoration => bytemuck::cast_slice(&prims.decorations),
+            PrimitiveKind::MonoSprite => bytemuck::cast_slice(&prims.mono_sprites),
+            PrimitiveKind::SubpixelSprite => bytemuck::cast_slice(&prims.subpixel_sprites),
+            PrimitiveKind::ColorSprite => bytemuck::cast_slice(&prims.color_sprites),
+            PrimitiveKind::Shaded => bytemuck::cast_slice(&prims.shaded),
+            PrimitiveKind::Marks => bytemuck::cast_slice(&prims.marks),
+            PrimitiveKind::GroupStart
+            | PrimitiveKind::GroupEnd
+            | PrimitiveKind::Vector
+            | PrimitiveKind::External
+            | PrimitiveKind::Backdrop => &[],
+        };
+        bytes
+    }};
 }
 
 /// One resident chunk: its bytes, and where each lane's elements sit in the arenas.
@@ -72,15 +107,43 @@ pub struct OrderEntry {
 struct Resident {
     /// The bytes, shared with the paint cache's record — also the rebuild source.
     prims: Arc<ChunkPrims>,
-    /// The element range each lane occupies, where the chunk has elements of that kind.
+    /// The element range each lane holds of the chunk, where it has elements of that kind.
     ranges: [Option<Range<u32>>; LANES.len()],
+    /// The key of each mark's payload in [`ChunkStore::shared`], one per mark.
+    payloads: Box<[usize]>,
+}
+
+/// One resident mark payload, held by every resident mark that draws it.
+#[derive(Debug)]
+struct Shared {
+    /// The payload. Held so no other payload takes its address while the key lives.
+    payload: Arc<zgui_scene::MarkPayload>,
+    /// Where each payload kind sits in its arena, where the payload has elements of that kind.
+    ranges: [Option<Range<u32>>; PAYLOAD_LANES],
+    /// How many resident marks draw it.
+    holders: u32,
+}
+
+/// The key a payload is resident under: the address of its allocation.
+fn payload_key(payload: &Arc<zgui_scene::MarkPayload>) -> usize {
+    Arc::as_ptr(payload) as usize
+}
+
+/// One payload kind of one mark, as bytes.
+fn payload_slice(payload: &zgui_scene::MarkPayload, kind: usize) -> &[u8] {
+    match kind {
+        0 => bytemuck::cast_slice(&payload.discs),
+        1 => bytemuck::cast_slice(&payload.boxes),
+        2 => bytemuck::cast_slice(&payload.vertices),
+        _ => bytemuck::cast_slice(&payload.glyphs),
+    }
 }
 
 /// One persistent element arena: a texture, a bump tail, and ranges given back by the ledger.
 ///
-/// A texture rather than a storage buffer, for the reason `buffer::tables` states: a GL 3.3 context
-/// and WebGL 2 have no storage buffers at all. An element is written at a texel boundary, so its
-/// fields sit at fixed positions a loader can name, which is what `stride` is for.
+/// A texture rather than a storage buffer, for the reason `buffer::tables` states: a GL 3.3
+/// context and WebGL 2 have no storage buffers at all. An element is written at a texel boundary,
+/// so its fields sit at fixed positions a loader can name, which is what `stride` is for.
 #[derive(Debug)]
 struct Arena {
     /// The texture, bound as the pipeline's instance storage.
@@ -93,14 +156,14 @@ struct Arena {
     element: u32,
     /// What one element occupies in the texture: `element` rounded up to a whole texel.
     ///
-    /// A record is 104 or 136 or 108 bytes, and a texel is sixteen. Rounding up costs at most
-    /// twelve bytes an element and puts every record on a texel, so a shader reads its fields at
-    /// offsets it knows rather than at ones that rotate with the index. Reading a record word by
-    /// word instead needs no padding and measured fifteen per cent slower.
+    /// A record is 56 to 152 bytes and a texel is sixteen. Rounding up costs at most eight bytes
+    /// an element and puts every record on a texel, so a shader reads its fields at offsets it
+    /// knows rather than at ones that rotate with the index. Reading a record word by word
+    /// instead needs no padding and measured fifteen per cent slower.
     stride: u32,
-    /// How many elements the buffer holds.
+    /// How many elements the texture holds.
     capacity: u32,
-    /// Changes whenever `buffer` changes identity, for bind-group cache invalidation.
+    /// Changes whenever `texture` changes identity, for bind-group cache invalidation.
     generation: u64,
     /// The first element never allocated.
     tail: u32,
@@ -109,12 +172,12 @@ struct Arena {
 }
 
 impl Arena {
-    /// The smallest allocation, in bytes — a bind group has to name a buffer either way.
+    /// The smallest allocation, in bytes — a bind group has to name a texture either way.
     const MINIMUM_BYTES: u64 = 256;
 
     /// An empty arena for elements of `element` bytes.
     fn new(gpu: &Gpu, label: &'static str, element: u32) -> Self {
-        let stride = element.div_ceil(TEXEL).saturating_mul(TEXEL);
+        let stride = element.div_ceil(TEXEL as u32).saturating_mul(TEXEL as u32);
         let capacity = (Self::MINIMUM_BYTES as u32 / stride).max(1);
         let (texture, view) = allocate(gpu, label, capacity, stride);
         Self {
@@ -216,12 +279,12 @@ impl Arena {
             run[index * stride..index * stride + element].copy_from_slice(record);
         }
 
-        let texels = self.stride / TEXEL;
+        let texels = self.stride / TEXEL as u32;
         write_texels(gpu, belt, encoder, &self.texture, start * texels, &run);
         run.len() as u64
     }
 
-    /// Replaces the buffer with one holding at least `needed` elements, forgetting every range.
+    /// Replaces the texture with one holding at least `needed` elements, forgetting every range.
     ///
     /// The caller re-uploads every resident chunk afterwards: this is the growth path, the
     /// idle-release path and the device-loss path, and they are deliberately one code path.
@@ -246,23 +309,8 @@ fn allocate(
     capacity: u32,
     stride: u32,
 ) -> (wgpu::Texture, wgpu::TextureView) {
-    let texels = capacity.saturating_mul(stride / TEXEL);
-    let texture = gpu.device().create_texture(&wgpu::TextureDescriptor {
-        label: Some(label),
-        size: wgpu::Extent3d {
-            width: TEXELS_WIDE,
-            height: texels.div_ceil(TEXELS_WIDE).max(1),
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba32Uint,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    (texture, view)
+    let texels = capacity.saturating_mul(stride / TEXEL as u32);
+    allocate_rows(gpu, label, texels.div_ceil(TEXELS_WIDE).max(1))
 }
 
 /// Ranges awaiting reclamation, bucketed by the submission that could still read them.
@@ -316,7 +364,7 @@ impl RetireLedger {
     }
 
     /// Offers every bucket the device has finished with back to `arenas`.
-    fn reclaim(&mut self, arenas: &mut [Arena; LANES.len()]) {
+    fn reclaim(&mut self, arenas: &mut [Arena; ARENAS]) {
         let mut completed = 0;
         while let Ok(seq) = self.receiver.try_recv() {
             completed = completed.max(seq);
@@ -347,27 +395,24 @@ impl RetireLedger {
 /// The persistent halves of the six instanced kinds, and the residence over them.
 #[derive(Debug)]
 pub struct ChunkStore {
-    /// One arena per lane.
-    arenas: [Arena; LANES.len()],
+    /// One arena per lane, then one per mark payload kind.
+    arenas: [Arena; ARENAS],
     /// Every chunk the arenas hold, by revision.
     residence: HashMap<u64, Resident>,
+    /// Every mark payload the arenas hold, by [`payload_key`].
+    shared: FxHashMap<usize, Shared>,
+    /// Per-frame scratch: the payload keys of the chunks retired this frame, one per mark.
+    released: Vec<usize>,
     /// Ranges awaiting their submission's completion.
     ledger: RetireLedger,
-    /// Per-frame scratch: the resolved remap for each lane.
+    /// Per-frame scratch: the resolved draw order for each lane.
     resolved: [Vec<OrderEntry>; LANES.len()],
     /// Per-frame scratch: gathered transient element bytes for each lane.
     gathered: [Vec<u8>; LANES.len()],
-    /// The frame's chunk offsets, indexed by the high bits of a resolved remap entry.
-    ///
-    /// Entry zero is the zero offset every unmoved element names, so a frame with nothing moved
-    /// carries one entry and every remap entry's high bits are clear.
-    frame_offsets: Vec<[f32; 2]>,
-    /// Per-frame scratch: each moved revision's offset index, or the spill marker.
-    ///
-    /// A frame can name at most as many offsets as the remap's high bits can count. A revision
-    /// past that spills to [`u32::MAX`] and is served transiently — the frame arrays hold its
-    /// translated bytes — which is correct and merely copies.
-    offset_of: HashMap<u64, u32>,
+    /// Per-frame scratch: how far each moved revision moved, for the order stream to carry.
+    shift_of: HashMap<u64, [f32; 2]>,
+    /// Per-frame scratch: each mark's payload ranges by remap position, one per payload kind.
+    mark_payload: Vec<[Range<u32>; PAYLOAD_LANES]>,
 }
 
 impl ChunkStore {
@@ -410,13 +455,32 @@ impl ChunkStore {
                     "zgui.arena.shaded",
                     size_of::<zgui_scene::ShadedQuad>() as u32,
                 ),
+                Arena::new(
+                    gpu,
+                    "zgui.arena.marks",
+                    size_of::<zgui_scene::MarkItem>() as u32,
+                ),
+                Arena::new(gpu, "zgui.arena.mark_discs", size_of::<[f32; 4]>() as u32),
+                Arena::new(
+                    gpu,
+                    "zgui.arena.mark_boxes",
+                    size_of::<zgui_scene::MarkBox>() as u32,
+                ),
+                Arena::new(
+                    gpu,
+                    "zgui.arena.mark_vertices",
+                    size_of::<[f32; 2]>() as u32,
+                ),
+                Arena::new(gpu, "zgui.arena.mark_glyphs", size_of::<[u32; 4]>() as u32),
             ],
             residence: HashMap::new(),
+            shared: FxHashMap::default(),
+            released: Vec::new(),
             ledger: RetireLedger::new(),
             resolved: Default::default(),
             gathered: Default::default(),
-            frame_offsets: vec![[0.0, 0.0]],
-            offset_of: HashMap::new(),
+            shift_of: HashMap::new(),
+            mark_payload: Vec::new(),
         }
     }
 
@@ -425,9 +489,29 @@ impl ChunkStore {
         wgpu::BindingResource::TextureView(&self.arenas[lane].view)
     }
 
-    /// The allocation epoch of `lane`'s buffer, for bind-group cache keys.
+    /// The allocation epoch of `lane`'s texture, for bind-group cache keys.
     pub fn generation(&self, lane: usize) -> u64 {
         self.arenas[lane].generation
+    }
+
+    /// The texture a mark draw binds as the payload of `kind`.
+    pub fn payload_binding(&self, kind: usize) -> wgpu::BindingResource<'_> {
+        wgpu::BindingResource::TextureView(&self.arenas[payload_arena(kind)].view)
+    }
+
+    /// The allocation epoch of the payload texture of `kind`.
+    pub fn payload_generation(&self, kind: usize) -> u64 {
+        self.arenas[payload_arena(kind)].generation
+    }
+
+    /// The payload ranges of the mark at draw-order `position`, one per payload kind.
+    ///
+    /// Empty ranges past the frame's marks.
+    pub fn mark_payload(&self, position: usize) -> [Range<u32>; PAYLOAD_LANES] {
+        self.mark_payload
+            .get(position)
+            .cloned()
+            .unwrap_or([0..0, 0..0, 0..0, 0..0])
     }
 
     /// How many bytes the arenas hold.
@@ -438,9 +522,9 @@ impl ChunkStore {
             .sum()
     }
 
-    /// Uploads the frame's chunk changes and transient content, and resolves each lane's remap
-    /// into arena slots. Returns the bytes copied; the resolved remaps are in
-    /// [`ChunkStore::resolved_remap`] afterwards.
+    /// Uploads the frame's chunk changes and transient content, and resolves each lane's order
+    /// into arena slots. Returns the bytes copied; the resolved order is in
+    /// [`ChunkStore::resolved_order`] afterwards.
     pub fn upload_frame(
         &mut self,
         gpu: &Gpu,
@@ -451,19 +535,34 @@ impl ChunkStore {
         self.ledger.reclaim(&mut self.arenas);
         let mut uploaded = 0;
 
-        for &revision in scene.chunk_retired() {
-            if let Some(resident) = self.residence.remove(&revision) {
-                for (lane, range) in resident.ranges.into_iter().enumerate() {
-                    if let Some(range) = range {
-                        self.ledger.retire(lane, range);
+        // The notes apply in note order: they can span frames that never reached a draw, so a
+        // revision can be inserted and retired in one batch, and its retirement must find it.
+        // Payload holds drop only after every insertion, so the new chunks take their holds
+        // before the retired ones drop theirs, and a payload that passes from one revision to the
+        // next stays resident.
+        self.released.clear();
+        for note in scene.chunk_notes() {
+            match note {
+                ChunkNote::Inserted { revision, prims } => {
+                    uploaded += self.insert(gpu, belt, encoder, *revision, prims);
+                }
+                ChunkNote::Retired { revision } => {
+                    if let Some(resident) = self.residence.remove(revision) {
+                        for (lane, range) in resident.ranges.into_iter().enumerate() {
+                            if let Some(range) = range {
+                                self.ledger.retire(lane, range);
+                            }
+                        }
+                        self.released.extend_from_slice(&resident.payloads);
                     }
                 }
             }
         }
-
-        for upload in scene.chunk_inserted() {
-            uploaded += self.insert(gpu, belt, encoder, upload.revision, &upload.prims);
+        let released = core::mem::take(&mut self.released);
+        for key in &released {
+            self.drop_hold(*key);
         }
+        self.released = released;
 
         uploaded += self.resolve_and_gather(gpu, belt, encoder, scene);
         counter::set(Counter::ChunksResident, self.residence.len() as u64);
@@ -495,56 +594,119 @@ impl ChunkStore {
         {
             return 0;
         }
-        let lanes: [&[u8]; LANES.len()] = [
-            bytemuck::cast_slice(&prims.quads),
-            bytemuck::cast_slice(&prims.shadows),
-            bytemuck::cast_slice(&prims.decorations),
-            bytemuck::cast_slice(&prims.mono_sprites),
-            bytemuck::cast_slice(&prims.subpixel_sprites),
-            bytemuck::cast_slice(&prims.color_sprites),
-            bytemuck::cast_slice(&prims.shaded),
-        ];
-        let counts = [
-            prims.quads.len() as u32,
-            prims.shadows.len() as u32,
-            prims.decorations.len() as u32,
-            prims.mono_sprites.len() as u32,
-            prims.subpixel_sprites.len() as u32,
-            prims.color_sprites.len() as u32,
-            prims.shaded.len() as u32,
-        ];
         let mut ranges: [Option<Range<u32>>; LANES.len()] = Default::default();
         let mut uploaded = 0;
-        for lane in 0..LANES.len() {
-            if counts[lane] == 0 {
+        for (lane, held) in ranges.iter_mut().enumerate() {
+            let bytes = lane_slice!(prims, LANES[lane]);
+            let count = (bytes.len() / self.arenas[lane].element as usize) as u32;
+            if count == 0 {
                 continue;
             }
-            let range = match self.arenas[lane].alloc(counts[lane]) {
-                Some(range) => range,
-                None => {
-                    // Grow the lane and settle every resident chunk into the new buffer, then
-                    // take the range that now must fit.
-                    uploaded += self.grow(gpu, belt, encoder, lane, counts[lane]);
-                    self.arenas[lane]
-                        .alloc(counts[lane])
-                        .expect("the arena was grown for exactly this request")
+            let range = self.alloc(gpu, belt, encoder, lane, count, &mut uploaded);
+            uploaded += self.arenas[lane].upload(gpu, belt, encoder, range.start, bytes);
+            *held = Some(range);
+        }
+        // The payloads no resident mark holds yet are placed one after another in one range per
+        // payload kind, and uploaded in one write each.
+        let mut payloads = Vec::with_capacity(prims.mark_payloads.len());
+        let mut fresh = Vec::new();
+        let mut totals = [0u32; PAYLOAD_LANES];
+        for payload in &prims.mark_payloads {
+            let key = payload_key(payload);
+            payloads.push(key);
+            if let Some(shared) = self.shared.get_mut(&key) {
+                shared.holders += 1;
+                continue;
+            }
+            self.shared.insert(
+                key,
+                Shared {
+                    payload: Arc::clone(payload),
+                    ranges: Default::default(),
+                    holders: 1,
+                },
+            );
+            fresh.push(key);
+            for (kind, count) in payload.counts().into_iter().enumerate() {
+                totals[kind] += count;
+            }
+        }
+        for (kind, &total) in totals.iter().enumerate() {
+            if total == 0 {
+                continue;
+            }
+            let arena = payload_arena(kind);
+            let range = self.alloc(gpu, belt, encoder, arena, total, &mut uploaded);
+            let mut bytes =
+                Vec::with_capacity(total as usize * self.arenas[arena].element as usize);
+            let mut start = range.start;
+            for key in &fresh {
+                let shared = self.shared.get_mut(key).expect("inserted above");
+                let slice = payload_slice(&shared.payload, kind);
+                let count = (slice.len() / self.arenas[arena].element as usize) as u32;
+                if count == 0 {
+                    continue;
                 }
-            };
-            uploaded += self.arenas[lane].upload(gpu, belt, encoder, range.start, lanes[lane]);
-            ranges[lane] = Some(range);
+                bytes.extend_from_slice(slice);
+                shared.ranges[kind] = Some(start..start + count);
+                start += count;
+            }
+            let written = self.arenas[arena].upload(gpu, belt, encoder, range.start, &bytes);
+            counter::add(Counter::MarksPayloadBytes, written);
+            uploaded += written;
         }
         self.residence.insert(
             revision,
             Resident {
                 prims: Arc::clone(prims),
                 ranges,
+                payloads: payloads.into_boxed_slice(),
             },
         );
         uploaded
     }
 
+    /// Takes `count` elements of `arena`, growing it when they do not fit, and adds what the
+    /// growth uploaded to `uploaded`.
+    fn alloc(
+        &mut self,
+        gpu: &Gpu,
+        belt: &mut UploadBelt,
+        encoder: &mut wgpu::CommandEncoder,
+        arena: usize,
+        count: u32,
+        uploaded: &mut u64,
+    ) -> Range<u32> {
+        if let Some(range) = self.arenas[arena].alloc(count) {
+            return range;
+        }
+        // Grow the arena and settle everything resident into the new texture, then take the range
+        // that now must fit.
+        *uploaded += self.grow(gpu, belt, encoder, arena, count);
+        self.arenas[arena]
+            .alloc(count)
+            .expect("the arena was grown for exactly this request")
+    }
+
+    /// Drops one hold on the payload under `key`, and retires its ranges when none is left.
+    fn drop_hold(&mut self, key: usize) {
+        let Some(shared) = self.shared.get_mut(&key) else {
+            return;
+        };
+        shared.holders = shared.holders.saturating_sub(1);
+        if shared.holders > 0 {
+            return;
+        }
+        let shared = self.shared.remove(&key).expect("just found");
+        for (kind, range) in shared.ranges.into_iter().enumerate() {
+            if let Some(range) = range {
+                self.ledger.retire(payload_arena(kind), range);
+            }
+        }
+    }
+
     /// Replaces `lane`'s texture with one that fits everything resident plus `incoming`, and
-    /// re-uploads every resident chunk's lane.
+    /// re-uploads every resident chunk's lane, or every resident payload of a payload arena.
     ///
     /// Nothing in flight can be corrupted: the old texture is dropped, and the device keeps it
     /// alive until the submissions reading it complete. The ledger's claims on the old texture
@@ -557,49 +719,62 @@ impl ChunkStore {
         lane: usize,
         incoming: u32,
     ) -> u64 {
-        let live: u32 = self
-            .residence
-            .values()
-            .map(|resident| {
-                resident.ranges[lane]
-                    .as_ref()
-                    .map_or(0, |range| range.end - range.start)
-            })
-            .sum();
-        // Double past the need, so a growth is rare rather than per-insert.
-        let needed = (live + incoming).saturating_mul(2);
+        let length = |range: &Option<Range<u32>>| range.as_ref().map_or(0, |r| r.end - r.start);
+        let live: u32 = match lane.checked_sub(LANES.len()) {
+            None => self
+                .residence
+                .values()
+                .map(|resident| length(&resident.ranges[lane]))
+                .sum(),
+            Some(kind) => self
+                .shared
+                .values()
+                .map(|shared| length(&shared.ranges[kind]))
+                .sum(),
+        };
+        // Double past the need, so a growth is rare rather than per-insert. Ranges still in flight
+        // count toward no need, so a growth also at least doubles what the arena held: a lane of a
+        // few transient elements would otherwise grow to the same size every few frames.
+        let needed = (live + incoming)
+            .saturating_mul(2)
+            .max(self.arenas[lane].capacity.saturating_mul(2));
         self.arenas[lane].reset_with_capacity(gpu, needed);
-        // Every ledger bucket may name ranges in the replaced buffer of this lane; forgetting
+        // Every ledger bucket may name ranges in the replaced texture of this lane; forgetting
         // them all over-forgets other lanes' pending ranges, which costs those elements until
         // their own lanes grow. Rare enough to prefer over per-lane bookkeeping.
         self.ledger.forget();
         let mut uploaded = 0;
-        let revisions: Vec<u64> = self.residence.keys().copied().collect();
-        for revision in revisions {
-            let (bytes, count) = {
-                let resident = &self.residence[&revision];
-                let bytes: Vec<u8> = match lane {
-                    0 => bytemuck::cast_slice(&resident.prims.quads).to_vec(),
-                    1 => bytemuck::cast_slice(&resident.prims.shadows).to_vec(),
-                    2 => bytemuck::cast_slice(&resident.prims.decorations).to_vec(),
-                    3 => bytemuck::cast_slice(&resident.prims.mono_sprites).to_vec(),
-                    4 => bytemuck::cast_slice(&resident.prims.subpixel_sprites).to_vec(),
-                    _ => bytemuck::cast_slice(&resident.prims.color_sprites).to_vec(),
-                };
-                let count = (bytes.len() as u32) / self.arenas[lane].element;
-                (bytes, count)
-            };
+        if let Some(kind) = lane.checked_sub(LANES.len()) {
+            let arena = &mut self.arenas[lane];
+            for shared in self.shared.values_mut() {
+                let bytes = payload_slice(&shared.payload, kind);
+                let count = (bytes.len() as u32) / arena.element;
+                // A payload being inserted has no range yet, and takes one after the growth.
+                if count == 0 || shared.ranges[kind].is_none() {
+                    continue;
+                }
+                let range = arena
+                    .alloc(count)
+                    .expect("the arena was sized for everything resident");
+                let written = arena.upload(gpu, belt, encoder, range.start, bytes);
+                counter::add(Counter::MarksPayloadBytes, written);
+                uploaded += written;
+                shared.ranges[kind] = Some(range);
+            }
+            return uploaded;
+        }
+        let arena = &mut self.arenas[lane];
+        for resident in self.residence.values_mut() {
+            let bytes = lane_slice!(resident.prims, LANES[lane]);
+            let count = (bytes.len() as u32) / arena.element;
             if count == 0 {
                 continue;
             }
-            let range = self.arenas[lane]
+            let range = arena
                 .alloc(count)
                 .expect("the arena was sized for everything resident");
-            uploaded += self.arenas[lane].upload(gpu, belt, encoder, range.start, &bytes);
-            self.residence
-                .get_mut(&revision)
-                .expect("iterating known keys")
-                .ranges[lane] = Some(range);
+            uploaded += arena.upload(gpu, belt, encoder, range.start, bytes);
+            resident.ranges[lane] = Some(range);
         }
         uploaded
     }
@@ -614,18 +789,9 @@ impl ChunkStore {
         scene: &Scene,
     ) -> u64 {
         let mut uploaded = 0;
-        self.frame_offsets.clear();
-        self.frame_offsets.push([0.0, 0.0]);
-        self.offset_of.clear();
+        self.shift_of.clear();
         for (&revision, &offset) in scene.chunk_offsets() {
-            let index = if self.frame_offsets.len() <= (u32::MAX >> SLOT_BITS) as usize {
-                let index = self.frame_offsets.len() as u32;
-                self.frame_offsets.push(offset);
-                index
-            } else {
-                u32::MAX
-            };
-            self.offset_of.insert(revision, index);
+            self.shift_of.insert(revision, offset);
         }
         for (lane, &kind) in LANES.iter().enumerate() {
             let remap = scene.remap(kind);
@@ -641,7 +807,7 @@ impl ChunkStore {
                 .filter(|&&index| {
                     resident_slot(
                         &self.residence,
-                        &self.offset_of,
+                        &self.shift_of,
                         lane,
                         &provenance[index as usize],
                     )
@@ -661,26 +827,16 @@ impl ChunkStore {
             } else {
                 0..0
             };
-            debug_assert!(
-                transient_range.end <= SLOT_MASK,
-                "a lane's transient range left the slot bits; see SLOT_BITS"
-            );
-
             let bytes = lane_bytes(scene, lane);
             let mut placed = 0;
             for &index in remap {
                 let slot = provenance[index as usize];
-                match resident_slot(&self.residence, &self.offset_of, lane, &slot) {
-                    // The packed entry is unpacked here rather than in the vertex stage: the shift
-                    // rides the order stream beside the slot, so a shader neither carries the
-                    // packing's widths nor takes an indirection to resolve them.
-                    Some(at) => self.resolved[lane].push(OrderEntry {
-                        slot: at & SLOT_MASK,
-                        shift: self.frame_offsets[(at >> SLOT_BITS) as usize],
-                    }),
+                match resident_slot(&self.residence, &self.shift_of, lane, &slot) {
+                    Some(entry) => self.resolved[lane].push(entry),
                     None => {
                         let at = index as usize * element;
                         self.gathered[lane].extend_from_slice(&bytes[at..at + element]);
+                        // Gathered where it is drawn, so there is nothing to shift it by.
                         self.resolved[lane].push(OrderEntry {
                             slot: transient_range.start + placed,
                             shift: [0.0, 0.0],
@@ -699,11 +855,111 @@ impl ChunkStore {
             // This frame's transient elements are reclaimable once its submission completes.
             self.ledger.retire(lane, transient_range);
         }
+        uploaded += self.resolve_payloads(gpu, belt, encoder, scene);
         uploaded
     }
 
-    /// The resolved remap for `lane`: slot-and-shift entries, in draw order.
-    pub fn resolved_remap(&self, lane: usize) -> &[OrderEntry] {
+    /// Finds each mark's payload ranges, by remap position: in the resident payload its resident
+    /// chunk holds, in a resident payload a transient mark draws as well, or gathered into
+    /// per-frame ranges.
+    ///
+    /// The test is the one the lane's own resolution made, so a resident item always reads the
+    /// payload its chunk holds.
+    fn resolve_payloads(
+        &mut self,
+        gpu: &Gpu,
+        belt: &mut UploadBelt,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &Scene,
+    ) -> u64 {
+        self.mark_payload.clear();
+        let remap = scene.remap(PrimitiveKind::Marks);
+        if remap.is_empty() {
+            return 0;
+        }
+        let provenance = scene.provenance(PrimitiveKind::Marks);
+        let payloads = &scene.primitives.mark_payloads;
+        let resident = |store: &Self, index: u32| {
+            resident_slot(
+                &store.residence,
+                &store.shift_of,
+                MARKS_LANE,
+                &provenance[index as usize],
+            )
+            .is_some()
+        };
+        // A mark served transiently gathers its payload only when no resident payload is it.
+        let gathers = |store: &Self, index: u32| {
+            !resident(store, index)
+                && !store
+                    .shared
+                    .contains_key(&payload_key(&payloads[index as usize]))
+        };
+        let mut transient = [0u32; PAYLOAD_LANES];
+        for &index in remap {
+            if gathers(self, index) {
+                for (kind, count) in payloads[index as usize].counts().into_iter().enumerate() {
+                    transient[kind] += count;
+                }
+            }
+        }
+        let mut uploaded = 0;
+        let mut ranges: [Range<u32>; PAYLOAD_LANES] = [0..0, 0..0, 0..0, 0..0];
+        for (kind, range) in ranges.iter_mut().enumerate() {
+            if transient[kind] == 0 {
+                continue;
+            }
+            let arena = payload_arena(kind);
+            *range = match self.arenas[arena].alloc(transient[kind]) {
+                Some(range) => range,
+                None => {
+                    uploaded += self.grow(gpu, belt, encoder, arena, transient[kind]);
+                    self.arenas[arena]
+                        .alloc(transient[kind])
+                        .expect("the arena was grown for exactly this request")
+                }
+            };
+        }
+        let mut gathered: [Vec<u8>; PAYLOAD_LANES] = Default::default();
+        let mut placed = [0u32; PAYLOAD_LANES];
+        for &index in remap {
+            let payload = &payloads[index as usize];
+            let counts = payload.counts();
+            let slot = provenance[index as usize];
+            let key = if resident(self, index) {
+                Some(self.residence[&slot.revision].payloads[slot.index as usize])
+            } else {
+                let key = payload_key(payload);
+                self.shared.contains_key(&key).then_some(key)
+            };
+            let at = if let Some(key) = key {
+                let held = &self.shared[&key].ranges;
+                core::array::from_fn(|kind| held[kind].as_ref().map_or(0, |range| range.start))
+            } else {
+                let at: [u32; PAYLOAD_LANES] =
+                    core::array::from_fn(|kind| ranges[kind].start + placed[kind]);
+                for kind in 0..PAYLOAD_LANES {
+                    gathered[kind].extend_from_slice(payload_slice(payload, kind));
+                    placed[kind] += counts[kind];
+                }
+                at
+            };
+            self.mark_payload.push(core::array::from_fn(|kind| {
+                at[kind]..at[kind] + counts[kind]
+            }));
+        }
+        for (kind, bytes) in gathered.iter().enumerate() {
+            let arena = payload_arena(kind);
+            let written = self.arenas[arena].upload(gpu, belt, encoder, ranges[kind].start, bytes);
+            counter::add(Counter::MarksPayloadBytes, written);
+            uploaded += written;
+            self.ledger.retire(arena, ranges[kind].clone());
+        }
+        uploaded
+    }
+
+    /// The resolved draw order for `lane`: a slot and a shift each, in draw order.
+    pub fn resolved_order(&self, lane: usize) -> &[OrderEntry] {
         &self.resolved[lane]
     }
 
@@ -719,6 +975,7 @@ impl ChunkStore {
     pub fn release(&mut self, gpu: &Gpu) -> u64 {
         let before = self.bytes();
         self.residence.clear();
+        self.shared.clear();
         self.ledger.forget();
         for arena in &mut self.arenas {
             arena.reset_with_capacity(gpu, 0);
@@ -727,40 +984,29 @@ impl ChunkStore {
     }
 }
 
-/// The packed remap entry serving one primitive from a resident chunk, if one can.
+/// The order entry serving one primitive from a resident chunk, if one can.
 ///
 /// `None` is the transient answer, for every reason there is: the primitive is transient by
-/// provenance, its chunk is not resident, the chunk holds nothing in this lane, the resident
-/// slot lies past what the slot bits can name, or the chunk moved this frame and the offset
-/// table was already full.
+/// provenance, its chunk is not resident, or the chunk holds nothing in this lane. The reasons
+/// that used to be here and are not any more were both about the packing — a slot past what the
+/// slot bits could name, and a frame with more moved chunks than the offset table could hold.
 fn resident_slot(
     residence: &HashMap<u64, Resident>,
-    offset_of: &HashMap<u64, u32>,
+    shift_of: &HashMap<u64, [f32; 2]>,
     lane: usize,
     slot: &zgui_scene::ChunkSlot,
-) -> Option<u32> {
+) -> Option<OrderEntry> {
     if slot.is_transient() {
         return None;
     }
-    let offset = match offset_of.get(&slot.revision) {
-        Some(&u32::MAX) => return None,
-        Some(&index) => index,
-        None => 0,
-    };
     let range = residence.get(&slot.revision)?.ranges[lane].as_ref()?;
-    let at = range.start + slot.index;
-    (at <= SLOT_MASK).then_some((offset << SLOT_BITS) | at)
+    Some(OrderEntry {
+        slot: range.start + slot.index,
+        shift: shift_of.get(&slot.revision).copied().unwrap_or([0.0, 0.0]),
+    })
 }
 
 /// The frame array of `lane`, as bytes.
 fn lane_bytes(scene: &Scene, lane: usize) -> &[u8] {
-    match lane {
-        0 => bytemuck::cast_slice(&scene.primitives.quads),
-        1 => bytemuck::cast_slice(&scene.primitives.shadows),
-        2 => bytemuck::cast_slice(&scene.primitives.decorations),
-        3 => bytemuck::cast_slice(&scene.primitives.mono_sprites),
-        4 => bytemuck::cast_slice(&scene.primitives.subpixel_sprites),
-        5 => bytemuck::cast_slice(&scene.primitives.color_sprites),
-        _ => bytemuck::cast_slice(&scene.primitives.shaded),
-    }
+    lane_slice!(scene.primitives, LANES[lane])
 }

@@ -398,7 +398,7 @@ fn every_line_becomes_one_fragment() {
     let content_top = store
         .fragment(fragments[0])
         .expect("live")
-        .content_box
+        .content_box()
         .origin
         .y
         .0;
@@ -442,51 +442,228 @@ fn laying_out_again_replaces_the_lines_rather_than_adding_to_them() {
     assert_eq!(store.fragments_of_box(key).len(), after_one);
 }
 
-#[test]
-fn vertical_align_on_a_run_of_text_moves_nothing_yet() {
-    // The scheme this context resolves `vertical-align` with is the shaper's one lever: the height
-    // an *inline box* is declared at. A run of text is not an inline box — it is a styled range of
-    // the one string the shaper was handed — and there is no per-run baseline offset anywhere
-    // between here and the glyphs. So `<sup>` and `<sub>`, which is what almost every author means
-    // by `vertical-align`, do nothing at all: the run keeps its place on the baseline and the line
-    // box keeps the height the strut gave it.
-    //
-    // This is written down as an assertion rather than left absent because the failure is silent —
-    // an author writes the property and no error is reported anywhere. Closing it needs a shift
-    // carried on `StyledRun` through to wherever glyphs are positioned, which is a text-engine and
-    // a painting change, not a layout one; when it lands, this case fails and says so.
-    let (_, plain) = resolve(
+/// A paragraph holding `x` and a run holding `2` under `run` declarations.
+fn aligned_run(run: &str) -> (LayoutStore, InlineResolution) {
+    resolve(
         Element::new("root").children(vec![
-            Element::new("para").children(vec![Element::new("run").text("x2")]),
+            Element::new("para")
+                .text("x")
+                .children(vec![Element::new("run").text("2")]),
         ]),
-        "root { display: block; width: 400px }
-         para { display: block }
-         run { display: inline }",
+        &format!(
+            "root {{ display: block; width: 400px }}
+             para {{ display: block }}
+             run {{ display: inline; {run} }}"
+        ),
         400.0,
-    );
-    let (_, raised) = resolve(
-        Element::new("root").children(vec![
-            Element::new("para").children(vec![Element::new("run").text("x2")]),
-        ]),
-        "root { display: block; width: 400px }
-         para { display: block }
-         run { display: inline; vertical-align: super }",
-        400.0,
-    );
-    assert_eq!(
-        plain.lines[0].extents, raised.lines[0].extents,
-        "a superscripted run now changes the line box, so the run-level shift has a producer and \
-         this case has to become an assertion about where the glyphs went"
-    );
-    assert_eq!(plain.lines[0].height(), LINE);
+    )
+}
 
-    // The control that keeps the case honest: the same property on something that *is* an inline
-    // box does move it, so the assertion above is about runs and not about the property being
-    // unread.
-    let (line, top) = aligned_image("super");
+#[test]
+fn a_superscript_grows_the_line_above_and_raises_its_slice() {
+    // The run's edges carry its line-height-tall box at its shift, so the line grows above to
+    // hold the raised text; the slice carries the shift for painting, in whole pixels.
+    let (_, plain) = aligned_run("");
+    assert_eq!(plain.lines[0].height(), LINE);
+    assert!(plain.slices.iter().all(|slice| slice.shift == 0.0));
+
+    let (_, raised) = aligned_run("vertical-align: super");
+    let shift = 16.0 * zgui_layout::inline::vertical_align::SUPER_FRACTION;
+    let line = &raised.lines[0];
+    close(
+        line.extents.above,
+        BASELINE + shift,
+        "the line grows above by the shift",
+    );
+    close(
+        line.extents.below,
+        plain.lines[0].extents.below,
+        "and not below",
+    );
+    let slice = &raised.slices[0];
+    assert_eq!(slice.shift, shift.round(), "the shift in whole pixels");
+    close(
+        slice.baseline,
+        line.baseline() - shift.round(),
+        "the slice's baseline is raised",
+    );
+
+    // The control: the same property on an atomic inline still moves it as before.
+    let (image, top) = aligned_image("super");
     close(
         top,
-        line.baseline() - 40.0 - 16.0 * zgui_layout::inline::vertical_align::SUPER_FRACTION,
+        image.baseline() - 40.0 - 16.0 * zgui_layout::inline::vertical_align::SUPER_FRACTION,
         "an atomic inline is raised",
+    );
+}
+
+#[test]
+fn a_subscript_grows_the_line_below_and_lowers_its_slice() {
+    let (_, plain) = aligned_run("");
+    let (_, lowered) = aligned_run("vertical-align: sub");
+    let shift = 16.0 * zgui_layout::inline::vertical_align::SUB_FRACTION;
+    let line = &lowered.lines[0];
+    close(
+        line.extents.above,
+        plain.lines[0].extents.above,
+        "the line keeps its top",
+    );
+    close(
+        line.extents.below,
+        plain.lines[0].extents.below + shift,
+        "and grows below by the shift",
+    );
+    assert_eq!(lowered.slices[0].shift, -shift.round());
+}
+
+#[test]
+fn nested_shifts_add() {
+    let (_, resolution) = resolve(
+        Element::new("root").children(vec![Element::new("para").text("x").children(vec![
+            Element::new("run").text("2").children(vec![Element::new("inner").text("3")]),
+        ])]),
+        "root { display: block; width: 400px }
+         para { display: block }
+         run, inner { display: inline; vertical-align: super }",
+        400.0,
+    );
+    let shift = 16.0 * zgui_layout::inline::vertical_align::SUPER_FRACTION;
+    let shifts: Vec<f32> = resolution.slices.iter().map(|slice| slice.shift).collect();
+    assert_eq!(
+        shifts,
+        [shift.round(), (2.0 * shift).round()],
+        "the inner run rides on the outer one"
+    );
+    close(
+        resolution.lines[0].extents.above,
+        BASELINE + 2.0 * shift,
+        "the line holds the higher one",
+    );
+}
+
+#[test]
+fn a_shifted_run_keeps_the_paragraph_key_it_had() {
+    // A shaping key folds the edges' widths and leaves their heights to the breaking key, so a
+    // shift re-breaks the paragraph and shapes nothing again.
+    let (_, plain) = aligned_run("");
+    let (_, raised) = aligned_run("vertical-align: super");
+    assert_eq!(plain.key, raised.key);
+}
+
+/// The paragraph `aa ` followed by a span holding `bbbb cccc`, under `span` declarations.
+fn spanned(span: &str, para: &str) -> (LayoutStore, InlineResolution) {
+    resolve(
+        Element::new("root").children(vec![
+            Element::new("para")
+                .text("aa ")
+                .children(vec![Element::new("span").text("bbbb cccc")]),
+        ]),
+        &format!(
+            "root {{ display: block; width: 400px }}
+             para {{ display: block; {para} }}
+             span {{ display: inline; {span} }}"
+        ),
+        400.0,
+    )
+}
+
+#[test]
+fn a_nested_inline_box_has_one_slice_per_line_it_crosses() {
+    // Ten characters fit a line. The span's start edge is margin 3, border 1 and padding 2, six in
+    // all, so the first line ends after `aa bbbb` and the second holds ` cccc`.
+    let (_, resolution) = spanned(
+        "margin: 0 3px; border: 1px solid black; padding: 0 2px",
+        "width: 80px",
+    );
+    assert_eq!(resolution.lines.len(), 2);
+    let slices = &resolution.slices;
+    assert_eq!(slices.len(), 2, "{slices:#?}");
+
+    let first = &slices[0];
+    assert_eq!((first.line, first.first, first.last), (0, true, false));
+    // After `aa `, plus the start margin.
+    close(
+        first.x,
+        3.0 * ADVANCE + 3.0,
+        "the first part starts inside the margin",
+    );
+    close(
+        first.x + first.width,
+        resolution.lines[0].offset + resolution.lines[0].width,
+        "a part the box is broken after runs to the line's end",
+    );
+    assert_eq!(first.border.left, 1.0);
+    assert_eq!(first.border.right, 0.0, "the broken side has no border");
+    assert_eq!(first.padding.right, 0.0);
+
+    let second = &slices[1];
+    assert_eq!((second.line, second.first, second.last), (1, false, true));
+    close(
+        second.x,
+        resolution.lines[1].offset,
+        "a continued part starts at the line's start",
+    );
+    // ` cccc` is five characters, then the end border and padding.
+    close(
+        second.x + second.width,
+        5.0 * ADVANCE + 3.0,
+        "the last part ends at its border edge",
+    );
+    assert_eq!(second.border.left, 0.0);
+    assert_eq!(second.border.right, 1.0);
+    assert_eq!(first.text, 3..12, "both parts name the box's whole text");
+    assert_eq!(resolution.slices_on(1).len(), 1);
+}
+
+#[test]
+fn a_slice_is_as_tall_as_the_boxes_own_content_area_and_padding() {
+    let (_, resolution) = spanned("padding: 4px 0; border: 1px solid black", "");
+    let slice = &resolution.slices[0];
+    let line = &resolution.lines[0];
+    close(
+        slice.height,
+        ASCENT + DESCENT + 2.0 * 4.0 + 2.0,
+        "the content area, the padding and the border",
+    );
+    close(
+        slice.y,
+        line.baseline() - ASCENT - 4.0 - 1.0,
+        "the content area sits on the baseline",
+    );
+    assert_eq!(slice.baseline, line.baseline());
+    assert_eq!(slice.ascent, ASCENT);
+    assert_eq!(slice.descent, DESCENT);
+    assert_eq!(
+        line.height(),
+        LINE,
+        "the padding does not change the line box"
+    );
+}
+
+#[test]
+fn a_paragraph_without_nested_boxes_holds_no_slices() {
+    let (_, resolution) = resolve(
+        Element::new("root").children(vec![Element::new("para").text("alpha bravo")]),
+        "root { display: block; width: 400px }
+         para { display: block }",
+        400.0,
+    );
+    assert!(resolution.slices.is_empty());
+    assert_eq!(resolution.slices.capacity(), 0, "nothing was allocated");
+}
+
+#[test]
+fn a_slice_stops_where_an_ellipsis_cuts_the_line() {
+    let (_, resolution) = spanned(
+        "background: red",
+        "width: 64px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis",
+    );
+    let cut = resolution.lines[0].ellipsis.expect("the line was cut");
+    let slice = &resolution.slices[0];
+    close(slice.x, 3.0 * ADVANCE, "the part starts after `aa `");
+    close(
+        slice.x + slice.width,
+        cut.cutoff,
+        "the part ends at the cut",
     );
 }

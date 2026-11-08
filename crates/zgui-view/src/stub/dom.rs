@@ -334,6 +334,15 @@ impl Dom for StubDom {
         }
     }
 
+    fn text_is(&self, node: NodeId, data: &str) -> bool {
+        self.check(node);
+        self.tree
+            .borrow()
+            .nodes
+            .get(&node)
+            .is_some_and(|record| record.text == data)
+    }
+
     fn insert(&self, parent: NodeId, child: NodeId, before: Option<NodeId>) {
         self.check(parent);
         self.check(child);
@@ -542,6 +551,10 @@ impl Dom for StubDom {
 
     fn text_content(&self, node: NodeId) -> String {
         Self::text_content(self, node)
+    }
+
+    fn is_live(&self, node: NodeId) -> bool {
+        self.tree.borrow().nodes.contains_key(&node)
     }
 
     fn observe(&self, node: NodeId, what: Observed, sink: ObservationSink) -> ObservationHandle {

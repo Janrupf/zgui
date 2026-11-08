@@ -40,6 +40,7 @@
 use std::time::{Duration, Instant};
 
 use zgui::prelude::*;
+use zgui_console::RunDrm;
 
 /// How many lines of text the panel holds.
 ///

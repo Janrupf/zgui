@@ -1,7 +1,7 @@
 //! The frame-time graph: what it records, how it is drawn, and what it costs.
 //!
 //! It is the one sample taken on *every* frame rather than on the cadence, because a graph of frame
-//! times whose point is the spike cannot be built from one frame in thirty. What keeps that from
+//! times whose point is the slow frame cannot be built from one frame in thirty. What keeps that from
 //! being a runaway is that only the *reading* is per frame: the vector it accumulates into is not a
 //! signal, and nothing is published until the cadence comes round.
 //!

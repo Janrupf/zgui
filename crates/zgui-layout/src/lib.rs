@@ -15,11 +15,11 @@
 //! there is one box identity in the workspace and not two. The record for a box lives here; the
 //! name is declared where the document can reach it.
 //!
-//! # No layout-engine style is ever built
+//! # One engine style per box
 //!
-//! The layout algorithms read styles through traits, and what implements those traits is
-//! [`StyleRef`] — a small borrow of one box's computed style. Lowering a computed
-//! style into a second style struct, per box, per frame, would cost more than the layout it feeds.
+//! The layout algorithms read one engine style per box, which the store interns once from the
+//! box's lowered style and its variant (see [`style`]). Building a second style struct per box, per
+//! frame, would cost more than the layout it feeds.
 //!
 //! # What lives where
 //!
@@ -60,7 +60,7 @@
 //!
 //! let mut content = NoContent;
 //! let mut tree = LayoutTree::new(&mut store, &mut content, DeviceStyle::default());
-//! assert!(tree.layout_root(taffy::Size { width: 800.0, height: 600.0 }));
+//! assert!(tree.layout_viewport(800.0, 600.0));
 //!
 //! // A block-level root stretch-fits the viewport it was laid out in.
 //! let layout = store.layout_of(root).expect("laid out");
@@ -90,14 +90,14 @@ pub mod tree;
 
 pub use crate::axis::Axis;
 pub use crate::fragment::hit::{HitEntry, HitIndex, PointerEvents};
-pub use crate::fragment::{FragKey, Fragment, FragmentFlags, FragmentKind};
+pub use crate::fragment::{FragKey, Fragment, FragmentExtra, FragmentFlags, FragmentKind};
 pub use crate::key::{from_node_id, to_node_id};
 pub use crate::measure::{
     MeasureContent, MeasureRequest, Measured, NaturalSize, NoContent, WorkerMeasure,
 };
 pub use crate::node::box_node::BoxNode;
 pub use crate::node::kind::{BoxKind, FormattingContext, PseudoKind};
-pub use crate::style::{DeviceStyle, StyleRef};
+pub use crate::style::DeviceStyle;
 pub use crate::text::Paragraphs;
 pub use crate::tree::LayoutTree;
 pub use crate::tree::store::{LayoutStore, ResolvedLayout};

@@ -12,7 +12,6 @@ const NOTE: &str = "no probe has shown it changing a shaped line, and no module 
 
 crate::register_properties! {
     _webkit_text_security => Support::Ignored(NOTE),
-    color_scheme => Support::Ignored(NOTE),
     image_rendering => Support::Ignored(NOTE),
     text_rendering => Support::Ignored(NOTE),
     unicode_bidi => Support::Ignored(NOTE),

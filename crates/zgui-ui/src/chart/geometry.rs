@@ -4,7 +4,7 @@
 //! outline, in the element's own coordinate space. Everything here is a pure function of numbers,
 //! so a mark's geometry is testable without a window.
 
-use crate::chart::scale::Scale;
+use crate::chart::scale::{Scale, tick_label};
 
 /// Where a chart's plot area is inside its box, in CSS pixels.
 ///
@@ -83,6 +83,13 @@ impl Plot {
         Scale::over(values, self.y1(), self.y0())
     }
 
+    /// The same plot with `left` pixels of room for the value axis' labels.
+    #[must_use]
+    pub const fn with_left(mut self, left: f64) -> Self {
+        self.left = left;
+        self
+    }
+
     /// Where the `index`th of `count` evenly spaced bands starts and how wide it is.
     #[must_use]
     pub fn band(&self, index: usize, count: usize) -> (f64, f64) {
@@ -90,6 +97,110 @@ impl Plot {
         let width = self.inner_width() / count as f64;
         (self.x0() + index as f64 * width, width)
     }
+
+    /// Where the bar of series `series` of `series_count` sits in the `position`th of `count`
+    /// bands, as its left edge and its width.
+    ///
+    /// The bars of one band share the middle 80% of it, side by side and in series order, with a
+    /// small gap between two neighbours. The bar of a lone series fills that 80% alone.
+    ///
+    /// ```
+    /// use zgui_ui::chart::Plot;
+    ///
+    /// let plot = Plot::new(300.0, 150.0);
+    /// let (first, width) = plot.bar_slot(0, 3, 0, 2);
+    /// let (second, _) = plot.bar_slot(0, 3, 1, 2);
+    /// assert!(first + width < second, "two series, two bars side by side");
+    /// ```
+    #[must_use]
+    pub fn bar_slot(
+        &self,
+        position: usize,
+        count: usize,
+        series: usize,
+        series_count: usize,
+    ) -> (f64, f64) {
+        let (start, band) = self.band(position, count);
+        let inner = band * 0.8;
+        let first = start + band * 0.1;
+        let series_count = series_count.max(1);
+        if series_count == 1 {
+            return (first, inner);
+        }
+        let gaps = (series_count - 1) as f64;
+        let gap = (inner * 0.1 / gaps).min(BAR_GAP);
+        let width = (inner - gap * gaps) / series_count as f64;
+        (
+            first + series.min(series_count - 1) as f64 * (width + gap),
+            width,
+        )
+    }
+}
+
+/// The widest gap between two bars of one band, in CSS pixels.
+const BAR_GAP: f64 = 4.0;
+
+/// How narrow the value axis' gutter can be, in CSS pixels.
+const MIN_GUTTER: f64 = 44.0;
+
+/// How far a value label's end is from the value axis, in CSS pixels.
+pub(crate) const LABEL_GAP: f64 = 6.0;
+
+/// A generous estimate of how wide one character of an axis label is, in CSS pixels.
+///
+/// The chart measures its value labels once they are laid out, and uses this only until then and
+/// for the category labels.
+const LABEL_CHAR: f64 = 8.0;
+
+/// How wide the value axis' gutter is for labels at `ticks`: room for the longest label, the gap
+/// to the axis and a margin at the chart's edge, and never less than 44 pixels.
+///
+/// ```
+/// use zgui_ui::chart::value_gutter;
+///
+/// assert_eq!(value_gutter(&[0.0, 50.0, 100.0]), 44.0);
+/// assert!(value_gutter(&[0.0, 30_000.0, 60_000.0]) > 44.0);
+/// ```
+#[must_use]
+pub fn value_gutter(ticks: &[f64]) -> f64 {
+    let longest = ticks
+        .iter()
+        .map(|tick| tick_label(*tick).chars().count())
+        .max()
+        .unwrap_or(0);
+    measured_gutter(longest as f64 * LABEL_CHAR)
+}
+
+/// How wide the value axis' gutter is for a longest label `width` CSS pixels wide: the label, the
+/// gap to the axis and a margin at the chart's edge, and never less than 44 pixels.
+///
+/// ```
+/// use zgui_ui::chart::measured_gutter;
+///
+/// assert_eq!(measured_gutter(20.0), 44.0);
+/// assert_eq!(measured_gutter(50.0), 62.0);
+/// ```
+#[must_use]
+pub fn measured_gutter(width: f64) -> f64 {
+    (width + LABEL_GAP * 2.0).max(MIN_GUTTER)
+}
+
+/// Every how many bands a category label is drawn, so that labels `longest` characters long in
+/// bands `band` pixels wide do not run into each other.
+///
+/// ```
+/// use zgui_ui::chart::category_step;
+///
+/// assert_eq!(category_step(60.0, 3), 1, "room for every label");
+/// assert_eq!(category_step(10.0, 3), 3, "every third label");
+/// ```
+#[must_use]
+pub fn category_step(band: f64, longest: usize) -> usize {
+    let wanted = longest as f64 * LABEL_CHAR + LABEL_GAP;
+    if band <= 0.0 {
+        return 1;
+    }
+    ((wanted / band).ceil() as usize).max(1)
 }
 
 /// A rectangle, as path notation.
@@ -252,7 +363,9 @@ pub fn axes_path(plot: &Plot, scale: &Scale, ticks: &[f64]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MarkBox, Plot, area_path, axes_path, line_path, rect_path};
+    use super::{
+        MarkBox, Plot, area_path, axes_path, category_step, line_path, rect_path, value_gutter,
+    };
 
     /// Every coordinate in a path string, in order.
     fn numbers(path: &str) -> Vec<f64> {
@@ -362,6 +475,66 @@ mod tests {
             (last + width - plot.x1()).abs() < 1e-9,
             "the last band ends at the plot's right edge",
         );
+    }
+
+    #[test]
+    fn one_series_fills_the_middle_of_its_band() {
+        let plot = Plot::new(300.0, 200.0);
+        let (start, band) = plot.band(2, 6);
+        let (x, width) = plot.bar_slot(2, 6, 0, 1);
+        assert!((x - (start + band * 0.1)).abs() < 1e-9);
+        assert!((width - band * 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_bars_of_several_series_share_their_band_side_by_side() {
+        let plot = Plot::new(300.0, 200.0);
+        let (start, band) = plot.band(1, 4);
+        let slots: Vec<(f64, f64)> = (0..3)
+            .map(|series| plot.bar_slot(1, 4, series, 3))
+            .collect();
+        for pair in slots.windows(2) {
+            let gap = pair[1].0 - (pair[0].0 + pair[0].1);
+            assert!(gap > 0.0 && gap <= 4.0, "two neighbours are {gap}px apart");
+        }
+        assert!(
+            (slots[0].0 - (start + band * 0.1)).abs() < 1e-9,
+            "the first starts the 80%"
+        );
+        let (last, width) = slots[2];
+        assert!(
+            (last + width - (start + band * 0.9)).abs() < 1e-9,
+            "the last ends the 80%"
+        );
+        assert!(
+            slots.iter().all(|slot| (slot.1 - width).abs() < 1e-9),
+            "all one width"
+        );
+    }
+
+    #[test]
+    fn many_series_in_a_narrow_band_keep_a_gap_of_a_tenth_of_it() {
+        let plot = Plot::new(100.0, 200.0);
+        let (_, band) = plot.band(0, 4);
+        let (first, width) = plot.bar_slot(0, 4, 0, 5);
+        let (second, _) = plot.bar_slot(0, 4, 1, 5);
+        let gap = second - (first + width);
+        assert!((gap - band * 0.8 * 0.1 / 4.0).abs() < 1e-9, "gap {gap}");
+        assert!(width > 0.0);
+    }
+
+    #[test]
+    fn the_gutter_grows_with_the_longest_label() {
+        assert_eq!(value_gutter(&[]), 44.0);
+        assert_eq!(value_gutter(&[0.0, 100.0]), 44.0);
+        assert_eq!(value_gutter(&[0.0, 60_000.0]), 5.0 * 8.0 + 12.0);
+    }
+
+    #[test]
+    fn category_labels_thin_out_when_the_bands_are_narrow() {
+        assert_eq!(category_step(40.0, 3), 1);
+        assert_eq!(category_step(15.0, 3), 2);
+        assert_eq!(category_step(0.0, 3), 1);
     }
 
     #[test]

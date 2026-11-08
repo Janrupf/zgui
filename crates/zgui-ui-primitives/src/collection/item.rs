@@ -1,6 +1,6 @@
 //! One registered item, and the name it is known by.
 
-use zgui::prelude::{GetUntracked, NodeRef, Signal};
+use zgui::prelude::{GetUntracked, NodeRef, ScrollBehavior, ScrollTarget, Signal};
 use zgui::reactive::LocalStorage;
 
 /// One item's name inside its own [`Collection`](crate::Collection).
@@ -75,6 +75,15 @@ impl CollectionItem {
     /// Moves focus to this item.
     pub fn focus(&self) {
         self.node.focus();
+    }
+
+    /// Moves focus to this item and scrolls it into view.
+    ///
+    /// For a move the keyboard asked for. A pointer that focuses an item is already over it.
+    pub fn focus_and_reveal(&self) {
+        self.node.focus();
+        self.node
+            .scroll_to(ScrollTarget::IntoView, ScrollBehavior::Instant);
     }
 }
 

@@ -19,6 +19,8 @@ pub enum PaintKind {
     Gradient = 2,
     /// A sampled image.
     Image = 3,
+    /// One colour per border side, see [`Paint::Sides`](crate::Paint::Sides).
+    Sides = 4,
 }
 
 /// A primitive's reference to its paint: a family and an index.

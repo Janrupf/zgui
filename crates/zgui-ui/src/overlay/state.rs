@@ -75,6 +75,16 @@ impl OverlayState {
         Self::new(Binding::Unbound, default_open, on_open_change)
     }
 
+    /// The same overlay, anchored to `trigger` in place of a handle of its own.
+    ///
+    /// For a component whose caller hands in the trigger's handle. One handle then binds the
+    /// trigger's element, so the surface is placed against it and focus returns to it.
+    #[must_use]
+    pub fn anchored_to(mut self, trigger: NodeRef) -> Self {
+        self.trigger = trigger;
+        self
+    }
+
     /// Publishes this to every scope below the current one, and hands it back.
     pub fn provide(self) -> Self {
         provide_local_context(self);

@@ -200,6 +200,7 @@ fn scene_of(text: &str, drawn: Drawn) -> Scene {
             zgui_paint::emit::text::Inherited {
                 text_fill: lowered.text_fill.as_ref(),
                 decorations: &[],
+                inline: &[],
             },
             TextPlacement {
                 line: Rect::new(
@@ -210,7 +211,6 @@ fn scene_of(text: &str, drawn: Drawn) -> Scene {
                 transform,
                 opaque_target: true,
                 subpixel_capable: false,
-                upright: true,
                 scale: 1.0,
                 ellipsis: None,
             },

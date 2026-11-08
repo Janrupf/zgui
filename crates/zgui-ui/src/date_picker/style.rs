@@ -21,8 +21,7 @@ style! { pub DatePickerStyle =>
         padding: 0 var(--zui-space-md);
         border: 1px solid var(--zui-color-border);
         border-radius: var(--zui-radius-md);
-        background-color: var(--zui-color-background);
-        box-shadow: var(--zui-shadow-xs);
+        background-color: transparent;
         color: var(--zui-color-foreground);
         font-family: var(--zui-type-family-sans);
         font-size: var(--zui-type-size-sm);
@@ -52,10 +51,13 @@ style! { pub DatePickerStyle =>
     ":scope .zui-date-picker__label { overflow: hidden; text-overflow: ellipsis; }"
     // The surface is portaled out of the picker, so this is a plain rule rather than a scoped one.
     // It has no padding of its own: the calendar brings its own, and a surface that added more
-    // would put a band of popover colour around a calendar that already ends in one.
+    // would put a band of popover colour around a calendar that already ends in one. It scrolls
+    // when the window has less room than the calendar needs.
     ".zui-date-picker__surface {
         width: auto;
+        max-height: var(--zui-popper-available-height, none);
         padding: 0;
-        overflow: hidden;
+        overflow-x: hidden;
+        overflow-y: auto;
     }"
 }

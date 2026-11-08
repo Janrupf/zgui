@@ -24,7 +24,12 @@ fn first_glyph(text: &str) -> (Arc<FontSystem>, FaceId, u16) {
     let (fonts, mut shaper) = support::shaper(Controls::Verbatim);
     let fixture = support::Fixture::new(text, Direction::LeftToRight);
     let shaped = shaper.shape(&fixture.content());
-    let line = shaped.engine.layout.get(0).expect("one line");
+    let line = shaped
+        .engine
+        .layout()
+        .expect("a live form")
+        .get(0)
+        .expect("one line");
     let run = line.runs().next().expect("one run");
     let face = fonts.face_for(run.font());
     let glyph = run
@@ -355,4 +360,213 @@ fn a_face_handle_still_rasterises_after_its_family_is_unregistered() {
         Some(&before),
         "a paragraph shaped before the unregistration is still on screen and still has to draw"
     );
+}
+
+/// Where the ink of the rows from `rows` sits, as the mean column weighted by coverage.
+fn ink_column(image: &zgui_text::GlyphImage, rows: std::ops::Range<u32>) -> f32 {
+    let width = image.size.width;
+    let (mut sum, mut weight) = (0.0f32, 0.0f32);
+    for row in rows {
+        for column in 0..width {
+            let coverage = f32::from(image.bytes[(row * width + column) as usize]);
+            sum += coverage * column as f32;
+            weight += coverage;
+        }
+    }
+    sum / weight.max(1.0)
+}
+
+/// A synthesised italic leans the tile forward: the top of a stem sits right of its foot.
+#[test]
+fn a_synthetic_slant_leans_the_tile_forward() {
+    let (fonts, face, glyph) = first_glyph("l");
+    let raster = Rasteriser::new(fonts);
+    let key = GlyphKey {
+        synthetic_slant_bits: 14.0f32.to_bits(),
+        ..GlyphKey::new(face, glyph, 24.0, SubpixelOffset(0), RasterStyle::Grayscale)
+    };
+    let image = raster.raster(&key).expect("a tile");
+    let height = image.size.height;
+    let top = ink_column(&image, 0..height / 4);
+    let foot = ink_column(&image, height - height / 4..height);
+    assert!(
+        top > foot + 2.0,
+        "the top of the stem leans right of its foot: {top} against {foot}"
+    );
+}
+
+/// The first run of `text` shaped in the shipped variable face at `weight`, with the system it
+/// was shaped through.
+fn variable_run(fonts: &Arc<FontSystem>, weight: f32) -> zgui_text::ShapedRunOwned {
+    use zgui_text::{BreakRequest, ShapedRunOwned};
+
+    let mut shaper = zgui_text_parley::Shaper::with_controls(fonts.clone(), Controls::Verbatim);
+    let mut fixture = support::Fixture::new("HOW", Direction::LeftToRight);
+    fixture.runs[0].style = Arc::new(TextStyle {
+        family: FontFamilyList::from_iter([FamilyName::Named(Ident::new("Rubik"))]),
+        size: zgui_geom::CssPx(48.0),
+        weight,
+        ..TextStyle::initial()
+    });
+    let content = fixture.content();
+    let mut shaped = shaper.shape(&content);
+    shaper.break_lines(&mut shaped, &BreakRequest::new(&content, None));
+    let mut runs = Vec::new();
+    shaper.visit_line(&shaped, 0, &mut |run| runs.push(ShapedRunOwned::from(run)));
+    runs.into_iter().next().expect("one run")
+}
+
+/// The pixels a glyph covers, summed.
+fn ink(image: &GlyphImage) -> u64 {
+    image.bytes.iter().map(|byte| u64::from(*byte)).sum()
+}
+
+/// A variable face draws each weight at its own point on the `wght` axis: the runs name two
+/// instances, the glyphs are two cache entries, and the heavier one carries more ink.
+#[test]
+fn a_variable_face_draws_each_weight_at_its_own_instance() {
+    let fonts = Arc::new(FontSystem::new(FontSystemOptions::registered_only()));
+    fonts
+        .register(support::face("RubikSubset-Variable.ttf"), None)
+        .expect("the variable face registers");
+    let regular = variable_run(&fonts, 400.0);
+    let bold = variable_run(&fonts, 700.0);
+    assert_eq!(regular.face, bold.face, "one file, one face");
+    assert_ne!(
+        regular.instance, bold.instance,
+        "two weights of one variable face were shaped at one instance"
+    );
+    assert!(!bold.instance.is_default());
+    assert_eq!(bold.synthetic_bold, 0.0, "the weight comes from the axis");
+
+    let raster = Rasteriser::new(fonts);
+    let glyph = regular.glyphs[0];
+    let style = RasterStyle::Grayscale;
+    let light_key = regular
+        .as_run(zgui_scene::PaintSlot(0))
+        .key_for(glyph, 0.0, style);
+    let heavy_key = bold
+        .as_run(zgui_scene::PaintSlot(0))
+        .key_for(glyph, 0.0, style);
+    assert_ne!(light_key, heavy_key);
+    let light = raster.raster(&light_key).expect("a glyph");
+    let heavy = raster.raster(&heavy_key).expect("a glyph");
+    assert!(
+        ink(&heavy) > ink(&light) * 11 / 10,
+        "700 drew no heavier than 400: {} against {}",
+        ink(&heavy),
+        ink(&light)
+    );
+
+    let light_curves = raster
+        .outline(
+            &regular
+                .as_run(zgui_scene::PaintSlot(0))
+                .outline_key(glyph.glyph),
+        )
+        .expect("curves");
+    let heavy_curves = raster
+        .outline(
+            &bold
+                .as_run(zgui_scene::PaintSlot(0))
+                .outline_key(glyph.glyph),
+        )
+        .expect("curves");
+    assert!(
+        heavy_curves.bounding_box().width() > light_curves.bounding_box().width(),
+        "the heavier curves are no wider: {:?} against {:?}",
+        heavy_curves.bounding_box(),
+        light_curves.bounding_box()
+    );
+}
+
+/// A static face is drawn at the default instance, so its keys are the ones it always had.
+#[test]
+fn a_static_face_is_drawn_at_the_default_instance() {
+    let (fonts, mut shaper) = support::shaper(Controls::Verbatim);
+    let fixture = support::Fixture::new("H", Direction::LeftToRight);
+    let content = fixture.content();
+    let mut shaped = shaper.shape(&content);
+    shaper.break_lines(&mut shaped, &zgui_text::BreakRequest::new(&content, None));
+    let mut instances = Vec::new();
+    shaper.visit_line(&shaped, 0, &mut |run| instances.push(run.instance));
+    let _ = fonts;
+    assert_eq!(instances, vec![zgui_text::VariationInstance::DEFAULT]);
+}
+
+/// A batch gives each key the bytes a single call gives it, on any thread and in any order.
+///
+/// The prefetch of a cold frame rasterises batches on the layout workers, each through a scaler
+/// context of its own, and the atlas then holds those bytes for keys the frame thread asks for.
+#[test]
+fn a_batch_answers_what_one_call_answers() {
+    let (fonts, mut shaper) = support::shaper(Controls::Verbatim);
+    let fixture = support::Fixture::new("the quick brown fox 0123", Direction::LeftToRight);
+    let shaped = shaper.shape(&fixture.content());
+    let line = shaped
+        .engine
+        .layout()
+        .expect("a live form")
+        .get(0)
+        .expect("one line");
+    let run = line.runs().next().expect("one run");
+    let face = fonts.face_for(run.font());
+    let ids: Vec<u16> = run
+        .clusters()
+        .flat_map(|cluster| {
+            cluster
+                .glyphs()
+                .map(|glyph| glyph.id as u16)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let mut keys = Vec::new();
+    for size in [11.0, 13.5, 24.0] {
+        for phase in 0..SubpixelOffset::STEPS {
+            for style in [RasterStyle::Grayscale, RasterStyle::Subpixel] {
+                for glyph in &ids {
+                    keys.push(GlyphKey::new(
+                        face,
+                        *glyph,
+                        size,
+                        SubpixelOffset(phase),
+                        style,
+                    ));
+                }
+            }
+        }
+    }
+
+    let raster = Rasteriser::new(fonts);
+    let single: Vec<Option<GlyphImage>> = keys.iter().map(|key| raster.raster(key)).collect();
+    assert!(
+        single.iter().flatten().any(|image| !image.is_empty()),
+        "nothing drew, so the comparison is empty"
+    );
+    assert_eq!(raster.raster_many(&keys), single);
+
+    // Four batches at once, each in the reverse order, the way the workers take them.
+    let batches: Vec<Vec<GlyphKey>> = keys
+        .chunks(keys.len().div_ceil(4))
+        .map(|chunk| chunk.iter().rev().copied().collect())
+        .collect();
+    let answered: Vec<Vec<Option<GlyphImage>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = batches
+            .iter()
+            .map(|batch| scope.spawn(|| raster.raster_many(batch)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("a batch rasterises"))
+            .collect()
+    });
+    for (batch, images) in batches.iter().zip(answered) {
+        for (key, image) in batch.iter().zip(images) {
+            let at = keys
+                .iter()
+                .position(|k| k == key)
+                .expect("a key of the batch");
+            assert_eq!(image, single[at], "{key:?} drew differently in a batch");
+        }
+    }
 }

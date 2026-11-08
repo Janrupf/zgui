@@ -42,13 +42,11 @@ pub fn reach(deviation: f32) -> i32 {
 /// its edge rather than left to whatever a previous lease put there.
 ///
 /// That staging is the whole reason a blurred panel over a moving spinner costs the spinner's area
-/// instead of the panel's. Giving `output` and `valid` the same rectangle collapses all three back
+/// rather than the panel's. Giving `output` and `valid` the same rectangle collapses all three back
 /// onto it, which is what a filter over its own isolated target wants: it reads only what it wrote.
 ///
 /// The sampling lattice is anchored to the device origin throughout, so the result does not shift
-/// when the blurred content moves by a fraction of a pixel — and, for the same reason, a pass
-/// restricted to a sub-rectangle writes the same texels it would have written covering all of
-/// `valid`.
+/// when the blurred content moves by a fraction of a pixel.
 ///
 /// Returns `None` when the pool could not lend the two scratch targets, which is the one case
 /// where there is nothing to do but composite the content unfiltered.
@@ -63,8 +61,15 @@ pub fn plan(
         valid.contains_rect(output),
         "a blur writing {output:?} reads outside the {valid:?} its source holds"
     );
-    let ping = builder.acquire(TargetScale::Half)?;
-    let pong = match builder.acquire(TargetScale::Half) {
+    let reach = reach(deviation);
+    let downsampled = grown(output, reach, reach, valid);
+    let horizontal = grown(output, 0, reach, valid);
+    // Both scratch targets are leased over what the source holds. Every region a pass writes is
+    // cut to it, so one lease covers all three, and its origin is a device pixel the surface has —
+    // a lease taken over a slack-grown rectangle would hold texels for pixels outside the surface
+    // and shift every origin the passes are given.
+    let ping = builder.acquire(TargetScale::Half, valid)?;
+    let pong = match builder.acquire(TargetScale::Half, valid) {
         Some(pong) => pong,
         None => {
             builder.release(ping);
@@ -74,28 +79,22 @@ pub fn plan(
     let ping = TargetRef::Pool(ping);
     let pong = TargetRef::Pool(pong);
 
-    let source_extent = builder.extent_of(source);
-    let half_extent = builder.extent(TargetScale::Half);
-    let reach = reach(deviation);
-    let downsampled = grown(output, reach, reach, valid);
-    let horizontal = grown(output, 0, reach, valid);
-
     // What each pass promises the next one it has written. A texel wider than the region it was
     // staged over, and never wider than what the source itself holds — see [`SLACK`].
     let promised = |region| grown(region, MARGIN, MARGIN, valid);
 
-    let params = builder.stage_blur(&BlurParams::downsample(
-        source_extent,
+    let downsample = builder.stage_blur(&BlurParams::downsample(
+        (builder.extent_of(source), source.origin()),
         source.scale(),
-        half_extent,
+        (builder.extent_of(ping), ping.origin()),
         valid,
     ));
     // Every region a pass carries is in device pixels; a pass into a half-resolution target has
     // its scissor converted where the pass is opened, so nothing here halves anything twice.
-    builder.begin_pass(ping, with_slack(downsampled));
+    builder.begin_pass(ping, with_slack(downsampled, valid));
     builder.draw(PlannedDraw::Blur {
         source,
-        params,
+        params: downsample,
         downsample: true,
     });
 
@@ -111,13 +110,14 @@ pub fn plan(
         (BlurAxis::Vertical, pong, ping, output, promised(horizontal)),
     ] {
         let params = builder.stage_blur(&BlurParams::axis(
-            half_extent,
+            [builder.extent_of(from), builder.extent_of(to)],
             TargetScale::Half,
+            [from.origin(), to.origin()],
             axis,
             deviation,
             written,
         ));
-        builder.begin_pass(to, with_slack(region));
+        builder.begin_pass(to, with_slack(region, valid));
         builder.draw(PlannedDraw::Blur {
             source: from,
             params,
@@ -163,7 +163,10 @@ const MARGIN: i32 = 2;
 /// input, evaluated at its own position.
 const SLACK: i32 = 4;
 
-/// `rect` grown by everything a pass writes beyond the region it was staged over.
-fn with_slack(rect: Rect<i32, Device>) -> Rect<i32, Device> {
-    rect.outset(Edges::uniform(MARGIN + SLACK))
+/// `rect` grown by everything a pass writes beyond the region it was staged over, cut to `within`.
+///
+/// The cut is what keeps a pass inside the target it writes: a lease is taken over what the source
+/// holds, so a region grown past that names texels the lease does not have.
+fn with_slack(rect: Rect<i32, Device>, within: Rect<i32, Device>) -> Rect<i32, Device> {
+    grown(rect, MARGIN + SLACK, MARGIN + SLACK, within)
 }

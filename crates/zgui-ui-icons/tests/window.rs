@@ -23,18 +23,42 @@ use zgui_ui_icons::set::mark::CHECK;
 /// One shape a frame was handed.
 #[derive(Clone, Copy, Debug)]
 struct Shape {
-    /// How wide the geometry is, in device pixels.
+    /// How wide it is, in device pixels.
     width: f64,
     /// How tall it is.
     height: f64,
     /// What fills it, as premultiplied sRGB, when a solid colour does.
     fill: Option<[f32; 4]>,
+    /// Whether the size is the geometry's own. A vector item records its geometry. A coverage
+    /// sprite records its tile, which is the geometry rounded out to whole pixels.
+    exact: bool,
+}
+
+/// The colour `paint` resolves to in `scene`, as premultiplied sRGB, when it is a solid colour.
+fn solid(scene: &zgui::scene::Scene, paint: zgui::scene::PaintRef) -> Option<[f32; 4]> {
+    match scene.paints.get(paint.id()?) {
+        Some(zgui::scene::Paint::Solid(color)) => Some(color.to_premultiplied_srgb()),
+        _ => None,
+    }
+}
+
+/// A shape of `[x, y, width, height]`.
+fn sized(bounds: [f32; 4], fill: Option<[f32; 4]>) -> Shape {
+    Shape {
+        width: f64::from(bounds[2]),
+        height: f64::from(bounds[3]),
+        fill,
+        exact: false,
+    }
 }
 
 /// The shapes of every frame of the run, in order.
 static SHAPES: Mutex<Vec<Vec<Shape>>> = Mutex::new(Vec::new());
 
-/// A renderer that records the vector content of every frame and draws nothing.
+/// A renderer that records the shapes of every frame and draws nothing.
+///
+/// A shape arrives as a vector item, a mark item, a coverage sprite or a quad, depending on the
+/// route the display list gives it, so all four are recorded.
 #[derive(Debug, Default)]
 struct Recorder {
     /// Where tiles go, so the upload path still runs.
@@ -74,28 +98,38 @@ impl zgui::render::Renderer for Recorder {
         scene: &zgui::scene::Scene,
         _damage: &zgui::bits::DamageSet,
     ) -> zgui::render::FrameOutcome {
-        use zgui::elements::kurbo::Shape as _;
-        let frame = scene
-            .primitives
+        let primitives = &scene.primitives;
+        let mut frame: Vec<Shape> = primitives
             .vectors
             .iter()
             .map(|item| {
-                let bounds = item.path.bounding_box();
+                let bounds = item.placed_bounds();
                 Shape {
                     width: bounds.width(),
                     height: bounds.height(),
-                    fill: item
-                        .fill
-                        .and_then(|reference| reference.id())
-                        .and_then(|id| match scene.paints.get(id) {
-                            Some(zgui::scene::Paint::Solid(color)) => {
-                                Some(color.to_premultiplied_srgb())
-                            }
-                            _ => None,
-                        }),
+                    fill: item.fill.and_then(|reference| solid(scene, reference)),
+                    exact: true,
                 }
             })
             .collect();
+        frame.extend(
+            primitives
+                .marks
+                .iter()
+                .map(|mark| sized(mark.bounds, solid(scene, mark.paint))),
+        );
+        frame.extend(
+            primitives
+                .mono_sprites
+                .iter()
+                .map(|sprite| sized(sprite.bounds, Some(sprite.color))),
+        );
+        frame.extend(
+            primitives
+                .quads
+                .iter()
+                .map(|quad| sized(quad.bounds, solid(scene, quad.fill))),
+        );
         SHAPES.lock().expect("the log is not poisoned").push(frame);
         zgui::render::FrameOutcome::Presented(zgui::render::FrameStats::default())
     }
@@ -156,12 +190,16 @@ fn an_icon_mounted_in_a_window_paints_a_shape_the_size_its_own_sheet_gave_it() {
     // frame drew has to be the constant's own extent at exactly that ratio — which is a claim about
     // the sheet, about the fit and about the outline at once, and which "larger than nothing" would
     // not be: a box that collapsed to a point still produces a primitive, of no extent.
+    //
+    // A coverage sprite is the geometry rounded out to whole pixels, which adds less than one pixel
+    // at each edge. That is less than the step to the next icon size.
     let written = zgui::elements::kurbo::Shape::bounding_box(&CHECK.path());
     let ratio = 20.0 / CHECK.view_box();
     let shape = settled[0];
+    let rounding = if shape.exact { 0.0 } else { 2.0 };
+    let fits = |drawn: f64, asked: f64| drawn > asked - 0.01 && drawn < asked + rounding + 0.01;
     assert!(
-        (shape.width - written.width() * ratio).abs() < 0.01
-            && (shape.height - written.height() * ratio).abs() < 0.01,
+        fits(shape.width, written.width() * ratio) && fits(shape.height, written.height() * ratio),
         "the icon was drawn {} by {}, not the {} by {} its own sheet and its own outline ask for",
         shape.width,
         shape.height,

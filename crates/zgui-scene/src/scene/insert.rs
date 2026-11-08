@@ -1,14 +1,16 @@
 //! Pushing primitives: the clip cull, the order assignment, and the log entry.
 
-use zgui_geom::{Device, DevicePx, Rect};
+use std::sync::Arc;
+
+use zgui_geom::{Device, DevicePx, Matrix4, Rect};
 use zgui_profile::{Counter, counter};
 
 use crate::group::{BackdropFilter, GroupBoundary};
 use crate::id::{ClipId, DrawOrder};
 use crate::ops::PaintOp;
 use crate::prim::{
-    ColorSprite, Decoration, ExternalQuad, MonoSprite, PrimitiveKind, Quad, ShadedQuad, Shadow,
-    SubpixelSprite,
+    ColorSprite, Decoration, ExternalQuad, MarkItem, MarkPayload, MonoSprite, PrimitiveKind, Quad,
+    ShadedQuad, Shadow, SubpixelSprite,
 };
 use crate::scene::Scene;
 use crate::spatial::SpatialId;
@@ -21,15 +23,20 @@ use crate::vector::VectorItem;
 /// it lands in. The coordinate-system name is recorded beside it when the checks are on, exactly
 /// as [`Scene::record`] does for the frame's own log.
 macro_rules! tee {
-    ($self:ident, $kind:ident, $lane:ident, $space:expr, $ink:expr, $prim:expr) => {
+    ($self:ident, $kind:ident, $lane:ident, $space:expr, $slot:expr, $ink:expr, $prim:expr) => {
         if $self.capture.is_some() {
             // All three read before the capture is borrowed, because any of them would borrow the
             // scene. The order comes from the capture's own tree rather than the frame's: it says
             // where this primitive stands among the chunk's, which is what stays true after the
-            // frame it was encoded in is gone.
+            // frame it was encoded in is gone. Like the frame's tree, it compares rectangles on
+            // the device.
             let space = $space;
             let checking = $self.checking;
-            let order = $self.capture_order.insert($ink);
+            let placed = $self.on_device($slot, $ink);
+            let order = match $self.run_capture_order() {
+                Some(order) => order,
+                None => $self.capture_order.insert(placed),
+            };
             if let Some(capture) = &mut $self.capture {
                 let at = capture.$lane.len() as u32;
                 capture.ops.push(PaintOp::new(PrimitiveKind::$kind, at));
@@ -91,6 +98,7 @@ impl Scene {
             Quad,
             quads,
             self.space_at(quad.transform),
+            quad.transform,
             quad.ink(),
             quad
         );
@@ -122,6 +130,7 @@ impl Scene {
             Shaded,
             shaded,
             self.space_at(shaded.transform),
+            shaded.transform,
             shaded.ink(),
             shaded
         );
@@ -149,6 +158,7 @@ impl Scene {
             Shadow,
             shadows,
             self.space_at(shadow.transform),
+            shadow.transform,
             shadow.ink(),
             shadow
         );
@@ -176,6 +186,7 @@ impl Scene {
             Decoration,
             decorations,
             self.space_at(decoration.transform),
+            decoration.transform,
             decoration.ink(),
             decoration
         );
@@ -209,6 +220,7 @@ impl Scene {
             MonoSprite,
             mono_sprites,
             self.space_at(sprite.transform),
+            sprite.transform,
             sprite.ink(),
             sprite
         );
@@ -251,6 +263,7 @@ impl Scene {
             SubpixelSprite,
             subpixel_sprites,
             self.space_at(sprite.transform),
+            sprite.transform,
             sprite.ink(),
             sprite
         );
@@ -287,6 +300,7 @@ impl Scene {
             ColorSprite,
             color_sprites,
             self.space_at(sprite.transform),
+            sprite.transform,
             sprite.ink(),
             sprite
         );
@@ -316,27 +330,59 @@ impl Scene {
         Some(order)
     }
 
-    /// Pushes vector content, returning the order it took or `None` if it was culled.
+    /// Pushes recognised shapes over a shared payload, returning the order the item took or
+    /// `None` if it was culled.
     ///
-    /// A vector item is logged like everything else and, unlike everything else, is not re-emitted
-    /// by [`Scene::replay`] — it is planned into a rasterisation pass instead. So pushing one puts
-    /// the log out of step with what was drawn, which is what
-    /// [`Scene::unreplayable`](Scene::unreplayable) counts.
+    /// The payload is shared, never copied: the capture and the frame each hold one more
+    /// reference to it, so the cost does not depend on how many prims it holds.
+    pub fn push_marks(
+        &mut self,
+        mut item: MarkItem,
+        payload: Arc<MarkPayload>,
+    ) -> Option<DrawOrder> {
+        tee!(
+            self,
+            Marks,
+            marks,
+            self.space_at(item.transform),
+            item.transform,
+            item.ink(),
+            item
+        );
+        if let Some(capture) = &mut self.capture {
+            capture.mark_payloads.push(Arc::clone(&payload));
+        }
+        let order = self.assign_order(item.ink(), item.clip_id(), item.transform)?;
+        item.order = order;
+        let space = self.space_at(item.transform);
+        self.record(PrimitiveKind::Marks, self.primitives.marks.len(), space);
+        let capture_intra = self
+            .capture
+            .as_ref()
+            .map(|open| open.marks.len() as u32 - 1);
+        self.primitives.marks.push(item);
+        self.primitives.mark_payloads.push(payload);
+        self.note_pushed(
+            PrimitiveKind::Marks,
+            self.primitives.marks.len() - 1,
+            capture_intra,
+        );
+        Some(order)
+    }
+
+    /// Pushes vector content, returning the order it took or `None` if it was culled.
     pub fn push_vector(&mut self, mut item: VectorItem) -> Option<DrawOrder> {
         tee!(
             self,
             Vector,
             vectors,
             item.transform,
+            item.transform.unwrap_or(SpatialId::VIEWPORT).index(),
             item.local_ink,
             item.clone()
         );
-        self.note_unreplayable();
-        // The order and the cull read the ink measured in the subtree's own space, exactly as they
-        // do for every other primitive: `item.ink` has the item's transform applied, and testing it
-        // against neighbours recorded untransformed decides overlap in two different spaces at
-        // once. A held placement showed the failure — the drawing ordered against nothing, painted
-        // first, and covered by the surface drawn over it.
+        // The cull reads the ink measured in the subtree's own space, exactly as it does for every
+        // other primitive, and the order places that same rectangle on the device.
         let order = self.assign_order(
             item.local_ink,
             item.clip,
@@ -356,6 +402,7 @@ impl Scene {
             External,
             externals,
             Some(external.transform),
+            external.transform.index(),
             external.ink(),
             external
         );
@@ -373,23 +420,22 @@ impl Scene {
 
     /// Pushes a backdrop filter, returning the order it took or `None` if it was culled.
     pub fn push_backdrop(&mut self, mut backdrop: BackdropFilter) -> Option<DrawOrder> {
+        let slot = backdrop.transform.unwrap_or(SpatialId::VIEWPORT).index();
         tee!(
             self,
             Backdrop,
             backdrops,
-            None,
+            backdrop.transform,
+            slot,
             backdrop.bounds,
             backdrop.clone()
         );
-        let order =
-            self.assign_order(backdrop.bounds, backdrop.clip, SpatialId::VIEWPORT.index())?;
+        let order = self.assign_order(backdrop.bounds, backdrop.clip, slot)?;
         backdrop.order = order;
-        // A backdrop names no coordinate system: what it reads is a rectangle of the target as it
-        // already stands, in the device's own coordinates.
         self.record(
             PrimitiveKind::Backdrop,
             self.primitives.backdrops.len(),
-            None,
+            backdrop.transform,
         );
         self.primitives.backdrops.push(backdrop);
         Some(order)
@@ -409,7 +455,11 @@ impl Scene {
     /// by its bounds, and it happens precisely when the next thing drawn does not overlap the group
     /// it follows.
     pub fn push_group(&mut self, mut boundary: GroupBoundary) -> DrawOrder {
-        let order = self.order.insert_above_all(boundary.bounds);
+        let placed = self.on_device(
+            boundary.transform.unwrap_or(SpatialId::VIEWPORT).index(),
+            boundary.bounds,
+        );
+        let order = self.order.insert_above_all(placed);
         let is_end = !boundary.is_start;
         boundary.order = order;
         let kind = if boundary.is_start {
@@ -437,18 +487,23 @@ impl Scene {
     /// too. Resolving only one of them onto the device would cull a field's letters against a
     /// rectangle the transform moved out from under them.
     ///
+    /// The order is decided on the device: the clipped rectangle is put where the coordinate
+    /// system draws it, so content under two different transforms is compared where it lands.
+    ///
     /// `space` is the slot of the coordinate system the primitive draws under, and the cull reads
-    /// only the links of the chain that were measured in it. A link from anywhere else states its
-    /// rectangle in another system's coordinates — the window's clip against a panel the panel's
-    /// own transform moved — and is left to the shader, which resolves every link against the
-    /// frame's matrices. See [`ClipTable::bounds_in`](crate::ClipTable::bounds_in).
+    /// only the links of the chain that were measured in it, or in a scroll container that `space`
+    /// is the content system of. A link from anywhere else states its rectangle in another
+    /// system's coordinates — the window's clip against a panel the panel's own transform moved —
+    /// and is left to the shader, which resolves every link against the frame's matrices. See
+    /// [`ClipTable::bounds_in_carried`](crate::ClipTable::bounds_in_carried).
     fn assign_order(
         &mut self,
         ink: Rect<DevicePx, Device>,
         clip: ClipId,
         space: u32,
     ) -> Option<DrawOrder> {
-        let admitted = self.clips.bounds_in(clip, space);
+        let from_run = self.run_order(ink);
+        let admitted = self.admitted(clip, space);
         let Some(clipped) = ink.intersection(admitted) else {
             counter::bump(Counter::PrimitivesCulled);
             self.note_unreplayable();
@@ -465,10 +520,92 @@ impl Scene {
             // A replay carries the order this primitive already had among its chunk's, moved to
             // wherever the chunk as a whole now sits. Asking the tree again per primitive
             // rediscovers an order that did not change.
-            None => match self.replay_order.take() {
+            None => match self.replay_order.take().or(from_run) {
                 Some(order) => order,
-                None => self.order.insert(clipped),
+                None => {
+                    let placed = self.on_device(space, clipped);
+                    self.order.insert(placed)
+                }
             },
+        })
+    }
+
+    /// `rect`, measured in the coordinate system occupying `slot`, where the device shows it.
+    ///
+    /// The rectangle itself for the viewport and for a slot nothing occupies.
+    pub(crate) fn on_device(
+        &mut self,
+        slot: u32,
+        rect: Rect<DevicePx, Device>,
+    ) -> Rect<DevicePx, Device> {
+        let matrix = self.device_matrix(slot);
+        crate::scene::device::place(matrix.as_ref(), rect)
+    }
+
+    /// The matrix the coordinate system occupying `slot` maps onto the device.
+    ///
+    /// `None` for the viewport and for a slot nothing occupies. Kept per slot until the tree is
+    /// next written.
+    pub(crate) fn device_matrix(&mut self, slot: u32) -> Option<Matrix4> {
+        self.device.at(&self.spatial, slot)
+    }
+
+    /// The rectangle `clip` admits of the coordinate system at `space`, as
+    /// [`ClipTable::bounds_in`](crate::ClipTable::bounds_in) gives it.
+    ///
+    /// The last answer is kept, keyed by the chain, the slot and the clip table's version. The
+    /// version advances on every rewrite of a stored link, so a link rewritten in place is read
+    /// again.
+    pub(crate) fn admitted(&mut self, clip: ClipId, space: u32) -> Rect<DevicePx, Device> {
+        let version = self.clips.version();
+        let stamp = self.spatial.writes();
+        let admitted = match self.clip_cull {
+            Some(kept)
+                if kept.clip == clip
+                    && kept.space == space
+                    && kept.version == version
+                    && kept.stamp == stamp =>
+            {
+                kept.admitted
+            }
+            _ => {
+                let admitted = self.admitted_now(clip, space);
+                self.clip_cull = Some(crate::scene::ClipCull {
+                    clip,
+                    space,
+                    version,
+                    stamp,
+                    admitted,
+                });
+                admitted
+            }
+        };
+        // Equal, or equal in bits for a NaN edge. A link rewritten from 0.0 to -0.0 keeps the
+        // version and changes only the sign of a zero.
+        debug_assert!(
+            {
+                let fresh = self.admitted_now(clip, space);
+                admitted == fresh
+                    || crate::scene::device::rect_bits(admitted)
+                        == crate::scene::device::rect_bits(fresh)
+            },
+            "the kept cull of clip {clip:?} in slot {space} is stale",
+        );
+        admitted
+    }
+
+    /// The rectangle `clip` admits of the coordinate system at `space`, read from the tables.
+    ///
+    /// A link measured in a system that `space` is a content system of is brought into `space`
+    /// too: the scroll container's port clips its content, and the two systems are only the
+    /// container's scroll offset apart. See [`SpatialTree::across_content`].
+    ///
+    /// [`SpatialTree::across_content`]: crate::SpatialTree::across_content
+    fn admitted_now(&self, clip: ClipId, space: u32) -> Rect<DevicePx, Device> {
+        let spatial = &self.spatial;
+        let inner = spatial.at(space);
+        self.clips.bounds_in_carried(clip, space, &|measured| {
+            spatial.across_content(inner?, measured)
         })
     }
 

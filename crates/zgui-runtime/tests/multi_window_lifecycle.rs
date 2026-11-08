@@ -30,7 +30,7 @@ where
     V: FnMut(&mut BuildCx<'_>) -> Box<dyn Anchor> + 'static,
 {
     let mut options = zgui_runtime::WindowContent::default();
-    options.window_stylesheet = Some(SHEET.to_owned());
+    options.window_stylesheets.push(SHEET.to_owned());
     harness.app().window_commands().open(WindowSpec::new(
         SurfaceAttributes::new("second"),
         options,

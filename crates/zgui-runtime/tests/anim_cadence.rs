@@ -275,6 +275,7 @@ fn an_animation_that_finishes_leaves_no_deadline_and_draws_nothing_for_ten_secon
         harness.advance(interval(millihertz));
         harness.pump();
     }
+    support::cross_maintenance(&mut harness);
     harness.reset_counts();
 
     let frames = harness.run_for(Duration::from_secs(10), Duration::from_millis(16));
@@ -302,6 +303,7 @@ fn a_window_hidden_while_animating_parks_and_starts_a_fresh_phase_when_it_is_sho
 
     harness.deliver_to_first(SurfaceEvent::Occluded(true));
     harness.settle(8);
+    support::cross_maintenance(&mut harness);
     assert_eq!(
         harness.parked_deadline(),
         None,

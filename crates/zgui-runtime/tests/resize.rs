@@ -220,6 +220,7 @@ fn configures_arriving_after_a_resize_frame_wait_for_the_next_one_and_are_still_
         wide(*sizes.last().expect("the burst is not empty")),
         "the deferred configures were never drawn: the deadline that owes them was not installed"
     );
+    support::cross_maintenance(&mut harness);
     assert!(
         harness.parked_deadline().is_none(),
         "the window is still asking to be woken for a resize it has already drawn"
@@ -322,6 +323,7 @@ fn a_window_that_has_stopped_being_resized_runs_no_frames_at_all() {
     let surface = only_surface(&harness);
     harness.deliver(surface, SurfaceEvent::Resized(wide(1024.0)));
     harness.settle(8);
+    support::cross_maintenance(&mut harness);
     harness.reset_counts();
 
     let frames = harness.run_for(Duration::from_secs(2), Duration::from_millis(8));
@@ -415,5 +417,31 @@ fn a_drag_edge_with_nothing_owed_asks_for_nothing() {
     harness.deliver(surface, SurfaceEvent::ResizingChanged(false));
     assert_eq!(harness.redraws_requested(), 0);
     assert_eq!(harness.settle(8), 0, "a drag edge alone bought a frame");
+    harness.shut_down();
+}
+
+#[test]
+fn a_box_sized_in_viewport_units_follows_every_resize() {
+    // A viewport unit resolves at computed-value time, so only a recascade of the element that
+    // reads it moves the box. Two resizes in a row prove the reader stays filed after the first.
+    let mut harness = support::app(
+        "root { display: block; width: 50vw; height: 25vh }",
+        |cx: &mut BuildCx<'_>| {
+            Box::new(zgui_elements::column().class("root").into_view().build(cx))
+        },
+    );
+    let surface = only_surface(&harness);
+    harness.settle(8);
+
+    for width in [1000.0, 640.0] {
+        harness.advance(Duration::from_millis(100));
+        harness.deliver(surface, SurfaceEvent::Resized(wide(width)));
+        harness.settle(8);
+        assert_eq!(
+            laid_out(&harness),
+            Size::new(DevicePx(width / 2.0), DevicePx(150.0)),
+            "the root box kept the size its viewport units resolved to before the resize"
+        );
+    }
     harness.shut_down();
 }

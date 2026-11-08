@@ -11,9 +11,10 @@ use zgui_scene::Scene;
 
 use crate::frame::build::PlanBuilder;
 use crate::frame::damage;
-use crate::frame::pass::Recorder;
+use crate::frame::pass::{Recorded, Recorder};
 use crate::frame::plan::plan_segments;
 use crate::frame::present;
+use crate::gpu::timing::{GpuTimer, PassQueries, TimedWork};
 use crate::pipeline::kind::PipelineKind;
 use crate::renderer::WgpuRenderer;
 use crate::target::acquire::{Acquisition, SurfaceAction};
@@ -25,11 +26,12 @@ impl Renderer for WgpuRenderer {
     }
 
     fn configure(&mut self, target: RenderTarget) {
-        // Every trigger for this — a reconfiguration, a resize, a change of scale factor — changes
-        // what the surface is, so the frame after it cannot rely on what the composed target holds
-        // relative to it. A change of scale alone moves no allocation and would otherwise pass
-        // through here unnoticed.
-        self.full_damage_next |= self.target != target;
+        // A change of scale or of opacity changes what every composed pixel means, and moves no
+        // allocation that would otherwise say so. A change of size alone keeps the composed target
+        // whenever it still fits, and the pixels in it are the last frame's: the caller damages
+        // what the new extent exposes, and a target that had to be allocated again says so below.
+        self.full_damage_next |=
+            self.target.scale != target.scale || self.target.opaque != target.opaque;
         self.target = target;
         self.resize(target.size);
     }
@@ -59,10 +61,21 @@ impl Renderer for WgpuRenderer {
         Some(self)
     }
 
+    /// The shared form of the same door, for a caller that only reads, such as a memory report.
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
+
     /// Yes: this renderer composes every frame into a target that outlives it, so the pixels a
     /// scroll moves are already here.
     fn shifts_composed_pixels(&self) -> bool {
         true
+    }
+
+    /// Yes, unless the configure moved the scale or the opacity or outgrew the target, each of
+    /// which leaves the next frame owing every pixel.
+    fn composed_survives_configure(&self) -> bool {
+        !self.full_damage_next
     }
 
     fn shift_composed(&mut self, shift: zgui_render::ScrollShift) {
@@ -76,7 +89,7 @@ impl Renderer for WgpuRenderer {
     }
 
     fn draw(&mut self, scene: &Scene, damage: &DamageSet) -> FrameOutcome {
-        let _frame = Phase::Render.span().entered();
+        let _frame = Phase::Render.enter();
         zgui_profile::latency::mark("draw.in");
 
         // A surface whose configuration was thrown away is configured again here rather than at the
@@ -142,8 +155,9 @@ impl Renderer for WgpuRenderer {
         }
 
         // Resolved here, before anything is recorded, because the copy that ends the frame is
-        // limited to these rows and the copy is recorded below. Taken from what will be drawn
-        // rather than from what was asked for: the widening above happens between the two.
+        // limited to these rectangles and that copy is recorded below. Taken from what the frame
+        // will draw rather than from what it was asked to draw: the widening above happens between
+        // the two, and a display given only what was asked for misses the rest.
         let rects = damage::rects(damage, self.composed.used());
         let redrawn: u64 = rects.iter().map(|rect| damage::area(*rect)).sum();
         damage::rows_of(&rects, &mut self.composed_rows);
@@ -157,23 +171,50 @@ impl Renderer for WgpuRenderer {
 
         zgui_profile::latency::mark("r.tables");
         self.buffers.prepare_tables(scene);
-        zgui_profile::latency::mark("r.prepared");
         self.buffers.begin_frame();
+        if let Some(timer) = &mut self.timer {
+            timer.begin(&self.gpu);
+        }
         // Staged before the plan, because the plan stages the target blocks into the same frame
         // and a slot allocator hands out offsets in the order it is asked.
         self.buffers.stage_effect_params(scene);
 
-        // Everything the rasteriser does happens before this frame's encoder exists, because an
+        // The rasteriser's first round happens before this frame's encoder exists, because an
         // implementation submits command buffers of its own. Ordering stays exact anyway: nothing
-        // it submits writes the target this frame composes into.
+        // it submits writes the target this frame composes into. A later round is rasterised
+        // between two submissions of the frame, after the composites of the round before it.
         zgui_profile::latency::mark("r.vectors");
-        let vectors = self.rasterise_vectors(scene, damage.is_full());
+        // A pass outside every group rasterises only what the scene's damage reaches. A frame
+        // widened above draws its passes whole.
+        let uncut;
+        let passes = if damage.is_full() && scene.pass_plan().is_cut() {
+            let mut plan = zgui_scene::ScenePassPlan::default();
+            scene.plan_uncut_passes(&mut plan);
+            uncut = plan;
+            &uncut
+        } else {
+            scene.pass_plan()
+        };
+        let vectors = self.rasterise_vectors(scene, passes, damage.is_full());
 
         // Everything is planned before a pass is opened, because a live pass holds the encoder
         // borrowed and the points a frame has to be cut at are exactly the operations that need
         // it. The plan is also where the frame's blocks are staged and its isolated targets are
         // lent, so that recording is nothing but issuing what was decided.
         zgui_profile::latency::mark("r.plan");
+        // A union item paints through its bin whatever the damage, and a bin outside every group
+        // holds only what the scene's damage reaches. A frame widened above plans its own bins.
+        let widened;
+        let marks = if damage.is_full() && !scene.mark_plan().full_damage {
+            let mut plan = zgui_scene::MarkPlan::default();
+            scene.plan_marks(damage, &mut plan);
+            widened = plan;
+            &widened
+        } else {
+            scene.mark_plan()
+        };
+        self.marks_scratch
+            .ensure(&self.gpu, marks.extent, marks.pages);
         // A backdrop filter reads a copy of what lies beneath it, and where that copy is the kept
         // one it has to exist before the plan can name it. Allocated on the first frame a scene
         // holds a backdrop and kept for as long as one does.
@@ -192,7 +233,7 @@ impl Renderer for WgpuRenderer {
                 &mut self.buffers.globals,
                 &mut self.buffers.blocks,
                 &mut self.buffers.vectors,
-                &mut self.buffers.orders,
+                &mut self.buffers.mark_draws,
                 self.subpixel_order,
                 scene.frame_clock(),
                 &self.buffers.effect_offsets,
@@ -204,18 +245,14 @@ impl Renderer for WgpuRenderer {
                 builder,
                 scene,
                 damage,
+                marks,
                 self.composed.used(),
                 &externals,
                 vectors.as_ref(),
             )
         };
         zgui_profile::latency::mark("r.encoder");
-        let mut encoder =
-            self.gpu
-                .device()
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("zgui.frame"),
-                });
+        let mut encoder = self.frame_encoder();
         // Before anything this frame draws, and after nothing: the passes below clear and redraw
         // each damage rectangle, and the pixels this moves are the ones outside them.
         if let Some(shift) = self.pending_shift.take() {
@@ -230,9 +267,6 @@ impl Renderer for WgpuRenderer {
         }
         zgui_profile::latency::mark("r.buffers");
         let uploaded = self.buffers.upload_frame(&self.gpu, &mut encoder, scene);
-        // Split from the flush that follows it, because the two wait for different things: writing
-        // the frame's own bytes, and giving the belt back to the device.
-        zgui_profile::latency::mark("r.uploaded");
         let upload_allocations = self.buffers.upload_allocations();
         self.buffers.finish_uploads();
         if upload_allocations == 0 {
@@ -243,24 +277,21 @@ impl Renderer for WgpuRenderer {
                 format!("{upload_allocations} upload chunks allocated"),
             );
         }
-        // One borrow for the whole recording, released before anything else on this device asks for
-        // the pipelines it shares with the other windows.
-        let recorded = {
-            let pipelines = &mut *self.pipelines.borrow_mut();
-            Recorder {
-                gpu: &self.gpu,
-                pipelines,
-                buffers: &self.buffers,
-                atlas: &self.atlas,
-                pool: &self.groups,
-                composed: &self.composed,
-                kept: self.kept.as_ref(),
-                sampler: &self.sampler,
-                externals: &self.externals,
-                vectors: self.vectors.as_deref(),
+        let mut recorded = Recorded::default();
+        // A frame of several damage rectangles can prepare a round more than once, so a failed
+        // round is counted once per frame.
+        let mut dropped = false;
+        for (round, segments) in plan.runs() {
+            if let (Some(round), Some(vectors)) = (round, vectors.as_ref()) {
+                let finished = core::mem::replace(&mut encoder, self.frame_encoder());
+                self.gpu.queue().submit([finished.finish()]);
+                dropped |= !self.rasterise_round(scene, vectors, round);
             }
-            .record(&mut encoder, &plan)
-        };
+            recorded += self.record(&mut encoder, &plan, segments, marks.extent);
+        }
+        if dropped {
+            counter::bump(Counter::VectorFramesDropped);
+        }
         self.groups.release_all();
         if plan.capture_refused > 0 {
             // The damage was grown small for a kept copy that could not be used, so this frame
@@ -300,15 +331,10 @@ impl Renderer for WgpuRenderer {
         // Measured around the call and nowhere else. It is the frame's slack seen from the inside:
         // how much earlier than it needed to be the frame was started.
         self.acquire_block = asked.elapsed();
-        zgui_profile::latency::note("acq.out", presented.acquisition.name());
-        // The one place in the frame where the device is known to have caught up: what acquisition
-        // just handed back is a buffer nothing in flight still reads. `Gpu::reclaim` says why that
-        // matters — the same call made anywhere else on this path waits for the card on GL.
+        // What the compositor handed back is a buffer nothing in flight still reads, so this is
+        // the one point in the frame where asking the device what it has finished with is free.
         self.gpu.reclaim();
-        // Split from the acquisition before it and the repair after it, because the three wait for
-        // different things: a buffer to draw into, the graphics device to take back what it has
-        // finished with, and the display's own device to fill in what this frame will not.
-        zgui_profile::latency::mark("r.reclaimed");
+        zgui_profile::latency::note("acq.out", presented.acquisition.name());
         if crate::gpu::surface::human_visible_wait(self.acquire_block) {
             tracing::warn!(
                 stage = "acquire",
@@ -322,43 +348,22 @@ impl Renderer for WgpuRenderer {
             );
         }
         let mut draw_calls = recorded.draw_calls;
-        // Read before `recorded` is shadowed by the command buffer below.
-        let clears = recorded.clears;
-        // What the copy to the surface covers, which is not what this frame drew: a supplied
-        // texture is owed every rectangle drawn while it was not the one being written. On an
-        // arrangement where those pixels cross a bus it is the largest thing a frame spends, and
-        // this is the only place it can be counted.
-        let mut presented_px = 0;
-        // How many rectangles that area is spread over, which is what says whether the stale set is
-        // merging because it ran out of room or because they touched.
-        let mut presented_rects = 0;
-        // What a peer filled between the caller's own textures instead, which is what the copy
-        // above did *not* have to carry. Zero everywhere nothing can copy on the far side.
-        let mut repaired_px = 0;
         if let Some(view) = &presented.view {
             // What the copy has to cover. A supplied set is rotated through and its textures
             // persist, so a frame copies the rectangles it drew plus the ones drawn while this
-            // texture was not the one being written — which is worth knowing when every one of
-            // those pixels crosses a bus. Everything else is copied whole: an acquired surface
-            // texture is a new resource marked wholly uninitialised on every acquisition, so a
-            // partial copy onto one comes out black everywhere it did not write.
-            let owed = match &mut self.presentation {
+            // texture was not the one being written. Where those pixels cross a link, that copy is
+            // the largest thing a frame spends. Everything else is copied whole: an acquired
+            // surface texture is a new resource marked wholly uninitialised on every acquisition,
+            // so a partial copy onto one comes out black everywhere it did not write.
+            let scissors = match &mut self.presentation {
                 Presentation::Supplied(supplied) => {
                     let slot = supplied.selected();
                     supplied.owed(slot, &self.composed_rects)
                 }
                 Presentation::Surface(_) | Presentation::Offscreen(_) => {
-                    crate::target::swapchain::Owed {
-                        from_composed: vec![self.composed.used()],
-                        repaired: 0,
-                    }
+                    vec![self.composed.used()]
                 }
             };
-            zgui_profile::latency::mark("r.repaired");
-            let scissors = owed.from_composed;
-            repaired_px = owed.repaired;
-            presented_px = scissors.iter().map(|rect| damage::area(*rect)).sum();
-            presented_rects = scissors.len();
             if ablated() {
                 // The copy is the largest single term in a frame wherever these textures are on
                 // the far side of a link, and what it costs can only be read off by taking it
@@ -370,31 +375,18 @@ impl Renderer for WgpuRenderer {
                 draw_calls += self.blit(&mut encoder, view, formats.blit_undoes_srgb(), &scissors);
             }
         }
-        // Marked either side, because the two halves are different work and only one of them is
-        // this crate's. `finish` walks the recorded commands and validates them into a command
-        // buffer; `submit` is where a backend that defers its calls actually makes them. On the
-        // 32-bit target the split is about one millisecond against five, so the draws themselves
-        // are the cost and the validation is not.
-        zgui_profile::latency::mark("r.finish");
-        let recorded = encoder.finish();
-        zgui_profile::latency::mark("r.finished");
-        self.gpu.queue().submit([recorded]);
+        if let Some(timer) = &mut self.timer {
+            timer.finish(&mut encoder);
+        }
+        self.gpu.queue().submit([encoder.finish()]);
+        if let Some(timer) = &mut self.timer {
+            timer.submitted();
+        }
         // Ties the frame's retired arena ranges to the submission just made, so they come back
         // only once nothing in flight can read them.
         self.buffers.chunks.submitted(&self.gpu);
         self.buffers.recall_uploads();
-        // What the submission cost is read against: on a driver that validates its state per draw,
-        // a frame's submit is very nearly a constant times this number.
-        zgui_profile::latency::note_with("sub.out", || {
-            format!(
-                "draws={draw_calls} clears={} rects={} drawn_px={redrawn} \
-                 presented_px={presented_px} presented_rects={presented_rects} \
-                 repaired_px={repaired_px} uploaded={}",
-                clears,
-                self.composed_rects.len(),
-                zgui_profile::counter::get(zgui_profile::Counter::BytesUploaded)
-            )
-        });
+        zgui_profile::latency::mark("sub.out");
 
         let response = presented.acquisition.response();
         // Composition succeeded whichever answer acquisition gave, but only a presenting answer
@@ -410,6 +402,9 @@ impl Renderer for WgpuRenderer {
             texture.present();
         }
         zgui_profile::latency::mark("pres.out");
+        // After the present, so the frame reaches the screen first. It does nothing unless this
+        // frame built a pipeline, such as the first one for a group target format.
+        self.pipelines.borrow().persist();
 
         counter::add(Counter::DamagePx, redrawn);
         let stats = FrameStats {
@@ -499,12 +494,15 @@ impl Renderer for WgpuRenderer {
             .shift_scratch
             .take()
             .map_or(0, |held| crate::frame::shift::ShiftScratch::bytes(&held));
-        self.groups.release_unused() + scratch
+        // A kept bind group holds its view, so a target is freed only once those are dropped too.
+        self.buffers.forget_view_binds();
+        self.groups.release_unused() + scratch + self.marks_scratch.release()
     }
 
     fn release_idle_resources(&mut self) -> u64 {
         let mut freed = self.release_cached_targets();
         freed += self.buffers.release_idle(&self.gpu);
+        freed += self.atlas.release_idle();
         if let Some(vectors) = self.vectors.as_mut() {
             freed += vectors.release_idle_resources();
         }
@@ -523,7 +521,7 @@ impl Renderer for WgpuRenderer {
         let own = MemoryReport {
             fixed: 0,
             targets: self.composed.bytes() + self.groups.bytes(),
-            scratch: 0,
+            scratch: self.marks_scratch.bytes(),
             atlases: self.atlas.bytes(),
             buffers: self.buffers.bytes() + self.atlas.staging_bytes(),
         };
@@ -545,17 +543,18 @@ fn ablated() -> bool {
 }
 
 impl WgpuRenderer {
-    /// Runs this frame's vector work, before the frame's own encoder exists.
+    /// Resources this frame's vector work and rasterises its first round, before the frame's own
+    /// encoder exists.
     ///
     /// A frame with no surviving vector item runs no rasterisation at all — not an empty pass, which
-    /// is very far from free — so the whole of this is behind one question asked of the display
-    /// list's own plan.
+    /// is very far from free — so the whole of this is behind one question asked of `planned`: the
+    /// display list's own plan, or its uncut version on a frame widened past the damage.
     fn rasterise_vectors(
         &mut self,
         scene: &Scene,
+        planned: &zgui_scene::ScenePassPlan,
         full_repaint: bool,
     ) -> Option<zgui_render::VectorPlan> {
-        let planned = scene.pass_plan();
         if planned.is_empty() {
             return None;
         }
@@ -575,6 +574,7 @@ impl WgpuRenderer {
             && let Some(factory) = self.vector_factory
         {
             let raster = factory(&self.gpu, self.target.size);
+            counter::bump(Counter::VectorBackendBuilt);
             self.vector_backend = Some(raster.backend());
             self.vectors = Some(raster);
         }
@@ -584,18 +584,6 @@ impl WgpuRenderer {
         if plan.is_empty() {
             return None;
         }
-        // Mandatory, and before anything reads: a rasterisation that fails while reporting success
-        // would otherwise leave the previous frame's content in a reused scratch, which composites
-        // as wrong pixels rather than as missing ones and has nothing to notice it by.
-        raster.clear_targets(&plan);
-        let placements = zgui_scene::Placements::of(&scene.spatial);
-        let mut frame = zgui_render::VectorFrame::new(
-            &plan,
-            &scene.primitives.vectors,
-            &scene.clips,
-            &scene.paints,
-            &placements,
-        );
         debug_assert_eq!(
             plan.passes.len(),
             planned.passes.len(),
@@ -603,16 +591,13 @@ impl WgpuRenderer {
              named by its index, so a plan that dropped one would draw every later composite from \
              the wrong pass"
         );
-        // The frame borrows the plan, and the plan is what the shortfall arm below shortens, so
-        // the result is taken out of the borrow before it is read.
-        let outcome = raster.prepare(&mut frame);
-        match outcome {
+        match self.prepare_round(scene, &plan, 0) {
             Ok(()) => Some(plan),
-            // More passes than the scratch can keep apart. The passes that were finished are each
-            // in a scratch of their own and composite correctly; only the rest have nowhere to be
-            // read from, and a plan naming fewer passes than were planned leaves exactly those
-            // composites counted as undrawn. Losing the tail is a fraction of the frame's vector
-            // content, where returning nothing here loses all of it.
+            // A rasteriser that could not place every pass. Rounds give the built-in ones room for
+            // any frame, so this is another implementation's limit. The passes that were finished
+            // composite correctly; a plan naming fewer passes than were planned leaves exactly the
+            // rest counted as undrawn. Losing the tail is a fraction of the frame's vector content,
+            // where returning nothing here loses all of it.
             Err(zgui_render::VectorError::OutOfCapacity { detail, prepared }) => {
                 counter::bump(Counter::VectorFramesDropped);
                 assert!(
@@ -643,10 +628,110 @@ impl WgpuRenderer {
         }
     }
 
-    /// Copies the rectangles `scissors` names of the composed target onto whatever is presented to.
+    /// Clears and rasterises one round of `plan`.
+    fn prepare_round(
+        &mut self,
+        scene: &Scene,
+        plan: &zgui_render::VectorPlan,
+        round: usize,
+    ) -> Result<(), zgui_render::VectorError> {
+        let Some(raster) = self.vectors.as_deref_mut() else {
+            return Ok(());
+        };
+        let span = self
+            .timer
+            .as_mut()
+            .and_then(|timer| timer.open_vectors(&self.gpu));
+        // Mandatory, and before anything reads: a rasterisation that fails while reporting success
+        // would otherwise leave the previous round's content in a reused scratch, which composites
+        // as wrong pixels rather than as missing ones and has nothing to notice it by.
+        raster.clear_targets(plan, round);
+        let placements = scene.placements();
+        let mut frame = zgui_render::VectorFrame::new(
+            plan,
+            &scene.primitives.vectors,
+            &scene.clips,
+            &scene.paints,
+            &placements,
+        )
+        .in_round(round);
+        let prepared = raster.prepare(&mut frame);
+        if let Some(span) = &span {
+            GpuTimer::close_vectors(&self.gpu, span);
+        }
+        prepared
+    }
+
+    /// Rasterises a round after the first, between two submissions of the frame.
     ///
-    /// The attachment is **loaded** rather than cleared. A clear covers the whole of it whatever
-    /// the scissor says, so clearing here would blank every row this copy is not about to write.
+    /// The composites of the round are already planned, so a round that fails cannot be taken out
+    /// of the plan. Its layers were cleared, so its composites draw nothing. Returns whether the
+    /// round was rasterised, so that the caller can count the frame.
+    #[must_use]
+    fn rasterise_round(
+        &mut self,
+        scene: &Scene,
+        plan: &zgui_render::VectorPlan,
+        round: usize,
+    ) -> bool {
+        let Err(failure) = self.prepare_round(scene, plan, round) else {
+            return true;
+        };
+        assert!(
+            !(self.vector_shortfall_is_fatal
+                && matches!(failure, zgui_render::VectorError::OutOfCapacity { .. })),
+            "the vector rasteriser ran out of capacity in round {round}: {failure}"
+        );
+        tracing::warn!(
+            %failure,
+            round,
+            "the vector rasteriser could not prepare a round, so its passes draw nothing"
+        );
+        false
+    }
+
+    /// Records `segments` of `plan` into `encoder`.
+    ///
+    /// One borrow of the pipelines per run, released before anything else on this device asks for
+    /// the pipelines it shares with the other windows.
+    fn record(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &crate::frame::build::FramePlan,
+        segments: &[crate::frame::segment::Segment],
+        mark_extent: zgui_geom::Size<i32, zgui_geom::Device>,
+    ) -> Recorded {
+        let pipelines = &mut *self.pipelines.borrow_mut();
+        Recorder {
+            gpu: &self.gpu,
+            pipelines,
+            buffers: &self.buffers,
+            atlas: &self.atlas,
+            pool: &self.groups,
+            composed: &self.composed,
+            kept: self.kept.as_ref(),
+            sampler: &self.sampler,
+            externals: &self.externals,
+            vectors: self.vectors.as_deref(),
+            marks: &self.marks_scratch,
+            mark_extent,
+            timer: self.timer.as_mut(),
+        }
+        .record(encoder, plan, segments)
+    }
+
+    /// A command encoder for this frame's own work.
+    fn frame_encoder(&self) -> wgpu::CommandEncoder {
+        self.gpu
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("zgui.frame"),
+            })
+    }
+
+    /// Copies the composed target onto whatever is being presented to, within `scissors`.
+    ///
+    /// Answers how many draws that took: one for every rectangle that covers any pixel.
     fn blit(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -664,6 +749,10 @@ impl WgpuRenderer {
         let Some(pipeline) = pipelines.get(&self.gpu, kind, format) else {
             return 0;
         };
+        let queries = self
+            .timer
+            .as_mut()
+            .and_then(|timer| timer.pass(TimedWork::Blit));
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("zgui.present"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -671,12 +760,14 @@ impl WgpuRenderer {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
+                    // The copy covers the rectangles below and no other pixel, so what the texture
+                    // already holds is kept.
                     load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: None,
+            timestamp_writes: queries.as_ref().map(PassQueries::render),
             occlusion_query_set: None,
             multiview_mask: None,
         });

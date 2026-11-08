@@ -1,10 +1,6 @@
 //! An application: a window, what is in it, and what draws it.
 
 pub mod fonts;
-// What a display is drawn through on a console. Beside `graphics` because it answers the same
-// question for the other backend, and compiled only where that backend is.
-#[cfg(all(feature = "drm", target_os = "linux"))]
-mod console;
 mod graphics;
 
 use zgui_platform::{AppHandler, Decorations, PlatformError};
@@ -14,14 +10,16 @@ use zgui_view::{Anchor, BuildCx, IntoView, View};
 pub use crate::app::fonts::Fonts;
 
 /// Shaping text outside the paragraph pipeline: the shaper [`Fonts::shaper`] answers with, what one
-/// line is asked for in, and what the resolved face measures.
+/// line is asked for in, the OpenType settings on top of that, and what the resolved face measures.
 ///
 /// An element that positions its own glyphs — text in cells, one line at a time — shapes through
 /// these and draws the result with
 /// [`ScenePainter::glyphs`](zgui_custom::ScenePainter::glyphs). The shaped runs are owned
 /// ([`ShapedRunOwned`](zgui_text::ShapedRunOwned)), so they are held across frames rather than
 /// rebuilt for each one.
-pub use zgui_text_parley::{LineRequest, ResolvedLineMetrics, Shaper};
+pub use zgui_text_parley::{
+    FontFeature, FontVariation, LineRequest, LineSettings, ResolvedLineMetrics, Shaper, tag,
+};
 
 /// A platform backend's entry point: it takes the application and drives it until it stops.
 ///
@@ -143,6 +141,8 @@ pub struct App {
     fonts: std::cell::OnceCell<Fonts>,
     /// What draws its windows, when it is not this machine's own graphics device.
     renderer: Option<zgui_runtime::RendererFactory>,
+    /// How precisely the default renderer holds a plain group, when the application set it.
+    group_precision: Option<crate::GroupPrecision>,
     /// The application's own context setup, held until the faces are known.
     ///
     /// Held here rather than passed straight down because the faces are provided in the same scope
@@ -171,6 +171,7 @@ impl App {
             inner: zgui_runtime::App::new(),
             fonts: std::cell::OnceCell::new(),
             renderer: None,
+            group_precision: None,
             context: None,
         }
     }
@@ -231,9 +232,31 @@ impl App {
         self
     }
 
+    /// Where the desktop's window buttons sit over a window with [`Decorations::NoTitleBar`].
+    ///
+    /// Only macOS draws its buttons over the content. Elsewhere this does nothing.
+    pub fn with_title_buttons(mut self, buttons: zgui_platform::TitleButtons) -> Self {
+        self.inner.attributes_mut().title_buttons = Some(buttons);
+        self
+    }
+
+    /// Gives the application a menu outside its windows.
+    ///
+    /// `build` runs after [`App::with_context`], in the same scope, and runs again whenever a
+    /// signal it read changes. Only a desktop with an application menu shows it. What the user
+    /// picks reaches [`on_menu`](crate::desktop::on_menu).
+    pub fn with_menu(mut self, build: impl Fn() -> zgui_platform::AppMenu + 'static) -> Self {
+        self.inner = self.inner.with_menu(build);
+        self
+    }
+
     /// Whether the window may be partly transparent.
     ///
     /// What a window that draws its own rounded corners needs, so the desktop shows through them.
+    /// A transparent window is composed into a
+    /// [`RenderTarget::translucent`](zgui_render::RenderTarget::translucent) target: each pixel is
+    /// a premultiplied colour, a pixel nothing paints has zero alpha, and text is drawn with
+    /// ordinary coverage in place of per-channel coverage.
     pub fn with_transparent(mut self, transparent: bool) -> Self {
         self.inner.attributes_mut().transparent = transparent;
         self
@@ -322,10 +345,48 @@ impl App {
         self
     }
 
-    /// Installs the application's own style sheet.
+    /// Sets how many workers the style cascade may use.
     ///
-    /// It is added at the author origin, over this framework's own sheet, which is what gives
-    /// every element name its layout before a single application rule is written.
+    /// The default is the machine's parallelism. `0` and `1` run the cascade on the frame thread,
+    /// with no pool. A host that shares the machine with other work, for example a game engine,
+    /// sets a small number here. The `ZGUI_STYLE_THREADS` environment variable overrides this
+    /// value. See [`zgui_runtime::App::with_style_threads`].
+    ///
+    /// ```
+    /// let app = zgui::app().with_style_threads(1).with_layout_threads(1);
+    /// assert_eq!(app.style_threads(), Some(1));
+    /// assert_eq!(app.layout_threads(), Some(1));
+    /// ```
+    pub fn with_style_threads(mut self, threads: usize) -> Self {
+        self.inner = self.inner.with_style_threads(threads);
+        self
+    }
+
+    /// Sets how many workers the layout engine may use.
+    ///
+    /// The default is the machine's parallelism. `0` and `1` run layout on the frame thread, with
+    /// no pool. The `ZGUI_LAYOUT_THREADS` environment variable overrides this value. See
+    /// [`zgui_runtime::App::with_layout_threads`].
+    pub fn with_layout_threads(mut self, threads: usize) -> Self {
+        self.inner = self.inner.with_layout_threads(threads);
+        self
+    }
+
+    /// Returns the style worker count set with [`App::with_style_threads`], if one was set.
+    pub fn style_threads(&self) -> Option<usize> {
+        self.inner.style_threads()
+    }
+
+    /// Returns the layout worker count set with [`App::with_layout_threads`], if one was set.
+    pub fn layout_threads(&self) -> Option<usize> {
+        self.inner.layout_threads()
+    }
+
+    /// Adds a style sheet of the application's own.
+    ///
+    /// Each call adds one sheet. The sheets cascade in call order. They are added at the author
+    /// origin, over this framework's own sheet, which is what gives every element name its layout
+    /// before a single application rule is written.
     pub fn with_stylesheet(mut self, css: impl Into<String>) -> Self {
         self.inner = self.inner.with_stylesheet(css);
         self
@@ -385,6 +446,29 @@ impl App {
         self
     }
 
+    /// Sets how precisely the default renderer holds a plain group of content.
+    ///
+    /// The default is [`GroupPrecision::Compact`](crate::GroupPrecision::Compact), which holds a
+    /// plain group in the surface format when that format is `Bgra8Unorm` or `Rgba8Unorm`. That
+    /// target has half the bytes of a sixteen-bit one.
+    /// [`GroupPrecision::High`](crate::GroupPrecision::High) holds every group in sixteen-bit
+    /// float. The `ZGUI_GROUP_PRECISION` environment variable (`high` or `compact`) overrides this
+    /// value. A renderer set with [`App::with_renderer`] ignores it.
+    ///
+    /// ```no_run
+    /// use zgui::prelude::*;
+    ///
+    /// # fn main() -> Result<(), zgui::Error> {
+    /// app()
+    ///     .with_group_precision(zgui::GroupPrecision::High)
+    ///     .run(|| view! { column() })
+    /// # }
+    /// ```
+    pub fn with_group_precision(mut self, precision: crate::GroupPrecision) -> Self {
+        self.group_precision = Some(precision);
+        self
+    }
+
     /// The faces this application draws with, for registering one of its own.
     ///
     /// Asking settles the question [`App::with_fonts`] would otherwise answer: an application that
@@ -405,81 +489,6 @@ impl App {
         V: IntoView,
     {
         self.run_on(desktop(), view)
-    }
-
-    /// The same, on a Linux console with no display server under it.
-    ///
-    /// Lights every display that is plugged in, builds `view` into the first, and runs until the
-    /// application stops. The picture goes to the screen through the kernel and through nothing
-    /// else: a mode on the display, the buffers that display scans out of, and a page flip per
-    /// frame.
-    ///
-    /// The console backend and the renderer that draws through it are installed together, because
-    /// they are correct together and useless apart. The loop holds a display's buffers and says
-    /// which display a surface is; the renderer puts a composed frame in one. An application that
-    /// installed one of them alone would draw frames that reach no screen. The map between them is
-    /// made here and given to both.
-    ///
-    /// # The graphics device
-    ///
-    /// Opened here, before the displays exist, and by this method rather than by the first frame. A
-    /// display can hand out the buffers it scans out of, so that a frame is composed straight into
-    /// one and nothing is read back or copied, and those buffers are images on the graphics device.
-    /// They have to exist before the renderer that composes into them, so the device has to exist
-    /// before the displays. One device is made here and given to the loop and to the renderer
-    /// factory, the same way one map is.
-    ///
-    /// A machine where no adapter opens, or whose driver will not grant the Vulkan device
-    /// extensions an exported image needs, still runs: every display keeps the copied path, where a
-    /// frame is read back and copied into a buffer the driver allocated.
-    ///
-    /// **This needs the device.** Where a session daemon answers, it opens the card for this
-    /// program and no privilege of its own is needed. Where none answers, this process opens the
-    /// card and takes DRM master, which needs a free virtual terminal or root. It fails to start
-    /// while a compositor holds the device.
-    ///
-    /// # Switching terminal
-    ///
-    /// A run holds the keyboard, so `Ctrl+Alt+Fn` reaches this program rather than the console
-    /// driver. Where a session daemon answers, the chord asks that daemon for the terminal: the
-    /// devices go on the way out, they are opened again on the way back, and every display is set
-    /// to its mode again. Where none answers, no daemon owns the terminal, so the ask is refused
-    /// and the reason reported once. A switch made from elsewhere, such as `chvt`, leaves such a
-    /// run holding the display.
-    ///
-    /// ```no_run
-    /// use zgui::prelude::*;
-    ///
-    /// # fn main() -> Result<(), zgui::Error> {
-    /// app().run_drm(|| view! { column() })
-    /// # }
-    /// ```
-    ///
-    /// # Errors
-    ///
-    /// As [`App::run`], and additionally whatever the console refused with: no device to open, a
-    /// device this process cannot become master of, or a display that refused a buffer or a mode.
-    #[cfg(all(feature = "drm", target_os = "linux"))]
-    pub fn run_drm<F, V>(self, view: F) -> Result<(), AppError>
-    where
-        F: FnMut() -> V + 'static,
-        V: IntoView,
-    {
-        let displays = zgui_platform_drm::Displays::new();
-        // The extensions are asked for before the device is opened, because a device extension can
-        // be enabled only while a device is created. Every device this graphics opens reads the
-        // same list, so a device opened after a loss carries them too.
-        let graphics = zgui_render_wgpu::SharedGraphics::with_extensions(
-            zgui_platform_drm::EXTENSIONS.to_vec(),
-        );
-        // `None` is the copied path. A machine that cannot make these images is an ordinary
-        // machine rather than a failure to start.
-        let gpu = console::scanout_device(&graphics);
-        self.with_renderer(console::factory(graphics, displays.clone()))
-            .run_on(
-                move |handler| zgui_platform_drm::run(handler, &displays, gpu.as_deref()),
-                view,
-            )
     }
 
     /// The same, over a platform backend of the caller's choosing.
@@ -511,12 +520,18 @@ impl App {
         F: FnMut() -> V + 'static,
         V: IntoView,
     {
+        // Before the font thread below, which is the first thread this process starts: the guard
+        // inside changes the environment only while the process has one thread.
+        zgui_render_wgpu::gpu::loader::prefer_hardware_vulkan();
         // The last point at which the application could have named its own faces has passed, so
         // this is where enumerating the machine's starts — on a thread of its own, alongside
         // opening the window and the graphics device rather than in front of them.
         let fonts = self.fonts.into_inner().unwrap_or_else(Fonts::system);
         let shaping = fonts.clone();
-        let renderer = self.renderer.unwrap_or_else(graphics::factory);
+        let group_precision = self.group_precision;
+        let renderer = self
+            .renderer
+            .unwrap_or_else(|| graphics::factory(group_precision));
         // The faces are provided above every window, so a component that shapes its own text
         // reaches the same collection the frame does. The application's own setup runs after, and
         // therefore resolves them like any other context.
@@ -559,6 +574,15 @@ pub struct Handler {
 }
 
 impl Handler {
+    /// The frame loop, for a caller that drives it by hand.
+    ///
+    /// A headless test runs the real application this way: it builds the window with the same
+    /// builder the program uses, then steps the loop itself and reads what each frame produced.
+    #[must_use]
+    pub fn into_runtime(self) -> zgui_runtime::Runtime {
+        self.runtime
+    }
+
     /// Hands the application to `driver` and returns when the loop finishes.
     ///
     /// # Errors
@@ -571,7 +595,11 @@ impl Handler {
     {
         // Taken before the runtime is handed over, because the driver consumes it.
         let failure = self.runtime.failure();
-        driver(Box::new(self.runtime))?;
+        let ran = driver(Box::new(self.runtime));
+        // The runtime is gone with the driver. Whatever is left in the task pool is dropped now,
+        // while the thread's other state is alive.
+        zgui_reactive::shutdown();
+        ran?;
         failure.take().map_or(Ok(()), Err)
     }
 }

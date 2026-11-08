@@ -185,7 +185,6 @@ fn a_wavy_underline_is_given_a_band_and_stays_inside_the_line_box() {
         transform: SpatialId::VIEWPORT,
         opaque_target: true,
         subpixel_capable: false,
-        upright: true,
         scale: 1.0,
         ellipsis: None,
     };
@@ -210,6 +209,7 @@ fn a_wavy_underline_is_given_a_band_and_stays_inside_the_line_box() {
         text::Inherited {
             text_fill: None,
             decorations: core::slice::from_ref(&wavy),
+            inline: &[],
         },
         placement,
     );
@@ -261,6 +261,7 @@ fn a_text_shadow_is_drawn_as_a_second_pass_over_the_same_glyphs_at_its_own_offse
                 format: GlyphFormat::Mono,
                 paint: zgui_scene::PaintSlot(0),
                 synthetic_bold: 0.0,
+                text_start: 0,
             });
         }
     }
@@ -308,7 +309,6 @@ fn a_text_shadow_is_drawn_as_a_second_pass_over_the_same_glyphs_at_its_own_offse
             transform: SpatialId::VIEWPORT,
             opaque_target: true,
             subpixel_capable: true,
-            upright: true,
             scale: 1.0,
             ellipsis: None,
         },
@@ -357,11 +357,13 @@ fn a_filters_reach_grows_with_the_device_scale() {
         reach(at_one) > 0.0,
         "a blur has to reach outside its bounds"
     );
+    // The resampling reach is in device pixels at every density, so only the kernel scales.
+    let kernel = |extent| reach(extent) - zgui_scene::Filter::RESAMPLE_REACH;
     assert!(
-        (reach(at_two) - 2.0 * reach(at_one)).abs() < 1e-3,
-        "twice the density is twice the reach: {} against {}",
-        reach(at_two),
-        reach(at_one)
+        (kernel(at_two) - 2.0 * kernel(at_one)).abs() < 1e-3,
+        "twice the density is twice the kernel's reach: {} against {}",
+        kernel(at_two),
+        kernel(at_one)
     );
 }
 
@@ -383,7 +385,7 @@ fn an_animated_transform_reports_the_union_of_where_it_was_and_where_it_is() {
         .store
         .fragment(harness.fragment_of("subject"))
         .expect("a fragment")
-        .ink;
+        .device_ink(&zgui_scene::Placements::of(&harness.scene.spatial));
 
     let subject = harness.element("subject");
     harness.edit_and_restyle(|batch| {
@@ -396,7 +398,7 @@ fn an_animated_transform_reports_the_union_of_where_it_was_and_where_it_is() {
         .store
         .fragment(harness.fragment_of("subject"))
         .expect("a fragment")
-        .ink;
+        .device_ink(&zgui_scene::Placements::of(&harness.scene.spatial));
     assert_ne!(
         before.origin, after.origin,
         "the fixture has to have moved it"
